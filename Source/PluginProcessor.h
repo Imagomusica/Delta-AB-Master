@@ -34,6 +34,7 @@ public:
     void setStateInformation (const void* data, int sizeInBytes) override;
 
     juce::AudioProcessorValueTreeState apvts;
+    dab::AerEqParams aerEq (int a) const;   // current EQ settings of AER channel a (for the curve display)
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
@@ -41,7 +42,6 @@ private:
     void timerCallback() override;
     dab::CrossoverConfig currentConfig() const;
     void readParams (dab::EngineParams&) const;
-    dab::AerEqParams aerEq (int a) const;
     dab::AerEqFilter* makeEq (int a) const;
     void processDouble (const double* const* in, int numMain, double* const* out,
                         double* const* aerOut, double* const* spotsOut, int n);

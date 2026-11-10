@@ -1,48 +1,63 @@
 # Delta AB
 
-Plugin VST3 64 bits pour un arbre Delta AB : 3 micros hybrides (capsule omni O + capsule ruban R) disposés en triangle, façon mini arbre Decca.
+Plugin VST3 64 bits, une seule console : le Delta AB (3 micros hybrides en triangle, façon mini arbre Decca), le Delta AER (3 omnis d'ambiance G, C, D) et jusqu'à 16 spots EN-MS (cardio + ruban), puis les bus.
 
 ## Branchement
 
-Une piste à 6 canaux en entrée, une sortie stéréo.
+Une piste de 47 canaux en entrée (le DAW les voit comme des bus, à la suite) :
 
-| Entrées | Micro |
+| Entrées | Source |
 | --- | --- |
-| 1 et 2 | Micro 1, gauche (O puis R) |
-| 3 et 4 | Micro 2, droite (O puis R) |
-| 5 et 6 | Micro 3, centre (O puis R) |
+| 1 à 4 | Micro 1, gauche : O1 MK221, O2 MK102, R1 (aigu), R2 (grave) |
+| 5 à 8 | Micro 2, droite : idem |
+| 9 à 12 | Micro 3, centre : idem |
+| 13 à 15 | Delta AER : G, C, D |
+| 16 à 47 | Spots EN-MS 1 à 16 : cardio puis ruban |
 
-Si O et R sont inversés sur un micro, active « Inverser entrées O/R ».
+Une piste de 6 canaux (O, R par micro) marche aussi pour le Delta AB.
 
-## Chaîne de traitement
+Sorties : la sortie stéréo principale, plus deux sorties stéréo à activer dans le DAW si besoin : « AER séparé » et « Spots séparés ». Activées, l'AER ou les spots sortent là au lieu d'être mélangés, pour passer dans des inserts du DAW (réverbe, comp/EQ, ou insert hardware DA/AD).
 
-Par micro :
+## Delta AB, par micro
 
-1. Routage O / R.
-2. Appariement du ruban (±24 dB, au 0,1 dB). « Analyser » mesure O et R sur une octave autour de la coupure : active-le sur un passage de référence, puis désactive-le, et la correction s'inscrit dans « Appariement ».
-3. Crossover à 350, 700, 1 500 ou 2 200 Hz, pente 6, 12 ou 24 dB/oct.
-4. « Dans le grave » : l'omni ou le ruban.
-5. Bloom (capsule dans le grave) et Focus (capsule dans l'aigu), par pas de 0,5 dB.
-6. Somme mono, délai (micro central seulement, de −10 à +10 ms au centième), pan G – C – D.
+1. Choix de 2 sources sur 4 (X et Y), à l'oreille.
+2. Gain match de Y (±24 dB au 0,1 dB). « Analyser » mesure X et Y sur une octave autour de la coupure ; quand on le désactive, la correction s'inscrit.
+3. Crossover à 350, 700, 1250, 1600, 1950, 2200 ou 4400 Hz (ou « Focal », le point global), 6, 12 ou 24 dB/oct, phase linéaire ou minimale, sans perte au point de coupure (Linkwitz-Riley).
+4. Swap : X ou Y dans le grave. « Ambiance » inverse les 3 micros d'un coup.
+5. Aigu (Focus) et grave (Bloom) au 0,1 dB, délai de −10 à +10 ms par 0,5 ms.
+6. Somme mono, niveau de sortie, pan total.
 
-### Panpot
+Macros : Focus (plus ou moins d'aigu), Bloom (plus ou moins de grave, ou grave plus et aigu moins), Focal (point de crossover), Ambiance (swap).
 
-Le pan se fait entre deux bus voisins (G–C ou C–D), avec trois indices qu'on dose séparément, sans aucun filtre :
+## Delta AER, par canal
 
-- **Niveau** (0–100 %) : loi de pan −3, −4,5 ou −6 dB au milieu.
-- **Délai** (0–100 %) : le bus le plus éloigné est retardé, jusqu'à 0,7, 1,4 ou 2,8 ms. Pur retard, amplitude plate.
-- **Phase** (0–100 %) : décalage de phase constant entre les deux bus, jusqu'à ±45° (90° d'écart). Transformée de Hilbert en FIR à phase linéaire : amplitude plate, aucune coloration.
+Low cut et high cut (6, 12 ou 24 dB/oct), shelf grave et aigu avec Q, 3 cloches avec Q. Phase minimale (biquads) ou linéaire (FIR qui a exactement la même courbe). Délai de −10 à +100 ms, affiché aussi en mètres (343 m/s). Fader, faders liés en option (bouger un fader déplace les deux autres du même nombre de dB). Pan total. Puis somme G, C, D.
 
-Un micro posé exactement sur un bus n'alimente que ce bus, sans retard ni déphasage.
+## Spots EN-MS, par tranche
 
-Puis les bus G, C, D : fader, low cut 6 dB/oct (20 à 200 Hz), envoi du centre dans G et D (−1,5 à −12 dB par pas de 1,5 dB), sortie.
+8 tranches de base, « + TRANCHE » en ajoute une (jusqu'à 16 ; les tranches non ajoutées sont coupées et ne coûtent rien).
+
+1. Gain match du ruban.
+2. Mode M/S : cardio (M) + ruban (S) en mono ; le dosage des deux oriente le micro virtuel, « ruban côté opposé » le tourne de l'autre côté. Ou mode Crossover, le même que le Delta AB (cardio ou ruban dans le grave).
+3. Niveaux cardio et ruban, délai (−10 à +100 ms, en ms et en mètres), fader, pan total.
+
+## Pan total
+
+Le pan se fait entre deux bus voisins (G–C ou C–D), avec des indices qu'on dose séparément, sans coloration :
+
+- **Niveau** : loi de pan −3, −4,5 ou −6 dB au milieu.
+- **Délai** : le bus le plus éloigné est retardé, jusqu'à 0,7 à 11,2 ms, ou 30 ms (Haas). Pur retard, amplitude plate.
+- **Phase** : décalage de phase constant entre les deux bus, jusqu'à ±45°. Transformée de Hilbert en FIR à phase linéaire : amplitude plate.
+- **Pan HF** : le grave (sous 700 Hz) reste plus au centre que l'aigu. Séparation à phase linéaire, somme exacte.
+
+Bus G, C, D du Delta AB : fader, low cut 6 dB/oct (20 à 200 Hz). Le centre est envoyé dans G et D (−1,5 à −12 dB par pas de 1,5 dB), pour le Delta AB, l'AER et les spots. Puis faders AER, Spots et Master.
 
 ## Modes
 
-- **Phase linéaire** : la somme des deux branches redonne exactement le signal, à la précision du 64 bits. « Écoute » utilise un filtre court (environ 100 ms de latence à 48 kHz, panpot compris), « Export » un filtre long (environ 0,9 s). Les deux tournent en temps réel.
+- **Phase linéaire** : la somme des deux branches redonne exactement le signal, à la précision du 64 bits. « Écoute » utilise un filtre court (environ 100 ms de latence à 48 kHz, panpot compris), « Export » un filtre long (environ 1 s). Les deux tournent en temps réel (export avec 16 spots : environ un tiers d’un cœur).
 - **Phase minimale** : filtres Linkwitz-Riley (1er ordre en 6 dB/oct), latence d’environ 45 ms (délai du centre et panpot de phase).
 
-La latence est annoncée au DAW, qui la compense. Les 10 ms fixes servent au délai négatif du micro central (G et D sont alors retardés à sa place).
+La latence est annoncée au DAW, qui la compense. Les 10 ms fixes servent aux délais négatifs (les autres voies sont alors retardées à leur place).
 
 ## Compiler
 

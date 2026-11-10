@@ -54,4 +54,10 @@ if(DELTAAB_HOST_TEST)
     target_sources(host_test PRIVATE tests/host_test.cpp)
     target_compile_definitions(host_test PRIVATE JUCE_PLUGINHOST_VST3=1 JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
     target_link_libraries(host_test PRIVATE juce::juce_audio_processors juce::juce_audio_utils PUBLIC juce::juce_recommended_config_flags)
+
+    # Editor snapshot (PNG) from the plugin's shared code
+    add_executable(ui_snapshot tests/ui_snapshot.cpp)
+    target_include_directories(ui_snapshot PRIVATE Source $<TARGET_PROPERTY:DeltaAB,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(ui_snapshot PRIVATE $<TARGET_PROPERTY:DeltaAB,COMPILE_DEFINITIONS>)
+    target_link_libraries(ui_snapshot PRIVATE DeltaAB)
 endif()
