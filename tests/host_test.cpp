@@ -4,6 +4,7 @@
 #include <cstdio>
 
 static int fails = 0;
+static constexpr int kParams = 415;   // 3 mics x (xsrc, ysrc ...) + AER + 16 spots + global
 static void check (bool ok, const char* what, double v) { std::printf ("[%s] %-60s %g\n", ok ? " OK " : "FAIL", what, v); if (! ok) ++fails; }
 
 int main (int argc, char** argv)
@@ -20,10 +21,12 @@ int main (int argc, char** argv)
     check (p != nullptr, "instance created", 0);
     if (! p) { std::printf ("%s\n", err.toRawUTF8()); return 1; }
 
-    check (p->getTotalNumInputChannels() == 47, "47 inputs (3 mics x O1 O2 R1 R2, AER G C D, 16 spots x 2)", p->getTotalNumInputChannels());
-    check (p->getTotalNumOutputChannels() == 42, "42 outputs (mix, AER, 3 mics, 16 spots, in stereo)", p->getTotalNumOutputChannels());
+    check (p->getTotalNumInputChannels() == 11, "11 inputs (AB 3 x X/Y, AER G C D, EN-MS 1 cardio + ruban)", p->getTotalNumInputChannels());
+    check (p->getTotalNumOutputChannels() == 10, "10 outputs (Micro 1, 2, 3, AER, EN-MS 1, in stereo)", p->getTotalNumOutputChannels());
     check (p->supportsDoublePrecisionProcessing(), "64-bit processing supported", 1);
-    check (p->getParameters().size() == 412, "parameter count", p->getParameters().size());
+    std::printf ("parameters: %d\n", p->getParameters().size());
+    check (p->getParameters().size() == kParams, "parameter count", p->getParameters().size());
+    const int N = 11;
     auto setParam = [&] (const char* name, float v01) {
         for (auto* prm : p->getParameters()) if (prm->getName (128) == juce::String::fromUTF8 (name)) { prm->setValueNotifyingHost (v01); return; }
         check (false, name, 0);
@@ -62,15 +65,15 @@ int main (int argc, char** argv)
         {
             if (dbl)
             {
-                juce::AudioBuffer<double> b (47, 512); b.clear();
-                if (blk == 0) for (int m = 0; m < 3; ++m) { b.setSample (m * 4, 0, 1.0); b.setSample (m * 4 + 2, 0, 1.0); }
+                juce::AudioBuffer<double> b (N, 512); b.clear();
+                if (blk == 0) for (int c = 0; c < 6; ++c) b.setSample (c, 0, 1.0);
                 p->processBlock (b, midi);
                 for (int i = 0; i < 512; ++i) if (std::abs (b.getSample (0, i)) > peak) { peak = std::abs (b.getSample (0, i)); peakPos = pos + i; }
             }
             else
             {
-                juce::AudioBuffer<float> b (47, 512); b.clear();
-                if (blk == 0) for (int m = 0; m < 3; ++m) { b.setSample (m * 4, 0, 1.0f); b.setSample (m * 4 + 2, 0, 1.0f); }
+                juce::AudioBuffer<float> b (N, 512); b.clear();
+                if (blk == 0) for (int c = 0; c < 6; ++c) b.setSample (c, 0, 1.0f);
                 p->processBlock (b, midi);
                 for (int i = 0; i < 512; ++i) if (std::abs (b.getSample (0, i)) > peak) { peak = std::abs (b.getSample (0, i)); peakPos = pos + i; }
             }
@@ -78,7 +81,7 @@ int main (int argc, char** argv)
         }
         p->releaseResources();
         check (peakPos == lat, dbl ? "double: impulse arrives at reported latency" : "float: impulse arrives at reported latency", peakPos);
-        check (std::abs (peak - (1 + std::pow (10.0, -3.0 / 20))) < (dbl ? 1e-9 : 1e-6), dbl ? "double: L = mic1 + centre at -3 dB" : "float: L = mic1 + centre at -3 dB", peak);
+        check (std::abs (peak - 1) < (dbl ? 1e-9 : 1e-6), dbl ? "double: Micro 1 out L = mic 1 alone, unity" : "float: Micro 1 out L = mic 1 alone, unity", peak);
         return lat;
     };
     const double latListen = run (false);
@@ -91,52 +94,50 @@ int main (int argc, char** argv)
         setParam ("AER · Phase des EQ", lin ? 1.0f : 0.0f);
         p->prepareToPlay (48000, 512); p->releaseResources();
         double pk = 0;
-        const double off = impulse (true, { 12 }, 2, pk, 47);
+        const double off = impulse (true, { 6 }, 6, pk, N);
         check (off == 0, lin ? "AER lin EQ: impulse on AER out L at latency (offset)" : "AER min EQ: impulse on AER out L at latency (offset)", off);
         check (std::abs (pk - 1) < 1e-6, lin ? "AER lin EQ: flat EQ gives unity" : "AER min EQ: flat EQ gives unity", pk);
         if (lin) check (p->getLatencySamples() == latListen, "AER lin EQ: same latency as the linear crossover", p->getLatencySamples());
     }
     setParam ("AER · Phase des EQ", 0.0f);
 
-    // EN-MS spots: spot 1 on L, cardio in 16, ribbon in 17 (0-based 15, 16)
+    // EN-MS spot 1: cardio in 10, ribbon in 11 (0-based 9, 10), out on 9-10 (0-based 8, 9)
     {
         setParam ("Spot 1 · Pan G-C-D", 0.0f);
         double pk = 0;
-        double off = impulse (true, { 15 }, 0, pk, 47);
+        double off = impulse (true, { 9 }, 8, pk, N);
         check (off == 0 && std::abs (pk - 1) < 1e-9, "Spot 1 M/S: cardio alone on L at latency, unity", pk);
-        off = impulse (true, { 15, 16 }, 0, pk, 47);
+        off = impulse (true, { 9, 10 }, 8, pk, N);
         check (off == 0 && std::abs (pk - 2) < 1e-9, "Spot 1 M/S: cardio + ribbon = M + S (2.0)", pk);
         setParam ("Spot 1 · Mode", 1.0f);
         p->prepareToPlay (48000, 512); p->releaseResources();
-        off = impulse (true, { 15, 16 }, 0, pk, 47);
+        off = impulse (true, { 9, 10 }, 8, pk, N);
         check (off == 0 && std::abs (pk - 1) < 1e-9, "Spot 1 crossover: same impulse on both = exact reconstruction (1.0)", pk);
         setParam ("Spot 1 · Mode", 0.0f);
-        impulse (true, { 15 + 2 * 8 }, 0, pk, 47);
-        double pk2 = 0; impulse (true, { 15 + 2 * 8 }, 1, pk2, 47);
-        check (pk < 1e-12 && pk2 < 1e-12, "Spot 9 is off until added (8 spots by default)", pk + pk2);
     }
 
-    // AER output disabled: the AER goes back into the main mix
-    {
-        auto layout = p->getBusesLayout();
-        layout.outputBuses.getReference (1) = juce::AudioChannelSet::disabled();
-        check (p->setBusesLayout (layout), "AER output can be disabled", 1);
-        double pkMain = 0;
-        const double off = impulse (false, { 12 }, 0, pkMain, 47);
-        check (off == 0 && std::abs (pkMain - 1) < 1e-6, "AER output off: AER G in main L at latency", pkMain);
-        layout.outputBuses.getReference (1) = juce::AudioChannelSet::stereo();
-        p->setBusesLayout (layout);
-    }
-
-    // Per-flow outputs: mic 1 alone on its own stereo pair (outputs 5-6), spot 1 on its pair
+    // Per-flow outputs: mic 1 alone stays on its own pair
     {
         double pk = 0;
-        double off = impulse (true, { 0, 2 }, 4, pk, 47);   // mic 1 X + Y (O1, R1): crossover reconstruction = 1 at L
+        double off = impulse (true, { 0, 1 }, 0, pk, N);
         check (off == 0 && std::abs (pk - 1) < 1e-9, "Flow out Micro 1: on its own pair, L, at latency", pk);
-        double pkC = 0; impulse (true, { 0, 2 }, 8, pkC, 47);   // Micro 3 C pair stays silent
+        double pkC = 0; impulse (true, { 0, 1 }, 4, pkC, N);
         check (pkC < 1e-12, "Flow out Micro 3: silent when only mic 1 plays", pkC);
-        off = impulse (true, { 15 }, 10, pk, 47);   // spot 1 cardio -> spot 1 pair (outputs 11-12), panned L
-        check (off == 0 && std::abs (pk - 1) < 1e-9, "Flow out Spot 1: cardio on its own pair at latency", pk);
+    }
+
+    // AER output off and Mix on: the AER goes into the mix (AER off, so EN-MS 1 sits at 6-7 and Mix at 8-9)
+    {
+        auto layout = p->getBusesLayout();
+        const int mixBus = layout.outputBuses.size() - 1;
+        layout.outputBuses.getReference (3) = juce::AudioChannelSet::disabled();
+        layout.outputBuses.getReference (mixBus) = juce::AudioChannelSet::stereo();
+        check (p->setBusesLayout (layout), "AER output off, Mix output on", 1);
+        double pkMain = 0;
+        const double off = impulse (false, { 6 }, 8, pkMain, N);
+        check (off == 0 && std::abs (pkMain - 1) < 1e-6, "AER output off: AER G in Mix L at latency", pkMain);
+        layout.outputBuses.getReference (3) = juce::AudioChannelSet::stereo();
+        layout.outputBuses.getReference (mixBus) = juce::AudioChannelSet::disabled();
+        p->setBusesLayout (layout);
     }
 
     // switch to Export quality via the host parameter and let the plugin rebuild

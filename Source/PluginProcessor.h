@@ -38,7 +38,7 @@ public:
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
-    static BusesProperties withSpots (BusesProperties);
+    static BusesProperties makeBuses();
     void timerCallback() override;
     dab::CrossoverConfig currentConfig() const;
     void readParams (dab::EngineParams&) const;
@@ -46,9 +46,9 @@ private:
     void processDouble (const double* const* in, int numMain, double* const* out,
                         double* const* aerOut, double* const* spotsOut, int n);
     template <typename T> void processAny (juce::AudioBuffer<T>&);
-    struct Io { int numMain = 0, aerStart = 0, numAer = 0, aerOutStart = 2, spotOutStart = 2;
+    struct Io { int numMain = 0, aerStart = 0, numAer = 0, aerOutStart = 2, mixStart = 0; bool mixOn = false;
                 std::array<int, dab::kMaxSpots> spotStart {}, spotIn {};
-                bool aerOutOn = false, spotOutOn = false;
+                bool aerOutOn = false;
                 std::array<int, 3 + dab::kMaxSpots> flowStart {};
                 std::array<bool, 3 + dab::kMaxSpots> flowOn {}; };
     static constexpr int kNumFlowOut = 3 + dab::kMaxSpots;   // stereo outputs: AB mics, spots

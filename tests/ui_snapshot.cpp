@@ -20,7 +20,7 @@ int main (int argc, char** argv)
         juce::PNGImageFormat().writeImageToStream (img, os);
         std::printf ("%s\n", f.getFullPathName().toRawUTF8());
     };
-    save ("console.png", 1.0f);
+    save ("console.png", 1.5f);
     // open each kind of detail by clicking its DETAIL button
     auto clickDetail = [&] (const juce::String& stripTitle)
     {
@@ -34,7 +34,7 @@ int main (int argc, char** argv)
     };
     clickDetail ("MIC 1 G"); save ("detail_ab.png", 1.0f);
     clickDetail ("AER C");   save ("detail_aer.png", 1.0f);
-    clickDetail ("SPOT 1");  save ("detail_spot.png", 1.0f);
+    clickDetail ("EN-MS 1");  save ("detail_spot.png", 1.0f);
     ed.reset();
     p.reset();
     return 0;

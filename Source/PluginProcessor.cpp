@@ -19,8 +19,10 @@ static const double xoverHz[kNumX] = { 350, 700, 1250, 1600, 1950, 2200, 4400 };
 static const juce::StringArray xoverNames { "350 Hz", "700 Hz", "1250 Hz", "1600 Hz", "1950 Hz", "2200 Hz", "4400 Hz" };
 
 // Two of the four sources of a hybrid mic: X and Y. Sources: 0 = O1 MK221, 1 = O2 MK102, 2 = R1 (aigu), 3 = R2 (grave).
-struct Combo { int x, y; bool autoYInLows; };
-static const Combo combos[6] = { { 0, 2, false }, { 0, 3, true }, { 1, 2, false }, { 1, 3, true }, { 0, 1, true }, { 2, 3, true } };
+// Sources: 0 = O1 MK221, 1 = O2 MK102, 2 = R1 (tuned for highs), 3 = R2 (tuned for lows).
+// Auto rule for the switch: the capsule more suited to the lows goes there (R2 > O2 > O1 > R1).
+static const int lowRank[4] = { 1, 2, 0, 3 };
+static const juce::StringArray sourceNames { "O1", "O2", "R1", "R2" };
 
 static juce::String pid (int m, const char* p) { return juce::String (micId[m]) + "_" + p; }
 
@@ -52,17 +54,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
     for (int m = 0; m < 3; ++m)
     {
         const juce::String n (micName[m]);
-        l.add (std::make_unique<APC> (juce::ParameterID { pid (m, "combo"), 1 }, n + u (" · Combinaison"),
-                                      juce::StringArray { u ("O1 MK221 + R1 aigu"), u ("O1 MK221 + R2 grave"),
-                                                          u ("O2 MK102 + R1 aigu"), u ("O2 MK102 + R2 grave"),
-                                                          u ("O1 MK221 + O2 MK102"), u ("R1 aigu + R2 grave") }, 0));
+        l.add (std::make_unique<APC> (juce::ParameterID { pid (m, "xsrc"), 1 }, n + " · Source X", sourceNames, 0));
+        l.add (std::make_unique<APC> (juce::ParameterID { pid (m, "ysrc"), 1 }, n + " · Source Y", sourceNames, 2));
         l.add (std::make_unique<APB> (juce::ParameterID { pid (m, "swap"), 1 }, n + u (" · Inverser entrées X/Y (6 canaux)"), false));
         l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "match"), 1 }, n + u (" · Appariement Y"), db (-24, 24, 0.1f), 0.0f, attrDb));
         l.add (std::make_unique<APB> (juce::ParameterID { pid (m, "analyse"), 1 }, n + u (" · Analyser X/Y"), false));
         l.add (std::make_unique<APC> (juce::ParameterID { pid (m, "xover"), 1 }, n + u (" · Coupure"),
                                       [] { juce::StringArray a { "Focal" }; a.addArray (xoverNames); return a; }(), 0));
         l.add (std::make_unique<APC> (juce::ParameterID { pid (m, "lows"), 1 }, n + u (" · Dans le grave"),
-                                      juce::StringArray { u ("Auto (R1 aigu, R2 grave, O2 grave)"), u ("X grave, Y aigu"), u ("Y grave, X aigu") }, 0));
+                                      juce::StringArray { u ("Auto (R2 > O2 > O1 > R1 vers le grave)"), u ("X grave, Y aigu"), u ("Y grave, X aigu") }, 0));
         l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "focus"), 1 }, n + u (" · Focus (aigu)"), db (-24, 12, 0.1f), 0.0f, attrDb));
         l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "bloom"), 1 }, n + u (" · Bloom (grave)"), db (-24, 12, 0.1f), 0.0f, attrDb));
         l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "level"), 1 }, n + u (" · Niveau de sortie"), db (-60, 12, 0.1f), 0.0f, attrDb));
@@ -145,7 +145,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
     }
 
     // EN-MS spots: cardioid (Mid) + ribbon (Side)
-    l.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { "spots_n", 1 }, "Spots EN-MS : nombre de tranches", 1, dab::kMaxSpots, 8));
+    l.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { "spots_n", 1 }, "Spots EN-MS : nombre de tranches", 1, dab::kMaxSpots, 1));
     l.add (std::make_unique<APF> (juce::ParameterID { "spots_out", 1 }, "Spots EN-MS : sortie", db (-24, 12, 0.1f), 0.0f, attrDb));
     for (int k = 0; k < dab::kMaxSpots; ++k)
     {
@@ -179,24 +179,26 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
 
 // AB (12) and AER (3) inputs, then one stereo input per EN-MS spot (left = cardio, right = ribbon).
 // Fixed VST3 speaker layouts only: hosts flatten them to inputs 1-12, 13-15, then 16-47.
-juce::AudioProcessor::BusesProperties DeltaABProcessor::withSpots (BusesProperties b)
+// Inputs: ΔAB X/Y (6, or 12 = all four capsules), AER G C D (3), then one stereo input per EN-MS spot (cardio, ruban).
+// Outputs, for summing in the DAW bus (Pyramix): one stereo pair per AB mic, the AER, one per spot, then an optional mix.
+// Only spot 1 is enabled by default (first test: 11 inputs); the host can enable more spot buses.
+juce::AudioProcessor::BusesProperties DeltaABProcessor::makeBuses()
 {
+    BusesProperties b;
+    b = b.withInput (juce::String::fromUTF8 ("ΔAB X/Y (3 micros)"), juce::AudioChannelSet::create5point1(), true)
+         .withInput ("AER (G C D)", juce::AudioChannelSet::createLCR(), true);
     for (int k = 0; k < dab::kMaxSpots; ++k)
-        b = b.withInput ("Spot " + juce::String (k + 1) + " (cardio, ruban)", juce::AudioChannelSet::stereo(), true);
-    // One stereo output per flow, for summing in the DAW bus (Pyramix): the 3 AB mics, then each spot.
+        b = b.withInput ("EN-MS " + juce::String (k + 1) + " (cardio, ruban)", juce::AudioChannelSet::stereo(), k == 0);
     const char* micOut[3] = { "Micro 1 G", "Micro 2 D", "Micro 3 C" };
     for (int m = 0; m < 3; ++m) b = b.withOutput (micOut[m], juce::AudioChannelSet::stereo(), true);
-    for (int k = 0; k < dab::kMaxSpots; ++k) b = b.withOutput ("Spot " + juce::String (k + 1), juce::AudioChannelSet::stereo(), true);
+    b = b.withOutput ("AER", juce::AudioChannelSet::stereo(), true);
+    for (int k = 0; k < dab::kMaxSpots; ++k) b = b.withOutput ("EN-MS " + juce::String (k + 1), juce::AudioChannelSet::stereo(), k == 0);
+    b = b.withOutput ("Mix", juce::AudioChannelSet::stereo(), false);
     return b;
 }
 
 DeltaABProcessor::DeltaABProcessor()
-    : AudioProcessor (withSpots (BusesProperties()
-                          .withInput ("Entrées (3 micros x O1 O2 R1 R2)", juce::AudioChannelSet::create7point1point4(), true)
-                          .withInput ("AER (G C D)", juce::AudioChannelSet::createLCR(), true)
-                          .withOutput ("Sortie", juce::AudioChannelSet::stereo(), true)
-                          .withOutput ("AER", juce::AudioChannelSet::stereo(), true)
-                          .withOutput ("Spots séparés", juce::AudioChannelSet::stereo(), false))),
+    : AudioProcessor (makeBuses()),
       apvts (*this, nullptr, "DeltaAB", createLayout())
 {
     startTimerHz (20);
@@ -381,9 +383,9 @@ void DeltaABProcessor::readParams (dab::EngineParams& p) const
         mp.swapInputs = false;   // routing is resolved in processDouble
         mp.matchDb = pv (pid (m, "match"));
         mp.analyse = pv (pid (m, "analyse")) > 0.5f;
-        const auto& cb = combos[juce::jlimit (0, 5, (int) pv (pid (m, "combo")))];
+        const int xs = juce::jlimit (0, 3, (int) pv (pid (m, "xsrc"))), ys = juce::jlimit (0, 3, (int) pv (pid (m, "ysrc")));
         const int lows = (int) pv (pid (m, "lows"));
-        const bool inLows = lows == 0 ? cb.autoYInLows : lows == 2;   // true: Y in the lows
+        const bool inLows = lows == 0 ? lowRank[ys] > lowRank[xs] : lows == 2;   // true: Y in the lows
         mp.ribbonInLows = inLows != (pv ("ambient") > 0.5f);
         const double mf = pv ("m_focus"), mb = pv ("m_bloom");
         mp.focusDb = pv (pid (m, "focus")) + mf - ((int) pv ("bloom_mode") == 1 ? mb : 0.0);
@@ -469,15 +471,14 @@ void DeltaABProcessor::processDouble (const double* const* in, int numMain, doub
         return;
     }
 
-    // Source selection. 12 inputs: per mic O1, O2, R1, R2. 6 inputs: per mic O, R.
+    // Source selection. 12 inputs: per mic O1, O2, R1, R2 (routed by the X/Y selectors). 6 inputs: per mic X, Y.
     const double* ip[dab::kNumIn];
     for (int m = 0; m < 3; ++m)
     {
-        const auto& cb = combos[juce::jlimit (0, 5, (int) pv (pid (m, "combo")))];
-        if (numMain >= 12)
+        if (numMain >= 12)   // all four capsules come in: the selectors route them
         {
-            ip[m * 2]     = in[m * 4 + cb.x];   // X
-            ip[m * 2 + 1] = in[m * 4 + cb.y];   // Y
+            ip[m * 2]     = in[m * 4 + juce::jlimit (0, 3, (int) pv (pid (m, "xsrc")))];   // X
+            ip[m * 2 + 1] = in[m * 4 + juce::jlimit (0, 3, (int) pv (pid (m, "ysrc")))];   // Y
         }
         else
         {
@@ -510,13 +511,16 @@ DeltaABProcessor::Io DeltaABProcessor::io (int bufferChannels) const
         r.spotStart[(size_t) k] = start (true, 2 + k);
         r.spotIn[(size_t) k] = fit (r.spotStart[(size_t) k], juce::jmin (2, busCh (true, 2 + k)));
     }
-    r.aerOutStart = start (false, 1);   r.aerOutOn = busCh (false, 1) >= 2 && r.aerOutStart + 2 <= clampN;
-    r.spotOutStart = start (false, 2);  r.spotOutOn = busCh (false, 2) >= 2 && r.spotOutStart + 2 <= clampN;
+    // output buses: 0..2 AB mics, 3 AER, 4.. spots, last = mix
+    auto flowBus = [] (int f) { return f < 3 ? f : f + 1; };
     for (int f = 0; f < kNumFlowOut; ++f)
     {
-        r.flowStart[(size_t) f] = start (false, 3 + f);
-        r.flowOn[(size_t) f] = busCh (false, 3 + f) >= 2 && r.flowStart[(size_t) f] + 2 <= clampN;
+        r.flowStart[(size_t) f] = start (false, flowBus (f));
+        r.flowOn[(size_t) f] = busCh (false, flowBus (f)) >= 2 && r.flowStart[(size_t) f] + 2 <= clampN;
     }
+    r.aerOutStart = start (false, 3);   r.aerOutOn = busCh (false, 3) >= 2 && r.aerOutStart + 2 <= clampN;
+    const int mixBus = 4 + dab::kMaxSpots;
+    r.mixStart = start (false, mixBus); r.mixOn = busCh (false, mixBus) >= 2 && r.mixStart + 2 <= clampN;
     return r;
 }
 
@@ -562,14 +566,13 @@ void DeltaABProcessor::processAny (juce::AudioBuffer<T>& buffer)
             }
         }
     flowPtrs = flows;
-    processDouble (in, r.numMain, o, r.aerOutOn ? o + 2 : nullptr, r.spotOutOn ? o + 4 : nullptr, n);
+    processDouble (in, r.numMain, o, r.aerOutOn ? o + 2 : nullptr, nullptr, n);
     flowPtrs = nullptr;
 
     buffer.clear();
     auto give = [&] (int slot, int dst) { const double* s = scratch.getReadPointer (slot); T* d = buffer.getWritePointer (dst); for (int i = 0; i < n; ++i) d[i] = (T) s[i]; };
-    give (kOut, 0); give (kOut + 1, 1);
+    if (r.mixOn) { give (kOut, r.mixStart); give (kOut + 1, r.mixStart + 1); }
     if (r.aerOutOn) { give (kOut + 2, r.aerOutStart); give (kOut + 3, r.aerOutStart + 1); }
-    if (r.spotOutOn) { give (kOut + 4, r.spotOutStart); give (kOut + 5, r.spotOutStart + 1); }
     for (int f = 0; f < kNumFlowOut; ++f)
         if (r.flowOn[(size_t) f]) { give (kFlowOut + 2 * f, r.flowStart[(size_t) f]); give (kFlowOut + 2 * f + 1, r.flowStart[(size_t) f] + 1); }
 }
