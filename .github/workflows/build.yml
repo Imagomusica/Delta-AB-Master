@@ -14,8 +14,6 @@ jobs:
             name: Windows
           - os: ubuntu-24.04
             name: Linux
-          - os: macos-latest
-            name: Mac
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

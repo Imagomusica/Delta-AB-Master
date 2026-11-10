@@ -1,0 +1,41 @@
+name: Build Delta AB (Mac)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDELTAAB_HOST_TEST=ON
+
+      - name: Build (universal arm64 + x86_64)
+        run: cmake --build build --config Release --target DeltaAB_VST3 DeltaAB_AU dsp_tests host_test --parallel 4
+
+      - name: Ad-hoc signature and package
+        run: |
+          codesign --force --deep -s - "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3"
+          codesign --force --deep -s - "build/DeltaAB_artefacts/Release/AU/Delta AB.component"
+          mkdir -p dist
+          ditto "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3" "dist/VST3/Delta AB.vst3"
+          ditto "build/DeltaAB_artefacts/Release/AU/Delta AB.component" "dist/Components/Delta AB.component"
+
+      - name: Upload Mac (VST3 + AU)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeltaAB-Mac-VST3-AU-${{ matrix.os }}
+          path: dist/
+
+      - name: Tests
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+          build/host_test_artefacts/Release/host_test "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3"
