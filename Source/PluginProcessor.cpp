@@ -44,7 +44,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
         l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "focus"), 1 }, n + u (" · Focus (aigu)"), db (-24, 12, 0.5f), 0.0f, attrDb));
         l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "bloom"), 1 }, n + u (" · Bloom (grave)"), db (-24, 12, 0.5f), 0.0f, attrDb));
         l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "pan"), 1 }, n + u (" · Pan G-C-D"), Range (-1, 1, 0.01f), defPan[m]));
+        auto pct = juce::AudioParameterFloatAttributes().withLabel ("%");
+        l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "pan_lvl"), 1 }, n + u (" · Pan niveau"), Range (0, 100, 1), 100.0f, pct));
+        l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "pan_dly"), 1 }, n + u (" · Pan délai"), Range (0, 100, 1), 0.0f, pct));
+        l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "pan_ph"), 1 }, n + u (" · Pan phase"), Range (0, 100, 1), 0.0f, pct));
     }
+    l.add (std::make_unique<APC> (juce::ParameterID { "pan_law", 1 }, "Loi de pan (milieu)",
+                                  juce::StringArray { "-3 dB", "-4.5 dB", "-6 dB" }, 0));
+    l.add (std::make_unique<APC> (juce::ParameterID { "pan_mult", 1 }, u ("Pan délai : écart max"),
+                                  juce::StringArray { "0.7 ms", "1.4 ms", "2.8 ms" }, 0));
     l.add (std::make_unique<APF> (juce::ParameterID { "c_delay", 1 }, u ("Micro 3 (C) · Délai"), Range (-10, 10, 0.01f), 0.0f,
                                   juce::AudioParameterFloatAttributes().withLabel ("ms")));
 
@@ -155,8 +163,13 @@ void DeltaABProcessor::readParams (dab::EngineParams& p) const
         mp.focusDb = pv (pid (m, "focus"));
         mp.bloomDb = pv (pid (m, "bloom"));
         mp.pan = pv (pid (m, "pan"));
+        mp.panLevel = pv (pid (m, "pan_lvl")) / 100.0;
+        mp.panDelay = pv (pid (m, "pan_dly")) / 100.0;
+        mp.panPhase = pv (pid (m, "pan_ph")) / 100.0;
     }
     p.centreDelayMs = pv ("c_delay");
+    p.panLawDb = std::array<double, 3> { -3.0, -4.5, -6.0 }[(size_t) juce::jlimit (0, 2, (int) pv ("pan_law"))];
+    p.panDelayMult = 1 << juce::jlimit (0, 2, (int) pv ("pan_mult"));
     for (int b = 0; b < 3; ++b)
     {
         const juce::String id (busId[b]);

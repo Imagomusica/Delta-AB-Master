@@ -38,6 +38,13 @@ inline int firLength (double fs, bool exportQuality)
 }
 constexpr int kConvBlock = 512;
 
+// Hilbert length for phase panning: about 43 ms (listen) or 340 ms (export) of filter.
+inline int hilbertLength (double fs, bool exportQuality)
+{
+    const double base = exportQuality ? 16384.0 : 2048.0;   // at 48 kHz
+    return (1 << ceilLog2 ((int) std::lround (base * fs / 48000.0))) - 1;
+}
+
 // One mic's crossover: out = LP(low) + HP(high).
 class MicCrossover {
 public:
@@ -108,12 +115,21 @@ private:
 struct CrossoverSet {
     CrossoverConfig cfg;
     std::array<MicCrossover, 3> mic;
+    std::array<FifoConvolver, 3> hilbert;   // phase panning
+    std::array<IntDelay, 3> hilbertDirect;
     int latency = 0;
     void build (const CrossoverConfig& c)
     {
         cfg = c;
         for (int m = 0; m < 3; ++m) mic[(size_t) m].build (c, m);
-        latency = mic[0].latency();
+        const auto h = designHilbert (hilbertLength (c.fs, c.exportQuality));
+        const int hl = kConvBlock + ((int) h.size() - 1) / 2;
+        for (int m = 0; m < 3; ++m)
+        {
+            hilbert[(size_t) m].prepare (h, kConvBlock);
+            hilbertDirect[(size_t) m].prepare (hl);
+        }
+        latency = mic[0].latency() + hl;
     }
 };
 
@@ -125,6 +141,9 @@ struct MicParams {
     double focusDb = 0;          // capsule in the highs
     double bloomDb = 0;          // capsule in the lows
     double pan = 0;              // -1 = L, 0 = C, +1 = R
+    double panLevel = 1.0;       // 0..1 share of level panning
+    double panDelay = 0.0;       // 0..1 share of time panning (far bus delayed)
+    double panPhase = 0.0;       // 0..1 share of phase panning (constant phase offset, no filtering)
     bool analyse = false;        // measure O/R level around the crossover frequency
 };
 
@@ -135,12 +154,15 @@ struct EngineParams {
     std::array<bool, 3> lowCutOn { false, false, false };
     std::array<double, 3> lowCutHz { 40, 40, 40 };
     double centreSendDb = -3.0;  // C bus into L and R
+    double panLawDb = -3.0;      // level at the middle between two buses: -3, -4.5 or -6 dB
+    int panDelayMult = 1;        // max inter-bus delay = 0.7 ms x 1, 2 or 4
     double outputDb = 0;
 };
 
 class Engine {
 public:
     static constexpr double kMaxDelayMs = 10.0;
+    static constexpr double kMaxPanDelayMs = 0.7;   // x panDelayMult
 
     void prepare (double sampleRate, int maxBlock)
     {
@@ -151,8 +173,12 @@ public:
         for (auto& b : bus) b.assign ((size_t) maxN, 0.0);
         baseDelay = (int) std::ceil (kMaxDelayMs * 1e-3 * fs) + FractionalDelay::kHalf;
         for (auto& d : delay) d.prepare (2 * baseDelay + 4);
+        const int maxPan = FractionalDelay::kHalf + (int) std::ceil (kMaxPanDelayMs * 4 * 1e-3 * fs) + 4;
+        for (auto& md : panDelay) for (auto& d : md) d.prepare (maxPan);
+        for (auto& b : hx) b.assign ((size_t) maxN, 0.0);
         for (auto& s : smooth) s.prepare (fs);
         for (int i = 0; i < kNumSmoothers; ++i) smooth[(size_t) i].setImmediate (i < 6 ? 1.0 : 0.0);
+        for (int m = 0; m < 3; ++m) for (int b = 0; b < 3; ++b) sm (kRot + m * 6 + b * 2).setImmediate (1.0);
         firstBlock = true;
         for (auto& a : analysers) a = {};
         lastLowCut.fill (-1);
@@ -161,7 +187,7 @@ public:
     int extraLatency() const { return baseDelay; }
 
     // Total plugin latency for a given crossover set.
-    int totalLatency (const CrossoverSet& set) const { return set.latency + baseDelay; }
+    int totalLatency (const CrossoverSet& set) const { return set.latency + baseDelay + FractionalDelay::kHalf; }
 
     // in: 6 channels (mic1 O,R  mic2 O,R  mic3 O,R as routed), out: 2 channels.
     void process (CrossoverSet& set, const EngineParams& p, const double* const* in, double* const* out, int n)
@@ -189,7 +215,8 @@ public:
     std::array<std::atomic<bool>, 3> measureValid {};
 
 private:
-    static constexpr int kNumSmoothers = 6 + 9 + 3 + 1; // focus/bloom x3, pan gains 3x3, faders 3, centre send
+    static constexpr int kRot = 19;                          // cos/sin per mic and bus
+    static constexpr int kNumSmoothers = 6 + 9 + 3 + 1 + 18; // focus/bloom x3, pan gains 3x3, faders 3, centre send, rotations
 
     void processChunk (CrossoverSet& set, const EngineParams& p, const double* const* in, double* const* out, int n)
     {
@@ -199,8 +226,14 @@ private:
             const auto& mp = p.mic[(size_t) m];
             sm (m * 2).setTarget (dbToGain (mp.focusDb));
             sm (m * 2 + 1).setTarget (dbToGain (mp.bloomDb));
-            double gL, gC, gR; panGains (mp.pan, gL, gC, gR);
-            sm (6 + m * 3).setTarget (gL); sm (7 + m * 3).setTarget (gC); sm (8 + m * 3).setTarget (gR);
+            PanTargets t = panTargets (mp, p.panLawDb, p.panDelayMult);
+            for (int b = 0; b < 3; ++b)
+            {
+                sm (6 + m * 3 + b).setTarget (t.g[b]);
+                sm (kRot + m * 6 + b * 2).setTarget (std::cos (t.theta[b]));
+                sm (kRot + m * 6 + b * 2 + 1).setTarget (std::sin (t.theta[b]));
+                panDelay[(size_t) m][(size_t) b].setDelay (FractionalDelay::kHalf + t.tauMs[b] * 1e-3 * fs);
+            }
         }
         for (int b = 0; b < 3; ++b) sm (15 + b).setTarget (dbToGain (p.faderDb[(size_t) b]));
         sm (18).setTarget (dbToGain (p.centreSendDb));
@@ -237,14 +270,27 @@ private:
             double* mo = mono[(size_t) m].data();
             set.mic[(size_t) m].process (low, high, mo, n);
 
+            // centre delay, then the Hilbert pair used by phase panning
             auto& d = delay[(size_t) m];
-            auto& pL = sm (6 + m * 3); auto& pC = sm (7 + m * 3); auto& pR = sm (8 + m * 3);
-            for (int i = 0; i < n; ++i)
+            for (int i = 0; i < n; ++i) mo[i] = d.process (mo[i]);
+            double* h = hx[(size_t) m].data();
+            set.hilbert[(size_t) m].process (mo, h, n);
+            auto& hd = set.hilbertDirect[(size_t) m];
+            for (int i = 0; i < n; ++i) mo[i] = hd.process (mo[i]);
+
+            // pan: per bus gain, constant phase rotation (cos x + sin H{x}) and pure delay
+            for (int b = 0; b < 3; ++b)
             {
-                const double x = d.process (mo[i]);
-                bus[0][(size_t) i] += x * pL.next();
-                bus[1][(size_t) i] += x * pC.next();
-                bus[2][(size_t) i] += x * pR.next();
+                auto& g = sm (6 + m * 3 + b);
+                auto& co = sm (kRot + m * 6 + b * 2);
+                auto& si = sm (kRot + m * 6 + b * 2 + 1);
+                auto& pd = panDelay[(size_t) m][(size_t) b];
+                double* dst = bus[(size_t) b].data();
+                for (int i = 0; i < n; ++i)
+                {
+                    const double v = co.next() * mo[i] - si.next() * h[i];   // phase advance by theta
+                    dst[i] += pd.process (v) * g.next();
+                }
             }
         }
 
@@ -286,8 +332,13 @@ private:
             const auto& mp = p.mic[(size_t) m];
             sm (m * 2).setImmediate (dbToGain (mp.focusDb));
             sm (m * 2 + 1).setImmediate (dbToGain (mp.bloomDb));
-            double gL, gC, gR; panGains (mp.pan, gL, gC, gR);
-            sm (6 + m * 3).setImmediate (gL); sm (7 + m * 3).setImmediate (gC); sm (8 + m * 3).setImmediate (gR);
+            PanTargets t = panTargets (mp, p.panLawDb, p.panDelayMult);
+            for (int b = 0; b < 3; ++b)
+            {
+                sm (6 + m * 3 + b).setImmediate (t.g[b]);
+                sm (kRot + m * 6 + b * 2).setImmediate (std::cos (t.theta[b]));
+                sm (kRot + m * 6 + b * 2 + 1).setImmediate (std::sin (t.theta[b]));
+            }
         }
         for (int b = 0; b < 3; ++b) sm (15 + b).setImmediate (dbToGain (p.faderDb[(size_t) b]));
         sm (18).setImmediate (dbToGain (p.centreSendDb));
@@ -317,6 +368,31 @@ private:
     }
 
 public:
+    // Pan between the two neighbouring buses (L-C or C-R). Three cues, each with its own amount:
+    //  level : pan law gains (-3 / -4.5 / -6 dB at the middle)
+    //  delay : the far bus is delayed, up to 0.7 ms x mult (pure delay, flat amplitude)
+    //  phase : constant phase offset between the two buses, up to +-45 deg (FIR Hilbert, flat amplitude)
+    // A mic sitting exactly on a bus feeds only that bus, with no delay and no phase change.
+    struct PanTargets { double g[3] {}; double theta[3] {}; double tauMs[3] {}; };
+
+    static PanTargets panTargets (const MicParams& mp, double lawDb, int mult)
+    {
+        PanTargets t;
+        const double p = std::clamp (mp.pan, -1.0, 1.0);
+        const int A = p <= 0 ? 0 : 1, B = A + 1;
+        const double s = p <= 0 ? 2 * p + 1 : 2 * p - 1;          // -1 = on A, +1 = on B
+        const double a = std::clamp (mp.panLevel, 0.0, 1.0);
+        const double x = (s < 0 ? -1.0 : 1.0) * std::pow (std::abs (s), 1.0 + 3.0 * (1.0 - a));
+        const double e = lawDb / (20.0 * std::log10 (0.5));
+        t.g[A] = std::pow ((1 - x) / 2, e);
+        t.g[B] = std::pow ((1 + x) / 2, e);
+        const double tau = std::clamp (mp.panDelay, 0.0, 1.0) * kMaxPanDelayMs * mult * std::abs (s);
+        if (s < 0) t.tauMs[B] = tau; else t.tauMs[A] = tau;
+        const double phi = -std::clamp (mp.panPhase, 0.0, 1.0) * (kPi / 4) * std::sin (kPi * s);
+        t.theta[A] = phi; t.theta[B] = -phi;
+        return t;
+    }
+
     // 3-way pan, constant power between neighbours: -1 = L, 0 = C, +1 = R.
     static void panGains (double p, double& gL, double& gC, double& gR)
     {
@@ -336,6 +412,8 @@ private:
     bool firstBlock = true;
     std::array<std::vector<double>, 3> o, r, lo, hi, mono, bus;
     std::array<FractionalDelay, 3> delay;
+    std::array<std::array<FractionalDelay, 3>, 3> panDelay;
+    std::array<std::vector<double>, 3> hx;
     std::array<Smoother, kNumSmoothers> smooth;
     std::array<Biquad, 3> lowCut;
     std::array<double, 3> lastLowCut { -1, -1, -1 };

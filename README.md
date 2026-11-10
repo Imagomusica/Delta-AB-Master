@@ -25,11 +25,21 @@ Par micro :
 5. Bloom (capsule dans le grave) et Focus (capsule dans l'aigu), par pas de 0,5 dB.
 6. Somme mono, délai (micro central seulement, de −10 à +10 ms au centième), pan G – C – D.
 
+### Panpot
+
+Le pan se fait entre deux bus voisins (G–C ou C–D), avec trois indices qu'on dose séparément, sans aucun filtre :
+
+- **Niveau** (0–100 %) : loi de pan −3, −4,5 ou −6 dB au milieu.
+- **Délai** (0–100 %) : le bus le plus éloigné est retardé, jusqu'à 0,7, 1,4 ou 2,8 ms. Pur retard, amplitude plate.
+- **Phase** (0–100 %) : décalage de phase constant entre les deux bus, jusqu'à ±45° (90° d'écart). Transformée de Hilbert en FIR à phase linéaire : amplitude plate, aucune coloration.
+
+Un micro posé exactement sur un bus n'alimente que ce bus, sans retard ni déphasage.
+
 Puis les bus G, C, D : fader, low cut 6 dB/oct (20 à 200 Hz), envoi du centre dans G et D (−1,5 à −12 dB par pas de 1,5 dB), sortie.
 
 ## Modes
 
-- **Phase linéaire** : la somme des deux branches redonne exactement le signal, à la précision du 64 bits. « Écoute » utilise un filtre court (environ 65 ms de latence à 48 kHz), « Export » un filtre long (environ 0,7 s). Les deux tournent en temps réel.
+- **Phase linéaire** : la somme des deux branches redonne exactement le signal, à la précision du 64 bits. « Écoute » utilise un filtre court (environ 100 ms de latence à 48 kHz, panpot compris), « Export » un filtre long (environ 0,9 s). Les deux tournent en temps réel.
 - **Phase minimale** : filtres Linkwitz-Riley (1er ordre en 6 dB/oct), latence de 10 ms seulement.
 
 La latence est annoncée au DAW, qui la compense. Les 10 ms fixes servent au délai négatif du micro central (G et D sont alors retardés à sa place).

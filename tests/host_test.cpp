@@ -23,7 +23,7 @@ int main (int argc, char** argv)
     check (p->getTotalNumInputChannels() == 6, "6 input channels", p->getTotalNumInputChannels());
     check (p->getTotalNumOutputChannels() == 2, "stereo output", p->getTotalNumOutputChannels());
     check (p->supportsDoublePrecisionProcessing(), "64-bit processing supported", 1);
-    check (p->getParameters().size() == 40, "parameter count", p->getParameters().size());
+    check (p->getParameters().size() == 51, "parameter count", p->getParameters().size());
 
     auto run = [&] (bool dbl) -> double {
         p->setProcessingPrecision (dbl ? juce::AudioProcessor::doublePrecision : juce::AudioProcessor::singlePrecision);

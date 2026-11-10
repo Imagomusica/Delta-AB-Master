@@ -204,4 +204,24 @@ inline std::vector<double> designLinearPhaseLowpass (double fc, double fs, int n
     return h;
 }
 
+// ---------------------------------------------------------------- Hilbert transformer (FIR, linear phase)
+// 90 degree phase shift at every frequency of its band, flat amplitude, no colouring.
+// Odd length N, delay (N - 1) / 2. Rolls off only near DC and Nyquist.
+inline std::vector<double> designHilbert (int N)
+{
+    if (N % 2 == 0) ++N;
+    const int D = (N - 1) / 2;
+    std::vector<double> h ((size_t) N, 0.0);
+    const double beta = 8.0, i0b = FractionalDelay::besselI0 (beta);
+    for (int i = 0; i < N; ++i)
+    {
+        const int m = i - D;
+        if (m % 2 == 0) continue;
+        const double r = (double) m / (D + 1);
+        const double win = FractionalDelay::besselI0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0b;
+        h[(size_t) i] = 2.0 / (kPi * m) * win;
+    }
+    return h;
+}
+
 } // namespace dab

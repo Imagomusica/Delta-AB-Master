@@ -201,6 +201,63 @@ int main()
         check (std::abs (lowG) < 0.05 && std::abs (highG - 6.0206) < 0.05, "Focus +6 dB: 50 Hz stays 0 dB, 12 kHz at +6 dB (12 kHz value)", highG);
     }
 
+
+    // 9. Hilbert: 90 degrees, flat amplitude, from 100 Hz to 20 kHz (listen length)
+    {
+        const auto h = designHilbert (hilbertLength (fs, false));
+        double worstDb = 0, worstDeg = 0;
+        for (double f : { 100.0, 200.0, 1000.0, 5000.0, 10000.0, 20000.0 })
+        {
+            cd s = 0; const int D = ((int) h.size() - 1) / 2;
+            for (size_t i = 0; i < h.size(); ++i) s += h[i] * std::polar (1.0, -2 * kPi * f / fs * ((double) i - D));
+            worstDb = std::max (worstDb, std::abs (db (std::abs (s))));
+            worstDeg = std::max (worstDeg, std::abs (std::arg (s) * 180 / kPi + 90));
+        }
+        check (worstDb < 0.05, "Hilbert 100 Hz - 20 kHz: amplitude flat (max dB error)", worstDb);
+        check (worstDeg < 1e-6, "Hilbert 100 Hz - 20 kHz: exactly -90 degrees (max error)", worstDeg);
+    }
+
+    // 10. Phase and delay panning (mic 1 between L and C, others silent; R output = C bus, L - R = L bus)
+    auto panRun = [&] (double level, double dly, double ph, std::vector<double>& busL, std::vector<double>& busC) {
+        Engine e; e.prepare (fs, 512);
+        CrossoverConfig cfg; cfg.fs = fs;
+        CrossoverSet set; set.build (cfg);
+        EngineParams p; p.mic[0].pan = -0.75; p.mic[0].panLevel = level; p.mic[0].panDelay = dly; p.mic[0].panPhase = ph;
+        p.centreSendDb = 0;
+        const int lat = e.totalLatency (set), N = lat + 16384;
+        std::vector<std::vector<double>> in (6, std::vector<double> ((size_t) N, 0.0));
+        in[0][0] = in[1][0] = 1;
+        std::vector<double> L ((size_t) N), R ((size_t) N);
+        const double* ip[6]; for (int c = 0; c < 6; ++c) ip[c] = in[(size_t) c].data();
+        double* op[2] = { L.data(), R.data() };
+        e.process (set, p, ip, op, N);
+        busL.assign ((size_t) N, 0); busC.assign ((size_t) N, 0);
+        for (int i = 0; i < N; ++i) { busC[(size_t) i] = R[(size_t) i]; busL[(size_t) i] = L[(size_t) i] - R[(size_t) i]; }
+        return lat;
+    };
+    auto spec = [&] (const std::vector<double>& x, double f) { cd s = 0; for (size_t i = 0; i < x.size(); ++i) s += x[i] * std::polar (1.0, -2 * kPi * f / fs * (double) i); return s; };
+    {
+        std::vector<double> bl, bc;
+        panRun (1, 0, 1, bl, bc);
+        double worstDeg = 0, worstDb = 0;
+        const double ratio0 = db (std::abs (spec (bl, 1000)) / std::abs (spec (bc, 1000)));
+        for (double f : { 200.0, 1000.0, 5000.0, 15000.0 })
+        {
+            const cd a = spec (bl, f), c = spec (bc, f);
+            worstDeg = std::max (worstDeg, std::abs (std::arg (a / c) * 180 / kPi - 90));
+            worstDb = std::max (worstDb, std::abs (db (std::abs (a) / std::abs (c)) - ratio0));
+        }
+        check (worstDeg < 0.5, "Phase pan 100%, halfway L-C: L leads C by 90 deg (max error)", worstDeg);
+        check (worstDb < 0.05, "Phase pan: no filtering, L/C level ratio flat 200 Hz-15 kHz (dB)", worstDb);
+    }
+    {
+        std::vector<double> bl, bc;
+        panRun (0, 1, 0, bl, bc);
+        const cd a = spec (bl, 1000), c = spec (bc, 1000);
+        const double delayMs = -std::arg (c / a) / (2 * kPi * 1000) * 1000;
+        check (std::abs (delayMs - 0.35) < 1e-4, "Delay pan 100%, halfway L-C: C delayed by 0.35 ms (ms)", delayMs);
+        check (std::abs (db (std::abs (a) / std::abs (c))) < 0.6, "Delay pan with level 0%: L and C nearly equal (dB apart)", db (std::abs (a) / std::abs (c)));
+    }
     std::printf ("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }
