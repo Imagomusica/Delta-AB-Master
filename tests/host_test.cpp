@@ -103,17 +103,17 @@ int main (int argc, char** argv)
 
     // EN-MS spot 1: cardio in 10, ribbon in 11 (0-based 9, 10), out on 9-10 (0-based 8, 9)
     {
-        setParam ("Spot 1 · Pan G-C-D", 0.0f);
+        setParam ("EN-MS.01 · Pan G-C-D", 0.0f);
         double pk = 0;
         double off = impulse (true, { 9 }, 8, pk, N);
         check (off == 0 && std::abs (pk - 1) < 1e-9, "Spot 1 M/S: cardio alone on L at latency, unity", pk);
         off = impulse (true, { 9, 10 }, 8, pk, N);
         check (off == 0 && std::abs (pk - 2) < 1e-9, "Spot 1 M/S: cardio + ribbon = M + S (2.0)", pk);
-        setParam ("Spot 1 · Mode", 1.0f);
+        setParam ("EN-MS.01 · Mode", 1.0f);
         p->prepareToPlay (48000, 512); p->releaseResources();
         off = impulse (true, { 9, 10 }, 8, pk, N);
         check (off == 0 && std::abs (pk - 1) < 1e-9, "Spot 1 crossover: same impulse on both = exact reconstruction (1.0)", pk);
-        setParam ("Spot 1 · Mode", 0.0f);
+        setParam ("EN-MS.01 · Mode", 0.0f);
     }
 
     // Per-flow outputs: mic 1 alone stays on its own pair

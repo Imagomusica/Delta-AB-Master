@@ -678,9 +678,9 @@ static juce::String mid (int m, const char* p) { return "m" + juce::String (m + 
 static juce::String aid (int a, const char* p) { return "a" + juce::String (a + 1) + "_" + p; }
 static juce::String sid (int k, const char* p) { return "s" + juce::String (k + 1) + "_" + p; }
 
-static const int abMic[3] = { 0, 2, 1 };   // left to right: G, C, D
-static const char* abTitle[3] = { "MIC 1 G", "MIC 3 C", "MIC 2 D" };
-static const char* aerTitle[3] = { "AER G", "AER C", "AER D" };
+static const int abMic[3] = { 0, 1, 2 };   // left to right: AB.01, AB.02, AB.03
+static const char* abTitle[3] = { "AB.01", "AB.02", "AB.03" };
+static const char* aerTitle[3] = { "AER.01", "AER.02", "AER.03" };
 static constexpr int kStripW = 92, kAbW = 140, kGap = 6, kHead = 48, kPad = 8;
 
 Console::Console (DeltaABProcessor& p)
@@ -738,7 +738,7 @@ Console::Console (DeltaABProcessor& p)
     }
     for (int k = 0; k < dab::kMaxSpots; ++k)
     {
-        auto& st = *(spot[k] = std::make_unique<Strip> ("EN-MS " + juce::String (k + 1), [this, k] { openSpot (k); }));
+        auto& st = *(spot[k] = std::make_unique<Strip> ("EN-MS." + juce::String (k + 1).paddedLeft ('0', 2), [this, k] { openSpot (k); }));
         st.knobRow (s, { { sid (k, "gainc"), "gain M" }, { sid (k, "match"), "gain S" } }, 64, true);
         st.matchMeter (p, 6 + 2 * k, 7 + 2 * k, "M", "S");
         st.switch2 (s, sid (k, "mode"), "M/S", "xover");
@@ -920,7 +920,7 @@ void Console::openAer (int a)
 
 void Console::openSpot (int k)
 {
-    auto d = std::make_unique<Detail> ("EN-MS " + juce::String (k + 1) + u (" · CARDIO (M) + RUBAN (S)"), closer (this, detail, detailAer));
+    auto d = std::make_unique<Detail> ("EN-MS." + juce::String (k + 1).paddedLeft ('0', 2) + u (" · CARDIO (M) + RUBAN (S)"), closer (this, detail, detailAer));
     auto& s = proc.apvts;
     d->row ("gain match");
     d->knob (s, sid (k, "match"), "gain ruban");

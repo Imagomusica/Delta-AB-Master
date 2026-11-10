@@ -11,7 +11,7 @@ static juce::String u (const char* s) { return juce::String::fromUTF8 (s); }
 static const char* micId[3]   = { "m1", "m2", "m3" };
 static juce::String aid (int a, const char* p) { return "a" + juce::String (a + 1) + "_" + p; }
 static juce::String sid (int k, const char* p) { return "s" + juce::String (k + 1) + "_" + p; }
-static const char* micName[3] = { "Micro 1 (G)", "Micro 2 (D)", "Micro 3 (C)" };
+static const char* micName[3] = { "AB.01", "AB.02", "AB.03" };
 static const char* busId[3]   = { "L", "C", "R" };
 static const char* busName[3] = { "Bus G", "Bus C", "Bus D" };
 static constexpr int kNumX = 7;
@@ -26,7 +26,7 @@ static const juce::StringArray sourceNames { "O1", "O2", "R1", "R2" };
 
 static juce::String pid (int m, const char* p) { return juce::String (micId[m]) + "_" + p; }
 
-static const char* aerName[3] = { "AER G", "AER C", "AER D" };
+static const char* aerName[3] = { "AER.01", "AER.02", "AER.03" };
 static const int kSlopes[3] = { 1, 2, 4 };
 
 juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayout()
@@ -50,7 +50,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
                                   juce::StringArray { u ("Grave ↑"), u ("Grave ↑ et aigu ↓") }, 0));
 
     // Mics
-    const float defPan[3] = { -1.0f, 1.0f, 0.0f };
+    const float defPan[3] = { -1.0f, 0.0f, 1.0f };
     for (int m = 0; m < 3; ++m)
     {
         const juce::String n (micName[m]);
@@ -150,7 +150,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
     l.add (std::make_unique<APF> (juce::ParameterID { "spots_out", 1 }, "Spots EN-MS : sortie", db (-24, 12, 0.1f), 0.0f, attrDb));
     for (int k = 0; k < dab::kMaxSpots; ++k)
     {
-        const juce::String n = "Spot " + juce::String (k + 1);
+        const juce::String n = "EN-MS." + juce::String (k + 1).paddedLeft ('0', 2);
         auto id = [k] (const char* x) { return sid (k, x); };
         l.add (std::make_unique<APC> (juce::ParameterID { id ("mode"), 1 }, n + " · Mode", juce::StringArray { "M/S", "Crossover" }, 0));
         l.add (std::make_unique<APF> (juce::ParameterID { id ("gainc"), 1 }, n + " · Gain cardio (M)", db (-24, 24, 0.1f), 0.0f, attrDb));
@@ -187,14 +187,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
 juce::AudioProcessor::BusesProperties DeltaABProcessor::makeBuses()
 {
     BusesProperties b;
-    b = b.withInput (juce::String::fromUTF8 ("ΔAB X/Y (3 micros)"), juce::AudioChannelSet::create5point1(), true)
-         .withInput ("AER (G C D)", juce::AudioChannelSet::createLCR(), true);
+    b = b.withInput (juce::String::fromUTF8 ("ΔAB X/Y (AB.01-03)"), juce::AudioChannelSet::create5point1(), true)
+         .withInput ("AER.01-03", juce::AudioChannelSet::createLCR(), true);
     for (int k = 0; k < dab::kMaxSpots; ++k)
-        b = b.withInput ("EN-MS " + juce::String (k + 1) + " (cardio, ruban)", juce::AudioChannelSet::stereo(), k == 0);
-    const char* micOut[3] = { "Micro 1 G", "Micro 2 D", "Micro 3 C" };
+        b = b.withInput ("EN-MS." + juce::String (k + 1).paddedLeft ('0', 2) + " (cardio, ruban)", juce::AudioChannelSet::stereo(), k == 0);
+    const char* micOut[3] = { "AB.01", "AB.02", "AB.03" };
     for (int m = 0; m < 3; ++m) b = b.withOutput (micOut[m], juce::AudioChannelSet::stereo(), true);
     b = b.withOutput ("AER", juce::AudioChannelSet::stereo(), true);
-    for (int k = 0; k < dab::kMaxSpots; ++k) b = b.withOutput ("EN-MS " + juce::String (k + 1), juce::AudioChannelSet::stereo(), k == 0);
+    for (int k = 0; k < dab::kMaxSpots; ++k) b = b.withOutput ("EN-MS." + juce::String (k + 1).paddedLeft ('0', 2), juce::AudioChannelSet::stereo(), k == 0);
     b = b.withOutput ("Mix", juce::AudioChannelSet::stereo(), false);
     return b;
 }

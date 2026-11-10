@@ -55,9 +55,9 @@ int main (int argc, char** argv)
         };
         find (*ed);
     };
-    clickDetail ("MIC 1 G"); save ("detail_ab.png", 1.0f);
-    clickDetail ("AER C");   save ("detail_aer.png", 1.0f);
-    clickDetail ("EN-MS 1");  save ("detail_spot.png", 1.0f);
+    clickDetail ("AB.01"); save ("detail_ab.png", 1.0f);
+    clickDetail ("AER.02");   save ("detail_aer.png", 1.0f);
+    clickDetail ("EN-MS.01");  save ("detail_spot.png", 1.0f);
     ed.reset();
     p.reset();
     return 0;
