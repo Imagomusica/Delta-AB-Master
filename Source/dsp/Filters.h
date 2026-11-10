@@ -175,7 +175,7 @@ inline std::vector<double> designLinearPhaseLowpass (double fc, double fs, int n
 {
     if (N % 2 == 0) ++N;
     const int D = (N - 1) / 2;
-    const int order = ceilLog2 (8 * N);
+    const int order = ceilLog2 (4 * N);
     const int M = 1 << order;
     std::vector<cd> spec ((size_t) M);
     for (int k = 0; k <= M / 2; ++k)
@@ -222,6 +222,42 @@ inline std::vector<double> designHilbert (int N)
         h[(size_t) i] = 2.0 / (kPi * m) * win;
     }
     return h;
+}
+
+// Hilbert transform of the linear-phase low-pass: spectrum -j sign(f) |H_LP(f)|, odd length N, delay (N - 1) / 2.
+// Used with designHilbert so that the low and high bands each get their own 90 degree companion.
+inline std::vector<double> designHilbertLowpass (double fc, double fs, int n, int N)
+{
+    if (N % 2 == 0) ++N;
+    const int D = (N - 1) / 2;
+    const int order = ceilLog2 (4 * N);
+    const int M = 1 << order;
+    std::vector<cd> spec ((size_t) M, cd (0.0));
+    for (int k = 1; k < M / 2; ++k)
+    {
+        const double f = (double) k * fs / M;
+        const double mag = 1.0 / (1.0 + std::pow (f / fc, (double) n));
+        spec[(size_t) k] = cd (0.0, -mag);
+        spec[(size_t) (M - k)] = cd (0.0, mag);
+    }
+    FFT fft (order);
+    fft.inverse (spec.data());
+    std::vector<double> h ((size_t) N);
+    const double beta = 8.0, i0b = FractionalDelay::besselI0 (beta);
+    for (int i = 0; i < N; ++i)
+    {
+        const int m = i - D;
+        const double r = (double) m / (D + 1);
+        const double win = FractionalDelay::besselI0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0b;
+        h[(size_t) i] = spec[(size_t) ((m + M) % M)].real() * win;
+    }
+    return h;
+}
+
+// Same-length linear-phase low-pass (no DC renormalisation needed here: the high band is derived by subtraction).
+inline std::vector<double> designSplitLowpass (double fc, double fs, int n, int N)
+{
+    return designLinearPhaseLowpass (fc, fs, n, N);
 }
 
 } // namespace dab

@@ -54,6 +54,7 @@ private:
     dab::CrossoverConfig builtCfg;
 
     std::array<bool, 3> wasAnalysing { false, false, false };
+    static constexpr int kSilence = 12, kScratchCh = 14;
     juce::AudioBuffer<double> scratch;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DeltaABProcessor)

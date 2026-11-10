@@ -20,10 +20,10 @@ int main (int argc, char** argv)
     check (p != nullptr, "instance created", 0);
     if (! p) { std::printf ("%s\n", err.toRawUTF8()); return 1; }
 
-    check (p->getTotalNumInputChannels() == 6, "6 input channels", p->getTotalNumInputChannels());
+    check (p->getTotalNumInputChannels() == 12, "12 input channels (3 mics x O1 O2 R1 R2)", p->getTotalNumInputChannels());
     check (p->getTotalNumOutputChannels() == 2, "stereo output", p->getTotalNumOutputChannels());
     check (p->supportsDoublePrecisionProcessing(), "64-bit processing supported", 1);
-    check (p->getParameters().size() == 51, "parameter count", p->getParameters().size());
+    check (p->getParameters().size() == 64, "parameter count", p->getParameters().size());
 
     auto run = [&] (bool dbl) -> double {
         p->setProcessingPrecision (dbl ? juce::AudioProcessor::doublePrecision : juce::AudioProcessor::singlePrecision);
@@ -35,15 +35,15 @@ int main (int argc, char** argv)
         {
             if (dbl)
             {
-                juce::AudioBuffer<double> b (6, 512); b.clear();
-                if (blk == 0) for (int c = 0; c < 6; ++c) b.setSample (c, 0, 1.0);
+                juce::AudioBuffer<double> b (12, 512); b.clear();
+                if (blk == 0) for (int m = 0; m < 3; ++m) { b.setSample (m * 4, 0, 1.0); b.setSample (m * 4 + 2, 0, 1.0); }
                 p->processBlock (b, midi);
                 for (int i = 0; i < 512; ++i) if (std::abs (b.getSample (0, i)) > peak) { peak = std::abs (b.getSample (0, i)); peakPos = pos + i; }
             }
             else
             {
-                juce::AudioBuffer<float> b (6, 512); b.clear();
-                if (blk == 0) for (int c = 0; c < 6; ++c) b.setSample (c, 0, 1.0f);
+                juce::AudioBuffer<float> b (12, 512); b.clear();
+                if (blk == 0) for (int m = 0; m < 3; ++m) { b.setSample (m * 4, 0, 1.0f); b.setSample (m * 4 + 2, 0, 1.0f); }
                 p->processBlock (b, midi);
                 for (int i = 0; i < 512; ++i) if (std::abs (b.getSample (0, i)) > peak) { peak = std::abs (b.getSample (0, i)); peakPos = pos + i; }
             }

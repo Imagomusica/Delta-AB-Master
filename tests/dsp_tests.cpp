@@ -149,7 +149,7 @@ int main()
         Engine e; e.prepare (fs, 512);
         CrossoverConfig cfg; cfg.fs = fs;
         CrossoverSet set; set.build (cfg);
-        EngineParams p; p.mic[0].pan = -1; p.mic[1].pan = 1; p.mic[2].pan = 0; p.centreDelayMs = ms;
+        EngineParams p; p.mic[0].pan = -1; p.mic[1].pan = 1; p.mic[2].pan = 0; p.delayMs[2] = ms;
         p.centreSendDb = -1.5;
         const int lat = e.totalLatency (set), N = lat + 4096;
         std::vector<std::vector<double>> in (6, std::vector<double> ((size_t) N, 0.0));
@@ -159,7 +159,7 @@ int main()
         double* op[2] = { L.data(), R.data() };
         e.process (set, p, ip, op, N);
         const int shift = (int) std::lround (std::abs (ms) * 1e-3 * fs);
-        const int side = ms > 0 ? lat : lat + shift, centre = ms > 0 ? lat + shift : lat;
+        const int side = lat, centre = ms > 0 ? lat + shift : lat - shift;
         check (std::abs (L[(size_t) side] - 1) < 1e-12 && std::abs (L[(size_t) centre] - dbToGain (-1.5)) < 1e-12,
                "Centre delay " + std::to_string ((int) ms) + " ms: centre offset by " + std::to_string (shift) + " samples", L[(size_t) centre]);
     }
@@ -218,11 +218,11 @@ int main()
     }
 
     // 10. Phase and delay panning (mic 1 between L and C, others silent; R output = C bus, L - R = L bus)
-    auto panRun = [&] (double level, double dly, double ph, std::vector<double>& busL, std::vector<double>& busC) {
+    auto panRun = [&] (double level, double dly, double ph, std::vector<double>& busL, std::vector<double>& busC, double pan = -0.75, double hf = 0) {
         Engine e; e.prepare (fs, 512);
         CrossoverConfig cfg; cfg.fs = fs;
         CrossoverSet set; set.build (cfg);
-        EngineParams p; p.mic[0].pan = -0.75; p.mic[0].panLevel = level; p.mic[0].panDelay = dly; p.mic[0].panPhase = ph;
+        EngineParams p; p.mic[0].pan = pan; p.mic[0].panHF = hf; p.mic[0].panLevel = level; p.mic[0].panDelay = dly; p.mic[0].panPhase = ph;
         p.centreSendDb = 0;
         const int lat = e.totalLatency (set), N = lat + 16384;
         std::vector<std::vector<double>> in (6, std::vector<double> ((size_t) N, 0.0));
@@ -257,6 +257,14 @@ int main()
         const double delayMs = -std::arg (c / a) / (2 * kPi * 1000) * 1000;
         check (std::abs (delayMs - 0.35) < 1e-4, "Delay pan 100%, halfway L-C: C delayed by 0.35 ms (ms)", delayMs);
         check (std::abs (db (std::abs (a) / std::abs (c))) < 0.6, "Delay pan with level 0%: L and C nearly equal (dB apart)", db (std::abs (a) / std::abs (c)));
+    }
+    {
+        std::vector<double> bl, bc;
+        panRun (1, 0, 0, bl, bc, -1.0, 1.0);
+        const double lowDiff = db (std::abs (spec (bl, 50)) / std::abs (spec (bc, 50)));
+        const double highLeak = db (std::abs (spec (bc, 10000)) / std::abs (spec (bl, 10000)));
+        check (std::abs (lowDiff) < 0.5, "HF pan 100%, mic on L: 50 Hz shared L/C (dB apart)", lowDiff);
+        check (highLeak < -40, "HF pan 100%, mic on L: 10 kHz stays on L (C leak, dB)", highLeak);
     }
     std::printf ("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
