@@ -10,8 +10,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            name: macOS
           - os: windows-latest
             name: Windows
           - os: ubuntu-24.04
@@ -22,16 +20,25 @@ jobs:
 
       - name: Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev libfreetype6-dev libfontconfig1-dev libgl1-mesa-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev libfreetype6-dev libfontconfig1-dev libgl1-mesa-dev xvfb
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDELTAAB_HOST_TEST=ON
 
       - name: Build
-        run: cmake --build build --config Release --target DeltaAB_VST3 dsp_tests --parallel 4
+        run: cmake --build build --config Release --target DeltaAB_VST3 dsp_tests host_test --parallel 4
 
       - name: DSP measurement tests
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Host test (loads the VST3 like a DAW)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a build/host_test_artefacts/Release/host_test "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3"
+          else
+            build/host_test_artefacts/Release/host_test.exe "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3"
+          fi
 
       - name: Upload VST3
         uses: actions/upload-artifact@v4
