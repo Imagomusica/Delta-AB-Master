@@ -281,6 +281,12 @@ public:
             auto& G = g[(size_t) b]; auto& GL = gl[(size_t) b]; auto& C = co[(size_t) b]; auto& S = si[(size_t) b];
             auto& D = pd[(size_t) b];
             double* out = dst[b];
+            if (G.isSilent() && GL.isSilent())   // this bus gets nothing: keep the delay line fed with the zeros it would get
+            {
+                D.pushSilence (n);
+                for (int i = 0; i < n; ++i) { C.next(); S.next(); }
+                continue;
+            }
             for (int i = 0; i < n; ++i)
             {
                 const double gH = G.next(), gL = GL.next();
@@ -312,6 +318,8 @@ public:
         for (auto* v : { &mono, &hx, &lowBand, &lowBandH })
             for (auto& b : *v) b.assign ((size_t) maxN, 0.0);
         spotHi.assign ((size_t) maxN, 0.0);
+        for (auto& b : flowTmp) b.assign ((size_t) maxN, 0.0);
+        cSend.assign ((size_t) maxN, 0.0);
         for (auto& b : bus) b.assign ((size_t) maxN, 0.0);
         baseDelay = (int) std::ceil (kMaxDelayMs * 1e-3 * fs) + FractionalDelay::kHalf;
         for (auto& d : delay) d.prepare (2 * baseDelay + 4);
@@ -334,8 +342,12 @@ public:
     // in (kNumIn): 6 AB channels (mic1 X,Y  mic2 X,Y  mic3 X,Y), 3 AER channels (L, C, R), then per spot cardio, ribbon.
     // out: main stereo; aerOut / spotsOut: separate stereo outputs, or nullptr to mix into the main output.
     // eq: the 3 linear-phase AER EQ filters (used when set.cfg.aerEqLinear; entries may be nullptr).
+    // flows (optional, 2 * kPanCh pointers, entries may be nullptr): each channel's own stereo output after its pan
+    // (centre folded into L and R with the centre send), before any bus processing, for summing in the DAW.
+    // Channel order: AB mic 1..3, AER G C D, spots.
     void process (CrossoverSet& set, AerEqFilter* const* eq, const EngineParams& p, const double* const* in,
-                  double* const* out, double* const* aerOut, double* const* spotsOut, int n)
+                  double* const* out, double* const* aerOut, double* const* spotsOut, int n,
+                  double* const* flows = nullptr)
     {
         int done = 0;
         while (done < n)
@@ -348,6 +360,8 @@ public:
             double* spPtr[2] = { nullptr, nullptr };
             if (aerOut != nullptr) { aerPtr[0] = aerOut[0] + done; aerPtr[1] = aerOut[1] + done; }
             if (spotsOut != nullptr) { spPtr[0] = spotsOut[0] + done; spPtr[1] = spotsOut[1] + done; }
+            for (int c = 0; c < 2 * kPanCh; ++c)
+                flowPtr[(size_t) c] = flows != nullptr && flows[c] != nullptr ? flows[c] + done : nullptr;
             processChunk (set, eq, p, inPtr, outPtr, aerOut != nullptr ? aerPtr : nullptr, spotsOut != nullptr ? spPtr : nullptr, k);
             done += k;
         }
@@ -415,6 +429,7 @@ private:
         for (int b = 0; b < 3; ++b) setT (kFader + b, dbToGain (p.faderDb[(size_t) b]));
         setT (kCSend, dbToGain (p.centreSendDb));
         firstBlock = false;
+        { auto& cs = sm (kCSend); for (int i = 0; i < n; ++i) cSend[(size_t) i] = cs.next(); }
 
         for (auto& b : bus) std::fill (b.begin(), b.begin() + n, 0.0);
         double* abBus[3]  = { bus[0].data(), bus[1].data(), bus[2].data() };
@@ -543,10 +558,9 @@ private:
 
         // ---- stereo sums
         const double outG = dbToGain (p.outputDb), aerG = dbToGain (p.aerOutDb), spG = dbToGain (p.spotsOutDb);
-        auto& cs = sm (kCSend);
         for (int i = 0; i < n; ++i)
         {
-            const double k = cs.next();
+            const double k = cSend[(size_t) i];
             const double c = bus[1][(size_t) i] * k, ca = bus[4][(size_t) i] * k;
             const double aL = (bus[3][(size_t) i] + ca) * aerG, aR = (bus[5][(size_t) i] + ca) * aerG;
             double L = bus[0][(size_t) i] + c, R = bus[2][(size_t) i] + c;
@@ -581,7 +595,22 @@ private:
         run (set.splitLowH[(size_t) k], needL && needH, usedLH[(size_t) k], hlb);
         auto& hd = set.hilbertDirect[(size_t) k];
         for (int i = 0; i < n; ++i) mo[i] = hd.process (mo[i]);
-        pan[(size_t) k].process (mo, h, lb, hlb, dst, n);
+        double* const* fl = flowPtr.data() + 2 * k;
+        if (fl[0] != nullptr && fl[1] != nullptr)
+        {
+            double* t[3] = { flowTmp[0].data(), flowTmp[1].data(), flowTmp[2].data() };
+            for (int b = 0; b < 3; ++b) std::fill (t[b], t[b] + n, 0.0);
+            pan[(size_t) k].process (mo, h, lb, hlb, t, n);
+            for (int b = 0; b < 3; ++b) for (int i = 0; i < n; ++i) dst[b][i] += t[b][i];
+            for (int i = 0; i < n; ++i)
+            {
+                const double c = t[1][i] * cSend[(size_t) i];
+                fl[0][i] = t[0][i] + c;
+                fl[1][i] = t[2][i] + c;
+            }
+        }
+        else
+            pan[(size_t) k].process (mo, h, lb, hlb, dst, n);
     }
 
     void analyse (int m, bool on, double fc, const double* oIn, const double* rIn, int n)
@@ -653,6 +682,9 @@ private:
     std::array<FractionalDelay, kMaxSpots> spotDelay;
     std::array<PanChannel, kPanCh> pan;
     std::array<bool, kPanCh> usedH {}, usedL {}, usedLH {};
+    std::array<double*, 2 * kPanCh> flowPtr {};
+    std::array<std::vector<double>, 3> flowTmp;
+    std::vector<double> cSend;   // smoothed centre send, per sample of the chunk
     std::array<Smoother, kNumSmoothers> smooth;
     std::array<Biquad, 3> lowCut;
     std::array<double, 3> lastLowCut { -1, -1, -1 };

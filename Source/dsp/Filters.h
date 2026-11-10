@@ -121,6 +121,12 @@ public:
         for (int k = 0; k < kTaps; ++k) c[k] /= sum;
     }
 
+    // n zeros in, outputs discarded
+    void pushSilence (int n)
+    {
+        for (int i = 0; i < n; ++i) { buf[(size_t) w] = 0.0; w = (w + 1) & mask; }
+    }
+
     inline double process (double x)
     {
         buf[(size_t) w] = x;
@@ -158,6 +164,7 @@ public:
     void prepare (double fs, double seconds = 0.02) { len = std::max (1, (int) (fs * seconds)); }
     void setImmediate (double v) { cur = tgt = v; steps = 0; }
     double current() const { return cur; }
+    bool isSilent() const { return cur == 0.0 && tgt == 0.0; }
     double target() const { return tgt; }
     void setTarget (double v)
     {
