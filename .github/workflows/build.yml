@@ -14,6 +14,8 @@ jobs:
             name: Windows
           - os: ubuntu-24.04
             name: Linux
+          - os: macos-14
+            name: Mac
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -26,7 +28,20 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDELTAAB_HOST_TEST=ON
 
       - name: Build
-        run: cmake --build build --config Release --target DeltaAB_VST3 dsp_tests host_test --parallel 4
+        shell: bash
+        run: |
+          T="DeltaAB_VST3 dsp_tests host_test"
+          if [ "$RUNNER_OS" = "macOS" ]; then T="$T DeltaAB_AU"; fi
+          cmake --build build --config Release --target $T --parallel 4
+
+      - name: Mac ad-hoc signature (unsigned plugins do not load on Apple Silicon otherwise)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --deep -s - "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3"
+          codesign --force --deep -s - "build/DeltaAB_artefacts/Release/AU/Delta AB.component"
+          mkdir -p dist
+          ditto "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3" "dist/VST3/Delta AB.vst3"
+          ditto "build/DeltaAB_artefacts/Release/AU/Delta AB.component" "dist/Components/Delta AB.component"
 
       - name: DSP measurement tests
         run: ctest --test-dir build -C Release --output-on-failure
@@ -36,6 +51,8 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             xvfb-run -a build/host_test_artefacts/Release/host_test "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            build/host_test_artefacts/Release/host_test "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3"
           else
             build/host_test_artefacts/Release/host_test.exe "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3"
           fi
@@ -47,7 +64,15 @@ jobs:
           xvfb-run -a build/insert_test
 
       - name: Upload VST3
+        if: runner.os != 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: DeltaAB-VST3-${{ matrix.name }}
           path: build/DeltaAB_artefacts/Release/VST3/
+
+      - name: Upload Mac (VST3 + AU)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeltaAB-Mac-VST3-AU
+          path: dist/

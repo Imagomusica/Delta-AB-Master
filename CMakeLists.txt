@@ -20,7 +20,8 @@ juce_add_plugin(DeltaAB
     COMPANY_NAME "Imagomusica"
     PLUGIN_MANUFACTURER_CODE Imgm
     PLUGIN_CODE Dlab
-    FORMATS VST3 Standalone
+    FORMATS VST3 AU Standalone
+    AU_MAIN_TYPE kAudioUnitType_Effect
     PRODUCT_NAME "Delta AB"
     IS_SYNTH FALSE
     NEEDS_MIDI_INPUT FALSE
