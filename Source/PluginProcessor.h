@@ -48,7 +48,11 @@ private:
     template <typename T> void processAny (juce::AudioBuffer<T>&);
     struct Io { int numMain = 0, aerStart = 0, numAer = 0, aerOutStart = 2, spotOutStart = 2;
                 std::array<int, dab::kMaxSpots> spotStart {}, spotIn {};
-                bool aerOutOn = false, spotOutOn = false; };
+                bool aerOutOn = false, spotOutOn = false;
+                std::array<int, 3 + dab::kMaxSpots> flowStart {};
+                std::array<bool, 3 + dab::kMaxSpots> flowOn {}; };
+    static constexpr int kNumFlowOut = 3 + dab::kMaxSpots;   // stereo outputs: AB mics, spots
+    double* const* flowPtrs = nullptr;
     Io io (int bufferChannels) const;
 
     float pv (const juce::String& id) const { return apvts.getRawParameterValue (id)->load(); }
@@ -72,7 +76,8 @@ private:
 
     std::array<bool, 3> wasAnalysing { false, false, false };
     // scratch: main inputs, AER inputs, spot inputs, then 6 outputs (main, AER, spots)
-    static constexpr int kInMain = 0, kInAer = 12, kInSpots = 15, kOut = kInSpots + 2 * dab::kMaxSpots, kScratchCh = kOut + 6;
+    static constexpr int kInMain = 0, kInAer = 12, kInSpots = 15, kOut = kInSpots + 2 * dab::kMaxSpots,
+                         kFlowOut = kOut + 6, kScratchCh = kFlowOut + 2 * (3 + dab::kMaxSpots);
     juce::AudioBuffer<double> scratch;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DeltaABProcessor)

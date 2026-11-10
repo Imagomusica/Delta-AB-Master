@@ -180,6 +180,10 @@ juce::AudioProcessor::BusesProperties DeltaABProcessor::withSpots (BusesProperti
 {
     for (int k = 0; k < dab::kMaxSpots; ++k)
         b = b.withInput ("Spot " + juce::String (k + 1) + " (cardio, ruban)", juce::AudioChannelSet::stereo(), true);
+    // One stereo output per flow, for summing in the DAW bus (Pyramix): the 3 AB mics, then each spot.
+    const char* micOut[3] = { "Micro 1 G", "Micro 2 D", "Micro 3 C" };
+    for (int m = 0; m < 3; ++m) b = b.withOutput (micOut[m], juce::AudioChannelSet::stereo(), true);
+    for (int k = 0; k < dab::kMaxSpots; ++k) b = b.withOutput ("Spot " + juce::String (k + 1), juce::AudioChannelSet::stereo(), true);
     return b;
 }
 
@@ -188,7 +192,7 @@ DeltaABProcessor::DeltaABProcessor()
                           .withInput ("Entrées (3 micros x O1 O2 R1 R2)", juce::AudioChannelSet::create7point1point4(), true)
                           .withInput ("AER (G C D)", juce::AudioChannelSet::createLCR(), true)
                           .withOutput ("Sortie", juce::AudioChannelSet::stereo(), true)
-                          .withOutput ("AER séparé", juce::AudioChannelSet::stereo(), false)
+                          .withOutput ("AER", juce::AudioChannelSet::stereo(), true)
                           .withOutput ("Spots séparés", juce::AudioChannelSet::stereo(), false))),
       apvts (*this, nullptr, "DeltaAB", createLayout())
 {
@@ -483,7 +487,7 @@ void DeltaABProcessor::processDouble (const double* const* in, int numMain, doub
     dab::EngineParams p;
     readParams (p);
     dab::AerEqFilter* eq[3] = { eqActive[0], eqActive[1], eqActive[2] };
-    engine.process (*active, eq, p, ip, out, aerOut, spotsOut, n);
+    engine.process (*active, eq, p, ip, out, aerOut, spotsOut, n, flowPtrs);
 }
 
 // Where each bus sits in the process buffer (inputs and outputs both start at channel 0).
@@ -503,6 +507,11 @@ DeltaABProcessor::Io DeltaABProcessor::io (int bufferChannels) const
     }
     r.aerOutStart = start (false, 1);   r.aerOutOn = busCh (false, 1) >= 2 && r.aerOutStart + 2 <= clampN;
     r.spotOutStart = start (false, 2);  r.spotOutOn = busCh (false, 2) >= 2 && r.spotOutStart + 2 <= clampN;
+    for (int f = 0; f < kNumFlowOut; ++f)
+    {
+        r.flowStart[(size_t) f] = start (false, 3 + f);
+        r.flowOn[(size_t) f] = busCh (false, 3 + f) >= 2 && r.flowStart[(size_t) f] + 2 <= clampN;
+    }
     return r;
 }
 
@@ -533,13 +542,26 @@ void DeltaABProcessor::processAny (juce::AudioBuffer<T>& buffer)
     for (int c = 0; c < kOut; ++c) in[c] = scratch.getReadPointer (c);
     double* o[6];
     for (int c = 0; c < 6; ++c) o[c] = scratch.getWritePointer (kOut + c);
+    // engine flow order: AB mics 0..2, AER 3..5 (not sent out one by one), spots 6..
+    double* flows[2 * dab::kPanCh] = {};
+    for (int f = 0; f < kNumFlowOut; ++f)
+        if (r.flowOn[(size_t) f])
+        {
+            const int e = f < 3 ? f : f + 3;
+            flows[2 * e] = scratch.getWritePointer (kFlowOut + 2 * f);
+            flows[2 * e + 1] = scratch.getWritePointer (kFlowOut + 2 * f + 1);
+        }
+    flowPtrs = flows;
     processDouble (in, r.numMain, o, r.aerOutOn ? o + 2 : nullptr, r.spotOutOn ? o + 4 : nullptr, n);
+    flowPtrs = nullptr;
 
     buffer.clear();
     auto give = [&] (int slot, int dst) { const double* s = scratch.getReadPointer (slot); T* d = buffer.getWritePointer (dst); for (int i = 0; i < n; ++i) d[i] = (T) s[i]; };
     give (kOut, 0); give (kOut + 1, 1);
     if (r.aerOutOn) { give (kOut + 2, r.aerOutStart); give (kOut + 3, r.aerOutStart + 1); }
     if (r.spotOutOn) { give (kOut + 4, r.spotOutStart); give (kOut + 5, r.spotOutStart + 1); }
+    for (int f = 0; f < kNumFlowOut; ++f)
+        if (r.flowOn[(size_t) f]) { give (kFlowOut + 2 * f, r.flowStart[(size_t) f]); give (kFlowOut + 2 * f + 1, r.flowStart[(size_t) f] + 1); }
 }
 
 void DeltaABProcessor::processBlock (juce::AudioBuffer<double>& buffer, juce::MidiBuffer&) { processAny (buffer); }

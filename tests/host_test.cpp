@@ -21,7 +21,7 @@ int main (int argc, char** argv)
     if (! p) { std::printf ("%s\n", err.toRawUTF8()); return 1; }
 
     check (p->getTotalNumInputChannels() == 47, "47 inputs (3 mics x O1 O2 R1 R2, AER G C D, 16 spots x 2)", p->getTotalNumInputChannels());
-    check (p->getTotalNumOutputChannels() == 2, "stereo output (AER output off by default)", p->getTotalNumOutputChannels());
+    check (p->getTotalNumOutputChannels() == 42, "42 outputs (mix, AER, 3 mics, 16 spots, in stereo)", p->getTotalNumOutputChannels());
     check (p->supportsDoublePrecisionProcessing(), "64-bit processing supported", 1);
     check (p->getParameters().size() == 380, "parameter count", p->getParameters().size());
     auto setParam = [&] (const char* name, float v01) {
@@ -91,8 +91,8 @@ int main (int argc, char** argv)
         setParam ("AER · Phase des EQ", lin ? 1.0f : 0.0f);
         p->prepareToPlay (48000, 512); p->releaseResources();
         double pk = 0;
-        const double off = impulse (true, { 12 }, 0, pk, 47);
-        check (off == 0, lin ? "AER lin EQ: impulse on L at latency (offset)" : "AER min EQ: impulse on L at latency (offset)", off);
+        const double off = impulse (true, { 12 }, 2, pk, 47);
+        check (off == 0, lin ? "AER lin EQ: impulse on AER out L at latency (offset)" : "AER min EQ: impulse on AER out L at latency (offset)", off);
         check (std::abs (pk - 1) < 1e-6, lin ? "AER lin EQ: flat EQ gives unity" : "AER min EQ: flat EQ gives unity", pk);
         if (lin) check (p->getLatencySamples() == latListen, "AER lin EQ: same latency as the linear crossover", p->getLatencySamples());
     }
@@ -116,21 +116,27 @@ int main (int argc, char** argv)
         check (pk < 1e-12 && pk2 < 1e-12, "Spot 9 is off until added (8 spots by default)", pk + pk2);
     }
 
-    // Separate AER output: enable the second output bus, AER goes to channels 2-3 and leaves the main output
+    // AER output disabled: the AER goes back into the main mix
     {
         auto layout = p->getBusesLayout();
-        layout.outputBuses.getReference (1) = juce::AudioChannelSet::stereo();
-        const bool ok = p->setBusesLayout (layout);
-        if (! ok) for (auto& b : layout.inputBuses) std::printf ("   in bus: %s (%d)\n", b.getDescription().toRawUTF8(), b.size());
-        check (ok, "AER separate output can be enabled", 1);
-        check (p->getTotalNumOutputChannels() == 4, "outputs with AER separate", p->getTotalNumOutputChannels());
-        double pkMain = 0, pkAer = 0;
-        impulse (false, { 12 }, 0, pkMain, 47);
-        const double off = impulse (false, { 12 }, 2, pkAer, 47);
-        check (pkMain < 1e-9, "AER separate: nothing on main L", pkMain);
-        check (off == 0 && std::abs (pkAer - 1) < 1e-6, "AER separate: AER G on output 3 at latency", pkAer);
         layout.outputBuses.getReference (1) = juce::AudioChannelSet::disabled();
+        check (p->setBusesLayout (layout), "AER output can be disabled", 1);
+        double pkMain = 0;
+        const double off = impulse (false, { 12 }, 0, pkMain, 47);
+        check (off == 0 && std::abs (pkMain - 1) < 1e-6, "AER output off: AER G in main L at latency", pkMain);
+        layout.outputBuses.getReference (1) = juce::AudioChannelSet::stereo();
         p->setBusesLayout (layout);
+    }
+
+    // Per-flow outputs: mic 1 alone on its own stereo pair (outputs 5-6), spot 1 on its pair
+    {
+        double pk = 0;
+        double off = impulse (true, { 0, 2 }, 4, pk, 47);   // mic 1 X + Y (O1, R1): crossover reconstruction = 1 at L
+        check (off == 0 && std::abs (pk - 1) < 1e-9, "Flow out Micro 1: on its own pair, L, at latency", pk);
+        double pkC = 0; impulse (true, { 0, 2 }, 8, pkC, 47);   // Micro 3 C pair stays silent
+        check (pkC < 1e-12, "Flow out Micro 3: silent when only mic 1 plays", pkC);
+        off = impulse (true, { 15 }, 10, pk, 47);   // spot 1 cardio -> spot 1 pair (outputs 11-12), panned L
+        check (off == 0 && std::abs (pk - 1) < 1e-9, "Flow out Spot 1: cardio on its own pair at latency", pk);
     }
 
     // switch to Export quality via the host parameter and let the plugin rebuild
