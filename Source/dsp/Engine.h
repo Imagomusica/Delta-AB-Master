@@ -196,6 +196,7 @@ struct PanParams {
 
 struct MicParams : PanParams {
     bool swapInputs = false;     // false: input 1 = X, input 2 = Y
+    double gainXDb = 0;          // gain applied to X before the crossover (gain match, with matchDb on Y)
     double matchDb = 0;          // gain applied to Y before the crossover
     bool ribbonInLows = false;   // true: Y in the lows, X in the highs
     double focusDb = 0;          // source in the highs
@@ -213,6 +214,7 @@ struct AerParams : PanParams {
 // EN-MS spot: cardioid (Mid) + ribbon figure-8 aimed sideways (Side).
 struct SpotParams : PanParams {
     bool crossover = false;      // false: M/S (M + S summed, the ribbon polarity picks the side); true: crossover as in Delta AB
+    double gainCDb = 0;          // cardio gain before M/S or crossover (gain match, with matchDb on the ribbon)
     double matchDb = 0;          // ribbon gain before M/S or crossover
     bool ribbonInLows = false;   // crossover mode
     bool ribbonInvert = false;   // M/S mode: S polarity, aims the virtual mic to the other side
@@ -323,6 +325,11 @@ public:
         for (auto* v : { &mono, &hx, &lowBand, &lowBandH })
             for (auto& b : *v) b.assign ((size_t) maxN, 0.0);
         spotHi.assign ((size_t) maxN, 0.0);
+        for (auto& b : spotIn) b.assign ((size_t) maxN, 0.0);
+        meterPow.fill (0.0);
+        inGain.fill (1.0);
+        for (auto& m : meterRmsDb) m.store (-300.0f);
+        for (auto& m : meterPeak) m.store (0.0f);
         for (auto& b : flowTmp) b.assign ((size_t) maxN, 0.0);
         cSend.assign ((size_t) maxN, 0.0);
         for (auto& b : bus) b.assign ((size_t) maxN, 0.0);
@@ -384,6 +391,11 @@ public:
         for (int c = 0; c < kNumIn; ++c) all[c] = c < 6 ? in[c] : silence.data();
         process (set, nullptr, p, all, out, nullptr, nullptr, n);
     }
+
+    // Input meters for gain matching, after the input gains: per mic X, Y (0..5), per spot cardio, ribbon (6..).
+    // peak: max |x| since the UI last read it (the UI exchanges it with 0); rms: 300 ms average power, in dB.
+    static constexpr int kMeterCh = 2 * (3 + kMaxSpots);
+    std::array<std::atomic<float>, kMeterCh> meterPeak {}, meterRmsDb {};
 
     // Level analyser results (dB to add to Y so it matches X).
     struct Analyser {
@@ -457,19 +469,27 @@ private:
             const auto& mp = p.mic[(size_t) m];
             const double* oIn = in[m * 2 + (mp.swapInputs ? 1 : 0)];
             const double* rIn = in[m * 2 + (mp.swapInputs ? 0 : 1)];
-            const double match = dbToGain (mp.matchDb);
             analyse (m, mp.analyse, set.cfg.fc[(size_t) m], oIn, rIn, n);
 
             double* low = lo[(size_t) m].data();
             double* high = hi[(size_t) m].data();
             auto& sF = sm (kFB + m * 2); auto& sB = sm (kFB + m * 2 + 1);
+            // input gains, ramped over the block (no zipper while matching)
+            const double gx0 = inGain[(size_t) (2 * m)], gy0 = inGain[(size_t) (2 * m + 1)];
+            const double gx1 = dbToGain (mp.gainXDb), gy1 = dbToGain (mp.matchDb);
+            inGain[(size_t) (2 * m)] = gx1; inGain[(size_t) (2 * m + 1)] = gy1;
+            const double dx = (gx1 - gx0) / n, dy = (gy1 - gy0) / n;
+            double pkX = 0, pkY = 0, eX = 0, eY = 0;
             for (int i = 0; i < n; ++i)
             {
-                const double om = oIn[i], rb = rIn[i] * match;
+                const double om = oIn[i] * (gx0 + dx * (i + 1)), rb = rIn[i] * (gy0 + dy * (i + 1));
+                pkX = std::max (pkX, std::abs (om)); pkY = std::max (pkY, std::abs (rb));
+                eX += om * om; eY += rb * rb;
                 const double gF = sF.next(), gB = sB.next();
                 low[i]  = (mp.ribbonInLows ? rb : om) * gB;
                 high[i] = (mp.ribbonInLows ? om : rb) * gF;
             }
+            meter (2 * m, pkX, eX, n); meter (2 * m + 1, pkY, eY, n);
             double* mo = mono[(size_t) m].data();
             set.mic[(size_t) m].process (low, high, mo, n);
             auto& pad = set.abPad[(size_t) m];
@@ -523,9 +543,26 @@ private:
             const auto& sp = p.spot[(size_t) k];
             const double* cIn = in[9 + 2 * k];
             const double* rIn = in[10 + 2 * k];
-            const double match = dbToGain (sp.matchDb);
             double* mo = mono[(size_t) (6 + k)].data();
             auto& gC = sm (kSpotG + 2 * k); auto& gR = sm (kSpotG + 2 * k + 1);
+            // input gains (gain match), ramped over the block; the matched inputs feed the meters
+            {
+                double* ci = spotIn[0].data(); double* ri = spotIn[1].data();
+                const size_t a = (size_t) (6 + 2 * k), b = a + 1;
+                const double c0 = inGain[a], r0 = inGain[b], c1 = dbToGain (sp.gainCDb), r1 = dbToGain (sp.matchDb);
+                inGain[a] = c1; inGain[b] = r1;
+                const double dc = (c1 - c0) / n, dr = (r1 - r0) / n;
+                double pkC = 0, pkR = 0, eC = 0, eR = 0;
+                for (int i = 0; i < n; ++i)
+                {
+                    ci[i] = cIn[i] * (c0 + dc * (i + 1)); ri[i] = rIn[i] * (r0 + dr * (i + 1));
+                    pkC = std::max (pkC, std::abs (ci[i])); pkR = std::max (pkR, std::abs (ri[i]));
+                    eC += ci[i] * ci[i]; eR += ri[i] * ri[i];
+                }
+                meter ((int) a, pkC, eC, n); meter ((int) b, pkR, eR, n);
+                cIn = ci; rIn = ri;
+            }
+            const double match = 1.0;
             if (sp.crossover)
             {
                 double* low = lo[0].data();     // AB scratch, free here
@@ -655,6 +692,16 @@ private:
             pan[(size_t) k].process (mo, h, lb, hlb, dst, n);
     }
 
+    void meter (int ch, double pk, double e, int n)
+    {
+        auto& p = meterPeak[(size_t) ch];
+        if ((float) pk > p.load (std::memory_order_relaxed)) p.store ((float) pk, std::memory_order_relaxed);
+        const double a = std::exp (-(double) n / (0.3 * fs));
+        auto& acc = meterPow[(size_t) ch];
+        acc = a * acc + (1 - a) * e / n;
+        meterRmsDb[(size_t) ch].store ((float) (10.0 * std::log10 (acc + 1e-30)), std::memory_order_relaxed);
+    }
+
     void analyse (int m, bool on, double fc, const double* oIn, const double* rIn, int n)
     {
         auto& a = analysers[(size_t) m];
@@ -731,6 +778,9 @@ private:
     std::array<Biquad, 3> lowCut;
     std::array<double, 3> lastLowCut { -1, -1, -1 };
     std::array<Analyser, 3> analysers;
+    std::array<double, kMeterCh> meterPow {};
+    std::array<double, kMeterCh> inGain {};
+    std::array<std::vector<double>, 2> spotIn;
     std::array<MinEq, 3> aerMinEq;
     std::vector<double> silence;
 };

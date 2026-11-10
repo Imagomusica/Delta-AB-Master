@@ -9,7 +9,6 @@ int main (int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI init;
     const juce::File dir (argc > 1 ? juce::String (argv[1]) : juce::File::getCurrentWorkingDirectory().getFullPathName());
     std::unique_ptr<juce::AudioProcessor> p (createPluginFilter());
-    p->prepareToPlay (48000, 512);
     std::unique_ptr<juce::AudioProcessorEditor> ed (p->createEditor());
     auto save = [&] (const juce::String& name, float scale)
     {
@@ -20,6 +19,30 @@ int main (int argc, char** argv)
         juce::PNGImageFormat().writeImageToStream (img, os);
         std::printf ("%s\n", f.getFullPathName().toRawUTF8());
     };
+    {   // feed some signal so the gain-match meters show: mic 1 X at -12 dB, Y at -15.5 dB (noise)
+        juce::AudioBuffer<double> b (p->getTotalNumInputChannels() > p->getTotalNumOutputChannels() ? p->getTotalNumInputChannels() : p->getTotalNumOutputChannels(), 512);
+        juce::MidiBuffer midi; juce::Random rnd (1);
+        p->setProcessingPrecision (juce::AudioProcessor::doublePrecision);
+        p->prepareToPlay (48000, 512);
+        for (int blk = 0; blk < 60; ++blk)
+        {
+            b.clear();
+            for (int i = 0; i < 512; ++i)
+            {
+                b.setSample (0, i, 0.25 * (rnd.nextDouble() * 2 - 1) * 1.732);
+                b.setSample (1, i, 0.168 * (rnd.nextDouble() * 2 - 1) * 1.732);
+                b.setSample (9, i, 0.2 * (rnd.nextDouble() * 2 - 1));
+                b.setSample (10, i, 0.3 * (rnd.nextDouble() * 2 - 1));
+            }
+            static_cast<juce::AudioProcessor&> (*p).processBlock (b, midi);
+        }
+    }
+    if (auto* c = ed->findChildWithID ("console")) (void) c;
+    std::function<void (juce::Component&)> tickAll = [&] (juce::Component& c) {
+        if (auto* s = dynamic_cast<ui::Strip*> (&c)) s->tick();
+        for (auto* ch : c.getChildren()) tickAll (*ch);
+    };
+    tickAll (*ed);
     save ("console.png", 1.5f);
     // open each kind of detail by clicking its DETAIL button
     auto clickDetail = [&] (const juce::String& stripTitle)

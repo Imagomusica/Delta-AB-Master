@@ -54,18 +54,20 @@ struct Toggle : juce::Component
     std::unique_ptr<APVTS::ButtonAttachment> att;
 };
 
-// Two-position switch for a two-choice parameter: shows both positions, the active one lit.
+// Slide switch (Telefunken W 659 style) for a bool or choice parameter.
 struct Switch : juce::Component
 {
+    Switch (APVTS&, const juce::String& id, const juce::StringArray& names);
     Switch (APVTS&, const juce::String& id, const juce::String& a, const juce::String& b);
     void paint (juce::Graphics&) override;
     void mouseDown (const juce::MouseEvent&) override;
-    juce::String la, lb;
+    juce::StringArray labels;
     int index = 0;
+    juce::Rectangle<float> slot() const;
     std::unique_ptr<juce::ParameterAttachment> att;
 };
 
-// Rotary selector with a pointer knob and engraved positions around it (oscilloscope style).
+// Rotary selector, Nagra style: flat pointed bar knob sunk in a round cup, positions engraved around it.
 struct Selector : juce::Component
 {
     Selector (APVTS&, const juce::String& id, const juce::String& caption);
@@ -78,8 +80,22 @@ struct Selector : juce::Component
     int index = 0, dragStart = 0;
     std::unique_ptr<juce::ParameterAttachment> att;
 private:
+    struct Geo { juce::Point<float> c; float R; };
     void select (int i);
     float angleOf (int i) const;
+    Geo geo() const;
+};
+
+// Gain-match meters: two peak bars (with the 300 ms RMS as a marker) and the live difference in dB.
+struct MatchMeter : juce::Component
+{
+    MatchMeter (DeltaABProcessor& p, int a, int b, const juce::String& la, const juce::String& lb) : proc (p), ch { a, b }, lab { la, lb } {}
+    void tick();
+    void paint (juce::Graphics&) override;
+    DeltaABProcessor& proc;
+    int ch[2];
+    juce::String lab[2];
+    float peakDb[2] { -100.0f, -100.0f }, rmsDb[2] { -300.0f, -300.0f };
 };
 
 // Placeholder for an insert slot (VST or hardware), not active yet.
@@ -99,16 +115,22 @@ struct Strip : juce::Component
     Toggle& toggle (APVTS&, const juce::String& id, const juce::String& text);
     Switch& switch2 (APVTS&, const juce::String& id, const juce::String& a, const juce::String& b);
     void insert (const juce::String& text);
+    void selector (APVTS&, const juce::String& id, const juce::String& caption, int h);
+    Switch& switchN (APVTS&, const juce::String& id, const juce::StringArray& names);
+    void knobRow (APVTS&, std::initializer_list<std::pair<juce::String, juce::String>>, int h, bool values);
     void selectorPair (APVTS&, const juce::String& idA, const juce::String& a, const juce::String& idB, const juce::String& b);
     void fader (APVTS&, const juce::String& id);
+    void matchMeter (DeltaABProcessor&, int a, int b, const juce::String& la, const juce::String& lb);
+    void tick() { for (auto* m : meters) m->tick(); }
     void paint (juce::Graphics&) override;
     void resized() override;
 
     juce::String title;
     juce::TextButton detail { "DETAIL" };
+    std::vector<MatchMeter*> meters;
 
 private:
-    struct Item { juce::Component* c; int h; juce::Component* c2 = nullptr; };
+    struct Item { std::vector<juce::Component*> cs; int h; };
     std::vector<Item> items;
     juce::OwnedArray<juce::Component> owned;
     Knob* faderKnob = nullptr;
@@ -144,7 +166,7 @@ struct Console : juce::Component, private juce::Timer
     void paint (juce::Graphics&) override;
     void resized() override;
 
-    static constexpr int kW = 1560, kH = 900;
+    static constexpr int kW = 1560, kH = 960;
 
 private:
     void timerCallback() override;

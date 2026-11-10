@@ -4,7 +4,7 @@
 #include <cstdio>
 
 static int fails = 0;
-static constexpr int kParams = 415;   // 3 mics x (xsrc, ysrc ...) + AER + 16 spots + global
+static constexpr int kParams = 434;   // 3 mics x (xsrc, ysrc ...) + AER + 16 spots + global
 static void check (bool ok, const char* what, double v) { std::printf ("[%s] %-60s %g\n", ok ? " OK " : "FAIL", what, v); if (! ok) ++fails; }
 
 int main (int argc, char** argv)

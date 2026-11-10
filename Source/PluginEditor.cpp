@@ -221,34 +221,78 @@ Toggle::Toggle (APVTS& s, const juce::String& id, const juce::String& text)
     att = std::make_unique<APVTS::ButtonAttachment> (s, id, button);
 }
 
-Switch::Switch (APVTS& s, const juce::String& id, const juce::String& a, const juce::String& b)
-    : la (upper (a)), lb (upper (b))
+Switch::Switch (APVTS& s, const juce::String& id, const juce::StringArray& names)
 {
+    for (auto& n : names) labels.add (upper (n));
     if (auto* p = s.getParameter (id))
     {
-        att = std::make_unique<juce::ParameterAttachment> (*p, [this] (float v) { index = v > 0.5f ? 1 : 0; repaint(); });
+        att = std::make_unique<juce::ParameterAttachment> (*p, [this] (float v) { index = juce::jlimit (0, labels.size() - 1, juce::roundToInt (v)); repaint(); });
         att->sendInitialUpdate();
     }
 }
 
+Switch::Switch (APVTS& s, const juce::String& id, const juce::String& a, const juce::String& b)
+    : Switch (s, id, juce::StringArray { a, b }) {}
+
+static juce::Font monoFont (float h) { return juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), h, juce::Font::bold)); }
+
+// Slide switch in the style of the Telefunken W 659 (MS | XY): a slot with a light ridged block.
+// Two positions: labels left and right of the slot. More: labels above each position.
+juce::Rectangle<float> Switch::slot() const
+{
+    auto r = getLocalBounds().toFloat();
+    if (labels.size() == 2) return r.reduced (r.getWidth() * 0.32f, 0).withSizeKeepingCentre (r.getWidth() * 0.36f, juce::jmin (16.0f, r.getHeight()));
+    return r.withTrimmedTop (12).reduced (6, 1);
+}
+
 void Switch::paint (juce::Graphics& g)
 {
-    auto r = getLocalBounds().toFloat().reduced (0.5f);
-    g.setColour (kWhite);
-    g.drawRect (r, 1.0f);
-    auto left = r.removeFromLeft (r.getWidth() / 2);
-    g.fillRect (index == 0 ? left.reduced (2) : r.reduced (2));
-    g.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 9.5f, juce::Font::bold)));
-    g.setColour (index == 0 ? kBlack : kWhite);
-    g.drawFittedText (la, left.toNearestInt(), juce::Justification::centred, 1, 0.6f);
-    g.setColour (index == 1 ? kBlack : kWhite);
-    g.drawFittedText (lb, r.toNearestInt(), juce::Justification::centred, 1, 0.6f);
+    const int n = juce::jmax (2, labels.size());
+    auto r = getLocalBounds().toFloat();
+    const auto sl = slot();
+    g.setFont (monoFont (9.5f));
+    if (labels.size() == 2)
+    {
+        g.setColour (index == 0 ? kWhite : kGrey);
+        g.drawFittedText (labels[0], juce::Rectangle<float> (r.getX(), r.getY(), sl.getX() - r.getX() - 3, r.getHeight()).toNearestInt(), juce::Justification::centredRight, 1, 0.6f);
+        g.setColour (index == 1 ? kWhite : kGrey);
+        g.drawFittedText (labels[1], juce::Rectangle<float> (sl.getRight() + 3, r.getY(), r.getRight() - sl.getRight() - 3, r.getHeight()).toNearestInt(), juce::Justification::centredLeft, 1, 0.6f);
+    }
+    else
+    {
+        const float w = sl.getWidth() / (float) n;
+        for (int i = 0; i < n; ++i)
+        {
+            g.setColour (i == index ? kWhite : kGrey);
+            g.drawFittedText (labels[i], juce::Rectangle<float> (sl.getX() + w * (float) i - 4, r.getY(), w + 8, 11).toNearestInt(), juce::Justification::centred, 1, 0.5f);
+        }
+    }
+    // slot: recessed, dark
+    g.setColour (juce::Colour (0xff141414)); g.fillRoundedRectangle (sl, 2.0f);
+    g.setColour (kGrey); g.drawRoundedRectangle (sl, 2.0f, 1.0f);
+    // block
+    const float w = sl.getWidth() / (float) n;
+    auto blk = juce::Rectangle<float> (sl.getX() + w * (float) index, sl.getY(), w, sl.getHeight()).reduced (1.5f);
+    g.setColour (juce::Colour (0xffe8e4da)); g.fillRoundedRectangle (blk, 1.5f);
+    g.setColour (kBlack);
+    for (int i = 1; i <= 3; ++i)
+    {
+        const float x = blk.getX() + blk.getWidth() * (float) i / 4.0f;
+        g.drawLine (x, blk.getY() + 2.5f, x, blk.getBottom() - 2.5f, 1.0f);
+    }
 }
 
 void Switch::mouseDown (const juce::MouseEvent& e)
 {
     if (att == nullptr) return;
-    const int want = e.x < getWidth() / 2 ? 0 : 1;
+    const int n = juce::jmax (2, labels.size());
+    int want;
+    if (n == 2) want = index == 0 ? 1 : 0;   // a click flips it, like the real lever
+    else
+    {
+        const auto sl = slot();
+        want = juce::jlimit (0, n - 1, (int) ((e.position.x - sl.getX()) / (sl.getWidth() / (float) n)));
+    }
     if (want != index) att->setValueAsCompleteGesture ((float) want);
 }
 
@@ -256,7 +300,12 @@ Selector::Selector (APVTS& s, const juce::String& id, const juce::String& cap) :
 {
     if (auto* p = dynamic_cast<juce::AudioParameterChoice*> (s.getParameter (id)))
     {
-        names = p->choices;
+        for (auto n : p->choices)
+        {
+            n = n.replace (" Hz", "").replace (u ("Focal"), "FOC");
+            if (n.endsWith ("000")) n = n.dropLastCharacters (3) + "k";
+            names.add (n);
+        }
         att = std::make_unique<juce::ParameterAttachment> (*p, [this] (float v) { index = juce::roundToInt (v); repaint(); });
         att->sendInitialUpdate();
     }
@@ -265,7 +314,7 @@ Selector::Selector (APVTS& s, const juce::String& id, const juce::String& cap) :
 float Selector::angleOf (int i) const
 {
     const int n = juce::jmax (1, names.size());
-    const float span = juce::MathConstants<float>::pi * 0.75f;   // positions spread over 135 degrees, centred up
+    const float span = juce::MathConstants<float>::pi * (n <= 4 ? 0.75f : 1.45f);   // 135 deg for 4 sources, ~260 deg for the crossover
     return n == 1 ? 0.0f : -span / 2 + span * (float) i / (float) (n - 1);
 }
 
@@ -275,47 +324,76 @@ void Selector::select (int i)
     if (att != nullptr && i != index) att->setValueAsCompleteGesture ((float) i);
 }
 
+Selector::Geo Selector::geo() const
+{
+    auto r = getLocalBounds().toFloat();
+    const bool wide = names.size() > 4;
+    if (! wide)   // source selector: caption on the left, cup low, labels in an arc above it
+    {
+        const float R = (r.getHeight() - 17) / 2;
+        return { { r.getCentreX() + 8, r.getBottom() - R - 1 }, R };
+    }
+    if (caption.isNotEmpty()) r.removeFromBottom (12);
+    // label ring sits outside the cup: leave room for the text all around (wide) or above (4 sources)
+    const float R = wide ? juce::jmin (r.getWidth() / 2 - 14, r.getHeight() / 2 - 8) : juce::jmin (r.getWidth() / 2 - 12, r.getHeight() - 26);
+    const juce::Point<float> c (r.getCentreX(), wide ? r.getCentreY() + 3 : r.getBottom() - R - 2);
+    return { c, R };
+}
+
+// Nagra HD style: a flat bar knob with a pointed tip, sunk in a round cup, positions engraved around it.
 void Selector::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat();
     g.setColour (kWhite);
-    g.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 10.0f, juce::Font::bold)));
-    g.drawText (caption, r.removeFromBottom (12), juce::Justification::centred);
-    const float R = juce::jmin (r.getWidth() / 2, r.getHeight() * 0.62f) - 1;
-    const juce::Point<float> c (r.getCentreX(), r.getBottom() - R * 0.55f);
-    const float rk = R * 0.48f;
-    // engraved positions
-    g.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 8.5f, juce::Font::bold)));
+    g.setFont (monoFont (10.0f));
+    const auto [c, R] = geo();
+    if (names.size() <= 4)
+    {
+        g.setFont (monoFont (16.0f));
+        g.drawText (caption, juce::Rectangle<float> (r.getX() + 2, c.y - 10, c.x - R - 24 - r.getX(), 20), juce::Justification::centredLeft);
+    }
+    else if (caption.isNotEmpty()) g.drawText (caption, r.removeFromBottom (12), juce::Justification::centred);
+    // engraved positions: tick on the rim, label outside
+    g.setFont (monoFont (names.size() > 4 ? 8.0f : 8.5f));
     for (int i = 0; i < names.size(); ++i)
     {
         const float a = angleOf (i);
         g.setColour (i == index ? kWhite : kGrey);
-        g.drawLine (c.x + std::sin (a) * (rk + 2), c.y - std::cos (a) * (rk + 2), c.x + std::sin (a) * (rk + 5), c.y - std::cos (a) * (rk + 5), 1.0f);
-        const float rn = rk + 11;
-        g.drawText (names[i], juce::Rectangle<float> (c.x + std::sin (a) * rn - 9, c.y - std::cos (a) * rn - 5, 18, 10), juce::Justification::centred);
+        g.drawLine (c.x + std::sin (a) * (R + 1), c.y - std::cos (a) * (R + 1), c.x + std::sin (a) * (R + 4), c.y - std::cos (a) * (R + 4), 1.5f);
+        const float rn = R + 11;
+        g.drawText (names[i], juce::Rectangle<float> (c.x + std::sin (a) * rn - 11, c.y - std::cos (a) * rn - 5, 22, 10), juce::Justification::centred);
     }
-    // pointer knob ("chicken head"): round hub with a tapered bar pointing at the position
-    const float a = angleOf (index);
+    // cup: bevelled rim, dark well
+    g.setColour (kGrey);  g.fillEllipse (c.x - R, c.y - R, 2 * R, 2 * R);
+    g.setColour (kDim);   g.fillEllipse (c.x - R + 1.5f, c.y - R + 1.5f, 2 * R - 3, 2 * R - 3);
+    g.setColour (juce::Colour (0xff101010)); g.fillEllipse (c.x - R * 0.86f, c.y - R * 0.86f, R * 1.72f, R * 1.72f);
+    // bar knob across the cup, pointed at the selected position
+    const float a = angleOf (index), L = R * 0.84f, Wd = R * 0.30f;
     juce::Path bar;
-    bar.addTriangle (-rk * 0.32f, rk * 0.55f, rk * 0.32f, rk * 0.55f, 0.0f, -rk);
-    bar.addEllipse (-rk * 0.55f, -rk * 0.55f, rk * 1.1f, rk * 1.1f);
+    bar.startNewSubPath (0, -L);                       // tip
+    bar.lineTo (Wd, -L + Wd * 1.3f);
+    bar.lineTo (Wd, L - Wd * 0.4f);
+    bar.quadraticTo (Wd, L, 0, L);
+    bar.quadraticTo (-Wd, L, -Wd, L - Wd * 0.4f);
+    bar.lineTo (-Wd, -L + Wd * 1.3f);
+    bar.closeSubPath();
     bar.applyTransform (juce::AffineTransform::rotation (a).translated (c));
+    g.setColour (juce::Colour (0xffd9d9d9)); g.fillPath (bar);
+    g.setColour (kWhite); g.strokePath (bar, juce::PathStrokeType (1.0f));
+    // ridge along the bar and the index line on the tip
+    g.setColour (kGrey);
+    g.drawLine (c.x - std::sin (a) * L * 0.8f, c.y + std::cos (a) * L * 0.8f, c.x + std::sin (a) * L * 0.5f, c.y - std::cos (a) * L * 0.5f, 1.0f);
     g.setColour (kBlack);
-    g.fillPath (bar);
-    g.setColour (kWhite);
-    g.strokePath (bar, juce::PathStrokeType (1.2f));
-    g.drawLine (c.x, c.y, c.x + std::sin (a) * rk * 0.95f, c.y - std::cos (a) * rk * 0.95f, 2.0f);
+    g.drawLine (c.x + std::sin (a) * L * 0.55f, c.y - std::cos (a) * L * 0.55f, c.x + std::sin (a) * (L - 2), c.y - std::cos (a) * (L - 2), 2.0f);
 }
 
 void Selector::mouseDown (const juce::MouseEvent& e)
 {
     dragStart = index;
     // a click on (or near) a position label selects it
-    const auto r = getLocalBounds().toFloat().withTrimmedBottom (12);
-    const float R = juce::jmin (r.getWidth() / 2, r.getHeight() * 0.62f) - 1;
-    const juce::Point<float> c (r.getCentreX(), r.getBottom() - R * 0.55f);
+    const auto [c, R] = geo();
     const auto d = e.position - c;
-    if (d.getDistanceFromOrigin() > R * 0.48f)
+    if (d.getDistanceFromOrigin() > R * 0.9f)
     {
         const float a = std::atan2 (d.x, -d.y);
         int best = 0; float bd = 1e9f;
@@ -334,6 +412,47 @@ void Selector::mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDe
     select (index + (w.deltaY > 0 ? 1 : -1));
 }
 
+void MatchMeter::tick()
+{
+    for (int i = 0; i < 2; ++i)
+    {
+        const float pk = proc.takeMeterPeak (ch[i]);
+        const float db = pk > 1e-6f ? 20.0f * std::log10 (pk) : -100.0f;
+        peakDb[i] = juce::jmax (db, peakDb[i] - 1.5f);   // falls about 20 dB/s at 15 Hz
+        rmsDb[i] = proc.meterRmsDb (ch[i]);
+    }
+    repaint();
+}
+
+void MatchMeter::paint (juce::Graphics& g)
+{
+    auto r = getLocalBounds().toFloat();
+    const float lo = -48.0f;
+    auto xOf = [&] (juce::Rectangle<float> b, float db) { return b.getX() + b.getWidth() * juce::jlimit (0.0f, 1.0f, (db - lo) / -lo); };
+    g.setFont (monoFont (9.0f));
+    for (int i = 0; i < 2; ++i)
+    {
+        auto row = r.removeFromTop (10);
+        g.setColour (kWhite);
+        g.drawText (lab[i], row.removeFromLeft (10), juce::Justification::centredLeft);
+        auto bar = row.reduced (0, 1.5f);
+        g.setColour (kDim); g.fillRect (bar);
+        g.setColour (kWhite); g.fillRect (bar.withRight (xOf (bar, peakDb[i])));
+        if (rmsDb[i] > lo) { g.setColour (kBlack); g.fillRect (xOf (bar, rmsDb[i]) - 1.0f, bar.getY(), 2.0f, bar.getHeight()); }
+        r.removeFromTop (2);
+    }
+    // the difference, from the 300 ms RMS: what to add to the second input to match the first
+    juce::String t = u ("Δ  —");
+    if (rmsDb[0] > -90.0f && rmsDb[1] > -90.0f)
+    {
+        const float d = rmsDb[0] - rmsDb[1];
+        t = u ("Δ ") + (d >= 0 ? "+" : "") + juce::String (d, 1) + " dB";
+    }
+    g.setColour (kWhite);
+    g.setFont (monoFont (13.0f));
+    g.drawText (t, r, juce::Justification::centred);
+}
+
 void InsertSlot::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat().reduced (0.5f);
@@ -343,7 +462,7 @@ void InsertSlot::paint (juce::Graphics& g)
     juce::Path d; juce::PathStrokeType (1.0f).createDashedStroke (d, p, dash, 2);
     g.fillPath (d);
     g.setColour (kGrey);
-    g.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 9.0f, juce::Font::bold)));
+    g.setFont (monoFont (9.0f));
     g.drawFittedText (upper (text), getLocalBounds().reduced (2), juce::Justification::centred, 1, 0.6f);
 }
 
@@ -361,7 +480,7 @@ Knob& Strip::knob (APVTS& s, const juce::String& id, const juce::String& caption
 {
     auto* k = new Knob (s, id, caption, false, delayMetres); owned.add (k);
     addAndMakeVisible (k);
-    items.push_back ({ k, delayMetres ? 92 : 80 });
+    items.push_back ({ { k }, delayMetres ? 92 : 80 });
     return *k;
 }
 
@@ -369,7 +488,7 @@ Choice& Strip::choice (APVTS& s, const juce::String& id, const juce::String& cap
 {
     auto* c = new Choice (s, id, caption); owned.add (c);
     addAndMakeVisible (c);
-    items.push_back ({ c, 33 });
+    items.push_back ({ { c }, 33 });
     return *c;
 }
 
@@ -377,7 +496,7 @@ Toggle& Strip::toggle (APVTS& s, const juce::String& id, const juce::String& tex
 {
     auto* t = new Toggle (s, id, text); owned.add (t);
     addAndMakeVisible (t);
-    items.push_back ({ t, 20 });
+    items.push_back ({ { t }, 20 });
     return *t;
 }
 
@@ -385,7 +504,7 @@ Switch& Strip::switch2 (APVTS& s, const juce::String& id, const juce::String& a,
 {
     auto* t = new Switch (s, id, a, b); owned.add (t);
     addAndMakeVisible (t);
-    items.push_back ({ t, 20 });
+    items.push_back ({ { t }, 20 });
     return *t;
 }
 
@@ -393,7 +512,7 @@ void Strip::insert (const juce::String& text)
 {
     auto* t = new InsertSlot (text); owned.add (t);
     addAndMakeVisible (t);
-    items.push_back ({ t, 18 });
+    items.push_back ({ { t }, 18 });
 }
 
 void Strip::selectorPair (APVTS& s, const juce::String& idA, const juce::String& a, const juce::String& idB, const juce::String& b)
@@ -401,7 +520,44 @@ void Strip::selectorPair (APVTS& s, const juce::String& idA, const juce::String&
     auto* x = new Selector (s, idA, a); owned.add (x);
     auto* y = new Selector (s, idB, b); owned.add (y);
     addAndMakeVisible (x); addAndMakeVisible (y);
-    items.push_back ({ x, 66, y });
+    items.push_back ({ { x }, 60 });
+    items.push_back ({ { y }, 60 });
+}
+
+void Strip::selector (APVTS& s, const juce::String& id, const juce::String& caption, int h)
+{
+    auto* x = new Selector (s, id, caption); owned.add (x);
+    addAndMakeVisible (x);
+    items.push_back ({ { x }, h });
+}
+
+Switch& Strip::switchN (APVTS& s, const juce::String& id, const juce::StringArray& names)
+{
+    auto* t = new Switch (s, id, names); owned.add (t);
+    addAndMakeVisible (t);
+    items.push_back ({ { t }, 26 });
+    return *t;
+}
+
+void Strip::knobRow (APVTS& s, std::initializer_list<std::pair<juce::String, juce::String>> ks, int h, bool values)
+{
+    Item it { {}, h };
+    for (auto& [id, cap] : ks)
+    {
+        auto* k = new Knob (s, id, cap); owned.add (k);
+        if (! values) k->slider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        addAndMakeVisible (k);
+        it.cs.push_back (k);
+    }
+    items.push_back (it);
+}
+
+void Strip::matchMeter (DeltaABProcessor& p, int a, int b, const juce::String& la, const juce::String& lb)
+{
+    auto* m = new MatchMeter (p, a, b, la, lb); owned.add (m);
+    addAndMakeVisible (m);
+    meters.push_back (m);
+    items.push_back ({ { m }, 40 });
 }
 
 void Strip::fader (APVTS& s, const juce::String& id)
@@ -429,8 +585,8 @@ void Strip::resized()
     for (auto& it : items)
     {
         auto b = r.removeFromTop (it.h);
-        if (it.c2 != nullptr) { it.c->setBounds (b.removeFromLeft (b.getWidth() / 2)); it.c2->setBounds (b); }
-        else it.c->setBounds (b);
+        const int n = (int) it.cs.size(), w = b.getWidth() / juce::jmax (1, n);
+        for (int i = 0; i < n; ++i) it.cs[(size_t) i]->setBounds (i == n - 1 ? b : b.removeFromLeft (w));
         r.removeFromTop (5);
     }
     if (faderKnob != nullptr) faderKnob->setBounds (r.withTrimmedTop (4));
@@ -557,12 +713,13 @@ Console::Console (DeltaABProcessor& p)
         const int m = abMic[i];
         auto& st = *(ab[i] = std::make_unique<Strip> (abTitle[i], [this, m] { openMic (m); }));
         st.selectorPair (s, mid (m, "xsrc"), "X", mid (m, "ysrc"), "Y");
-        st.knob (s, mid (m, "match"), "gain match");
-        st.choice (s, mid (m, "xover"), "xover");
-        st.choice (s, mid (m, "lows"), "switch");
-        st.knob (s, mid (m, "focus"), "focus");
-        st.knob (s, mid (m, "bloom"), "bloom");
+        st.knobRow (s, { { mid (m, "gainx"), "gain X" }, { mid (m, "match"), "gain Y" } }, 64, true);
+        st.matchMeter (p, 2 * m, 2 * m + 1, "X", "Y");
+        st.selector (s, mid (m, "xover"), "xover Hz", 100);
+        st.switchN (s, mid (m, "lows"), { "auto", "X LF", "Y LF" });
+        st.knobRow (s, { { mid (m, "focus"), "focus" }, { mid (m, "bloom"), "bloom" }, { "focal", "focale" } }, 64, true);
         st.knob (s, mid (m, "pan"), "pan");
+        st.knobRow (s, { { mid (m, "pan_lvl"), "niv" }, { mid (m, "pan_dly"), u ("dél") }, { mid (m, "pan_ph"), "phase" }, { mid (m, "pan_hf"), "HF" } }, 44, false);
         st.fader (s, mid (m, "level"));
         addAndMakeVisible (st);
     }
@@ -582,7 +739,8 @@ Console::Console (DeltaABProcessor& p)
     for (int k = 0; k < dab::kMaxSpots; ++k)
     {
         auto& st = *(spot[k] = std::make_unique<Strip> ("EN-MS " + juce::String (k + 1), [this, k] { openSpot (k); }));
-        st.knob (s, sid (k, "match"), "gain match");
+        st.knobRow (s, { { sid (k, "gainc"), "gain M" }, { sid (k, "match"), "gain S" } }, 64, true);
+        st.matchMeter (p, 6 + 2 * k, 7 + 2 * k, "M", "S");
         st.switch2 (s, sid (k, "mode"), "M/S", "xover");
         st.knob (s, sid (k, "cardio"), "level M");
         st.knob (s, sid (k, "ribbon"), "level S");
@@ -638,6 +796,8 @@ void Console::layoutSpots()
 
 void Console::timerCallback()
 {
+    for (auto& st : ab) st->tick();
+    for (int k = 0; k < juce::jmax (0, shownSpots); ++k) spot[k]->tick();
     if ((int) proc.apvts.getRawParameterValue ("spots_n")->load() != shownSpots) { layoutSpots(); repaint(); }
     if (detail != nullptr && detailAer >= 0)
     {

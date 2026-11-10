@@ -35,6 +35,9 @@ public:
 
     juce::AudioProcessorValueTreeState apvts;
     dab::AerEqParams aerEq (int a) const;   // current EQ settings of AER channel a (for the curve display)
+    // Gain-match meters (after the input gains): mic m X = 2m, Y = 2m+1; spot k cardio = 6+2k, ribbon = 7+2k.
+    float takeMeterPeak (int ch) { return engine.meterPeak[(size_t) ch].exchange (0.0f); }
+    float meterRmsDb (int ch) const { return engine.meterRmsDb[(size_t) ch].load(); }
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();

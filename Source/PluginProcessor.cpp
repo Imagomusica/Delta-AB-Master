@@ -57,7 +57,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
         l.add (std::make_unique<APC> (juce::ParameterID { pid (m, "xsrc"), 1 }, n + " · Source X", sourceNames, 0));
         l.add (std::make_unique<APC> (juce::ParameterID { pid (m, "ysrc"), 1 }, n + " · Source Y", sourceNames, 2));
         l.add (std::make_unique<APB> (juce::ParameterID { pid (m, "swap"), 1 }, n + u (" · Inverser entrées X/Y (6 canaux)"), false));
-        l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "match"), 1 }, n + u (" · Appariement Y"), db (-24, 24, 0.1f), 0.0f, attrDb));
+        l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "gainx"), 1 }, n + u (" · Gain X"), db (-24, 24, 0.1f), 0.0f, attrDb));
+        l.add (std::make_unique<APF> (juce::ParameterID { pid (m, "match"), 1 }, n + u (" · Gain Y"), db (-24, 24, 0.1f), 0.0f, attrDb));
         l.add (std::make_unique<APB> (juce::ParameterID { pid (m, "analyse"), 1 }, n + u (" · Analyser X/Y"), false));
         l.add (std::make_unique<APC> (juce::ParameterID { pid (m, "xover"), 1 }, n + u (" · Coupure"),
                                       [] { juce::StringArray a { "Focal" }; a.addArray (xoverNames); return a; }(), 0));
@@ -152,7 +153,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
         const juce::String n = "Spot " + juce::String (k + 1);
         auto id = [k] (const char* x) { return sid (k, x); };
         l.add (std::make_unique<APC> (juce::ParameterID { id ("mode"), 1 }, n + " · Mode", juce::StringArray { "M/S", "Crossover" }, 0));
-        l.add (std::make_unique<APF> (juce::ParameterID { id ("match"), 1 }, n + " · Gain match ruban", db (-24, 24, 0.1f), 0.0f, attrDb));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("gainc"), 1 }, n + " · Gain cardio (M)", db (-24, 24, 0.1f), 0.0f, attrDb));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("match"), 1 }, n + " · Gain ruban (S)", db (-24, 24, 0.1f), 0.0f, attrDb));
         l.add (std::make_unique<APB> (juce::ParameterID { id ("invert"), 1 }, n + u (" · M/S : ruban côté opposé"), false));
         l.add (std::make_unique<APC> (juce::ParameterID { id ("out"), 1 }, n + u (" · M/S : somme ou stéréo"), juce::StringArray { "Somme (mono)", u ("Stéréo") }, 0));
         l.add (std::make_unique<APF> (juce::ParameterID { id ("width"), 1 }, n + u (" · Stéréo : largeur"), Range (0, 100, 1), 50.0f,
@@ -382,6 +384,7 @@ void DeltaABProcessor::readParams (dab::EngineParams& p) const
         auto& mp = p.mic[(size_t) m];
         mp.swapInputs = false;   // routing is resolved in processDouble
         mp.matchDb = pv (pid (m, "match"));
+        mp.gainXDb = pv (pid (m, "gainx"));
         mp.analyse = pv (pid (m, "analyse")) > 0.5f;
         const int xs = juce::jlimit (0, 3, (int) pv (pid (m, "xsrc"))), ys = juce::jlimit (0, 3, (int) pv (pid (m, "ysrc")));
         const int lows = (int) pv (pid (m, "lows"));
@@ -431,6 +434,7 @@ void DeltaABProcessor::readParams (dab::EngineParams& p) const
         auto& sp = p.spot[(size_t) k];
         sp.crossover = (int) pv (sid (k, "mode")) == 1;
         sp.matchDb = pv (sid (k, "match"));
+        sp.gainCDb = pv (sid (k, "gainc"));
         sp.ribbonInvert = pv (sid (k, "invert")) > 0.5f;
         sp.stereo = (int) pv (sid (k, "out")) == 1;
         sp.width = pv (sid (k, "width")) / 100.0;
