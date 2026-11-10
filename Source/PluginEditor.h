@@ -32,8 +32,10 @@ struct Knob : juce::Component
     Knob (APVTS&, const juce::String& id, const juce::String& caption, bool fader = false, bool delayMetres = false);
     void resized() override;
     juce::Slider slider;
-    juce::Label caption, value;
-    bool metres = false;
+    juce::Label caption, value, move;   // move: fader readout while dragging (change and destination)
+    bool metres = false, isFader = false;
+    double dragStartValue = 0;
+    void showMove();
     std::unique_ptr<APVTS::SliderAttachment> att;
 };
 

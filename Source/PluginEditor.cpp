@@ -174,6 +174,24 @@ Knob::Knob (APVTS& s, const juce::String& id, const juce::String& text, bool fad
     addAndMakeVisible (slider);
     addAndMakeVisible (caption);
     att = std::make_unique<APVTS::SliderAttachment> (s, id, slider);
+    isFader = fader;
+    if (fader)
+    {
+        // while the fader moves: how much it moved and where it lands; the value box below takes typed values
+        move.setJustificationType (juce::Justification::centred);
+        move.setInterceptsMouseClicks (false, false);
+        move.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 11.0f, juce::Font::bold)));
+        move.setColour (juce::Label::backgroundColourId, kWhite);
+        move.setColour (juce::Label::textColourId, kBlack);
+        addChildComponent (move);
+        slider.setTextBoxIsEditable (true);
+        slider.setTooltip (u ("Glisser, ou cliquer sur la valeur pour la taper (dB)"));
+        slider.onDragStart = [this] { dragStartValue = slider.getValue(); showMove(); move.setVisible (true); };
+        slider.onValueChange = [this] { if (move.isVisible()) showMove(); };
+        slider.onDragEnd = [this] {
+            juce::Timer::callAfterDelay (1200, [sp = juce::Component::SafePointer<Knob> (this)] { if (sp != nullptr) sp->move.setVisible (false); });
+        };
+    }
     if (metres)
     {
         value.setJustificationType (juce::Justification::centredTop);
@@ -185,6 +203,18 @@ Knob::Knob (APVTS& s, const juce::String& id, const juce::String& text, bool fad
         };
         slider.onValueChange();
     }
+}
+
+void Knob::showMove()
+{
+    const double v = slider.getValue(), d = v - dragStartValue;
+    auto txt = [] (double x) { return x <= -59.95 ? juce::String (u ("-∞")) : juce::String (x, 1); };
+    move.setText (u ("Δ ") + (d >= 0 ? "+" : "") + juce::String (d, 1) + "\n" + u ("→ ") + txt (v) + " dB", juce::dontSendNotification);
+    const int y = (int) slider.getPositionOfValue (v) + slider.getY();
+    const int w = juce::jmin (getWidth(), 84), h = 30;
+    // beside the cap, on the side with room, kept inside the strip
+    move.setBounds (juce::Rectangle<int> ((getWidth() - w) / 2, y - h - 16, w, h).constrainedWithin (getLocalBounds()));
+    move.toFront (false);
 }
 
 void Knob::resized()

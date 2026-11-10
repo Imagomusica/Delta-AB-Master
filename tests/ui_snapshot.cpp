@@ -44,6 +44,14 @@ int main (int argc, char** argv)
         for (auto* ch : c.getChildren()) tickAll (*ch);
     };
     tickAll (*ed);
+    {   // show the fader readout on the first fader, as during a drag from 0 to -6.5 dB
+        std::function<ui::Knob* (juce::Component&)> firstFader = [&] (juce::Component& c) -> ui::Knob* {
+            if (auto* k = dynamic_cast<ui::Knob*> (&c)) if (k->isFader) return k;
+            for (auto* ch : c.getChildren()) if (auto* k = firstFader (*ch)) return k;
+            return nullptr;
+        };
+        if (auto* k = firstFader (*ed)) { k->dragStartValue = 0; k->slider.setValue (-6.5); k->move.setVisible (true); k->showMove(); }
+    }
     save ("console.png", 1.5f);
     // open each kind of detail by clicking its DETAIL button
     auto clickDetail = [&] (const juce::String& stripTitle)
