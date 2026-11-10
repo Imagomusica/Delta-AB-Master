@@ -154,6 +154,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
         l.add (std::make_unique<APC> (juce::ParameterID { id ("mode"), 1 }, n + " · Mode", juce::StringArray { "M/S", "Crossover" }, 0));
         l.add (std::make_unique<APF> (juce::ParameterID { id ("match"), 1 }, n + " · Gain match ruban", db (-24, 24, 0.1f), 0.0f, attrDb));
         l.add (std::make_unique<APB> (juce::ParameterID { id ("invert"), 1 }, n + u (" · M/S : ruban côté opposé"), false));
+        l.add (std::make_unique<APC> (juce::ParameterID { id ("out"), 1 }, n + u (" · M/S : somme ou stéréo"), juce::StringArray { "Somme (mono)", u ("Stéréo") }, 0));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("width"), 1 }, n + u (" · Stéréo : largeur"), Range (0, 100, 1), 50.0f,
+                                      juce::AudioParameterFloatAttributes().withLabel ("%")));
         l.add (std::make_unique<APC> (juce::ParameterID { id ("xover"), 1 }, n + " · Coupure",
                                       [] { juce::StringArray a { "Focal" }; a.addArray (xoverNames); return a; }(), 0));
         l.add (std::make_unique<APC> (juce::ParameterID { id ("lows"), 1 }, n + " · Dans le grave",
@@ -427,6 +430,8 @@ void DeltaABProcessor::readParams (dab::EngineParams& p) const
         sp.crossover = (int) pv (sid (k, "mode")) == 1;
         sp.matchDb = pv (sid (k, "match"));
         sp.ribbonInvert = pv (sid (k, "invert")) > 0.5f;
+        sp.stereo = (int) pv (sid (k, "out")) == 1;
+        sp.width = pv (sid (k, "width")) / 100.0;
         sp.ribbonInLows = (int) pv (sid (k, "lows")) == 1;
         const float c = pv (sid (k, "cardio")), r = pv (sid (k, "ribbon"));
         sp.cardioDb = c <= -60.0f ? -400.0 : c;    // bottom of the range = off
@@ -550,6 +555,11 @@ void DeltaABProcessor::processAny (juce::AudioBuffer<T>& buffer)
             const int e = f < 3 ? f : f + 3;
             flows[2 * e] = scratch.getWritePointer (kFlowOut + 2 * f);
             flows[2 * e + 1] = scratch.getWritePointer (kFlowOut + 2 * f + 1);
+            if (f >= 3)   // a spot's right side (stereo M/S) goes to the same pair
+            {
+                const int r = 6 + dab::kMaxSpots + (f - 3);
+                flows[2 * r] = flows[2 * e]; flows[2 * r + 1] = flows[2 * e + 1];
+            }
         }
     flowPtrs = flows;
     processDouble (in, r.numMain, o, r.aerOutOn ? o + 2 : nullptr, r.spotOutOn ? o + 4 : nullptr, n);

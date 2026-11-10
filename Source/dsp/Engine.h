@@ -16,7 +16,7 @@ namespace dab {
 enum class Slope { dB6 = 1, dB12 = 2, dB24 = 4 };
 
 constexpr int kMaxSpots = 16;                 // EN-MS spot mics (ribbon + cardioid)
-constexpr int kPanCh = 6 + kMaxSpots;         // pan channels: 3 AB mics, 3 AER, spots
+constexpr int kPanCh = 6 + 2 * kMaxSpots;     // pan channels: 3 AB mics, 3 AER, spots, spots' right side (stereo M/S)
 constexpr int kNumIn = 9 + 2 * kMaxSpots;     // engine inputs: 6 AB (X, Y), 3 AER, spots (cardio, ribbon)
 
 // Everything that requires rebuilding filters (done off the audio thread).
@@ -75,6 +75,7 @@ public:
             lat = convBlock (fs, N) + (N - 1) / 2;
             direct.prepare (lat);
             bypassD.prepare (lat);
+            bypassR_.prepare (lat);
         }
         else
         {
@@ -99,6 +100,7 @@ public:
 
     // No crossover: same latency as the crossover, no filtering (EN-MS spots in M/S mode).
     void bypass (double* x, int n) { if (linear) for (int i = 0; i < n; ++i) x[i] = bypassD.process (x[i]); }
+    void bypassR (double* x, int n) { if (linear) for (int i = 0; i < n; ++i) x[i] = bypassR_.process (x[i]); }
 
     // low/high are scratch buffers and may be overwritten.
     void process (double* low, double* high, double* out, int n)
@@ -125,7 +127,7 @@ private:
     bool linear = true;
     int lat = 0;
     FifoConvolver conv;
-    IntDelay direct, bypassD;
+    IntDelay direct, bypassD, bypassR_;
     Biquad lp[2], hp[2];
     int nStages = 0;
     double sign = 1.0;
@@ -139,7 +141,7 @@ struct CrossoverSet {
     std::array<FifoConvolver, kPanCh> hilbert, splitLow, splitLowH;
     std::array<IntDelay, kPanCh> hilbertDirect;
     std::array<IntDelay, 3> abPad, aerPad;     // align AB crossover and AER EQ latencies
-    std::array<IntDelay, kMaxSpots> spotPad;
+    std::array<IntDelay, kMaxSpots> spotPad, spotPadR;
     int core = 0, latency = 0;
     void build (const CrossoverConfig& c)
     {
@@ -172,7 +174,8 @@ struct CrossoverSet {
         core = std::max (abLat, aerLat);
         for (auto& d : abPad) d.prepare (core - abLat);
         for (auto& d : aerPad) d.prepare (core - aerLat);
-        for (auto& d : spotPad) d.prepare (core - abLat);   // spots use the same crossover type as the AB mics
+        for (auto& d : spotPad) d.prepare (core - abLat);
+        for (auto& d : spotPadR) d.prepare (core - abLat);   // spots use the same crossover type as the AB mics
         latency = core + hl;
     }
     static int aerEqLatency (const CrossoverConfig& c)
@@ -213,6 +216,8 @@ struct SpotParams : PanParams {
     double matchDb = 0;          // ribbon gain before M/S or crossover
     bool ribbonInLows = false;   // crossover mode
     bool ribbonInvert = false;   // M/S mode: S polarity, aims the virtual mic to the other side
+    bool stereo = false;         // M/S mode: false = M + S summed (mono), true = decoded stereo (M + S, M - S)
+    double width = 0.5;          // stereo: the two sides sit at pan -+ width (on the -1 .. +1 scale)
     double cardioDb = 0, ribbonDb = 0;   // level of each branch after M/S or crossover
     double delayMs = 0;          // -10 .. +100 ms
     double faderDb = 0;
@@ -324,6 +329,7 @@ public:
         baseDelay = (int) std::ceil (kMaxDelayMs * 1e-3 * fs) + FractionalDelay::kHalf;
         for (auto& d : delay) d.prepare (2 * baseDelay + 4);
         for (auto& d : aerDelay) d.prepare (baseDelay + (int) std::ceil (kMaxAerDelayMs * 1e-3 * fs) + 4);
+        for (auto& d : spotDelayR) d.prepare (baseDelay + (int) std::ceil (kMaxAerDelayMs * 1e-3 * fs) + 4);
         for (auto& d : spotDelay) d.prepare (baseDelay + (int) std::ceil (kMaxAerDelayMs * 1e-3 * fs) + 4);
         const int maxPan = FractionalDelay::kHalf + (int) std::ceil (kMaxPanDelayMs * 1e-3 * fs) + 4;
         for (auto& pc : pan) pc.prepare (fs, maxPan);
@@ -361,7 +367,10 @@ public:
             if (aerOut != nullptr) { aerPtr[0] = aerOut[0] + done; aerPtr[1] = aerOut[1] + done; }
             if (spotsOut != nullptr) { spPtr[0] = spotsOut[0] + done; spPtr[1] = spotsOut[1] + done; }
             for (int c = 0; c < 2 * kPanCh; ++c)
+            {
                 flowPtr[(size_t) c] = flows != nullptr && flows[c] != nullptr ? flows[c] + done : nullptr;
+                if (flowPtr[(size_t) c] != nullptr) std::fill (flowPtr[(size_t) c], flowPtr[(size_t) c] + k, 0.0);   // flows add up
+            }
             processChunk (set, eq, p, inPtr, outPtr, aerOut != nullptr ? aerPtr : nullptr, spotsOut != nullptr ? spPtr : nullptr, k);
             done += k;
         }
@@ -423,8 +432,14 @@ private:
             setT (kSpotG + 2 * k, dbToGain (sp.cardioDb));
             setT (kSpotG + 2 * k + 1, dbToGain (sp.ribbonDb) * (! sp.crossover && sp.ribbonInvert ? -1.0 : 1.0));
             setT (kSpotFader + k, dbToGain (sp.faderDb));
-            pan[(size_t) (6 + k)].setTargets (panTargets (sp, p.panLawDb, p.panDelayMaxMs));
-            spotDelay[(size_t) k].setDelay (baseDelay + std::clamp (sp.delayMs, -kMaxDelayMs, kMaxAerDelayMs) * 1e-3 * fs);
+            const bool st = sp.stereo && ! sp.crossover;
+            PanParams pl = sp, pr = sp;
+            if (st) { pl.pan = std::clamp (sp.pan - sp.width, -1.0, 1.0); pr.pan = std::clamp (sp.pan + sp.width, -1.0, 1.0); }
+            pan[(size_t) (6 + k)].setTargets (panTargets (pl, p.panLawDb, p.panDelayMaxMs));
+            pan[(size_t) (6 + kMaxSpots + k)].setTargets (panTargets (pr, p.panLawDb, p.panDelayMaxMs));
+            const double dl = baseDelay + std::clamp (sp.delayMs, -kMaxDelayMs, kMaxAerDelayMs) * 1e-3 * fs;
+            spotDelay[(size_t) k].setDelay (dl);
+            spotDelayR[(size_t) k].setDelay (dl);
         }
         for (int b = 0; b < 3; ++b) setT (kFader + b, dbToGain (p.faderDb[(size_t) b]));
         setT (kCSend, dbToGain (p.centreSendDb));
@@ -523,15 +538,42 @@ private:
                 }
                 set.spot[(size_t) k].process (low, high, mo, n);
             }
-            else
+            else if (! sp.stereo)
             {
                 for (int i = 0; i < n; ++i) mo[i] = cIn[i] * gC.next() + rIn[i] * match * gR.next();
                 set.spot[(size_t) k].bypass (mo, n);
             }
+            else
+            {
+                // decoded M/S: left = M + S, right = M - S, each panned as its own source
+                double* moR = mono[(size_t) (6 + kMaxSpots + k)].data();
+                for (int i = 0; i < n; ++i)
+                {
+                    const double m = cIn[i] * gC.next(), sd = rIn[i] * match * gR.next();
+                    mo[i] = m + sd; moR[i] = m - sd;
+                }
+                set.spot[(size_t) k].bypass (mo, n);
+                set.spot[(size_t) k].bypassR (moR, n);
+            }
+            const bool st = sp.stereo && ! sp.crossover;
             auto& pad = set.spotPad[(size_t) k];
             auto& d = spotDelay[(size_t) k];
             auto& f = sm (kSpotFader + k);
-            for (int i = 0; i < n; ++i) mo[i] = d.process (pad.process (mo[i])) * f.next();
+            if (st)
+            {
+                double* moR = mono[(size_t) (6 + kMaxSpots + k)].data();
+                auto& padR = set.spotPadR[(size_t) k];
+                auto& dR = spotDelayR[(size_t) k];
+                for (int i = 0; i < n; ++i)
+                {
+                    const double g = f.next();
+                    mo[i] = d.process (pad.process (mo[i])) * g;
+                    moR[i] = dR.process (padR.process (moR[i])) * g;
+                }
+                panStage (set, 6 + kMaxSpots + k, spotBus, n);
+            }
+            else
+                for (int i = 0; i < n; ++i) mo[i] = d.process (pad.process (mo[i])) * f.next();
             panStage (set, 6 + k, spotBus, n);
         }
 
@@ -605,8 +647,8 @@ private:
             for (int i = 0; i < n; ++i)
             {
                 const double c = t[1][i] * cSend[(size_t) i];
-                fl[0][i] = t[0][i] + c;
-                fl[1][i] = t[2][i] + c;
+                fl[0][i] += t[0][i] + c;
+                fl[1][i] += t[2][i] + c;
             }
         }
         else
@@ -679,7 +721,7 @@ private:
     std::array<std::vector<double>, 9> bus;   // AB L C R, AER L C R, spots L C R
     std::vector<double> spotHi;
     std::array<FractionalDelay, 3> delay, aerDelay;
-    std::array<FractionalDelay, kMaxSpots> spotDelay;
+    std::array<FractionalDelay, kMaxSpots> spotDelay, spotDelayR;
     std::array<PanChannel, kPanCh> pan;
     std::array<bool, kPanCh> usedH {}, usedL {}, usedLH {};
     std::array<double*, 2 * kPanCh> flowPtr {};

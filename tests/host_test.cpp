@@ -23,7 +23,7 @@ int main (int argc, char** argv)
     check (p->getTotalNumInputChannels() == 47, "47 inputs (3 mics x O1 O2 R1 R2, AER G C D, 16 spots x 2)", p->getTotalNumInputChannels());
     check (p->getTotalNumOutputChannels() == 42, "42 outputs (mix, AER, 3 mics, 16 spots, in stereo)", p->getTotalNumOutputChannels());
     check (p->supportsDoublePrecisionProcessing(), "64-bit processing supported", 1);
-    check (p->getParameters().size() == 380, "parameter count", p->getParameters().size());
+    check (p->getParameters().size() == 412, "parameter count", p->getParameters().size());
     auto setParam = [&] (const char* name, float v01) {
         for (auto* prm : p->getParameters()) if (prm->getName (128) == juce::String::fromUTF8 (name)) { prm->setValueNotifyingHost (v01); return; }
         check (false, name, 0);
