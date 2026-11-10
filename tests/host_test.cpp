@@ -20,10 +20,37 @@ int main (int argc, char** argv)
     check (p != nullptr, "instance created", 0);
     if (! p) { std::printf ("%s\n", err.toRawUTF8()); return 1; }
 
-    check (p->getTotalNumInputChannels() == 12, "12 input channels (3 mics x O1 O2 R1 R2)", p->getTotalNumInputChannels());
-    check (p->getTotalNumOutputChannels() == 2, "stereo output", p->getTotalNumOutputChannels());
+    check (p->getTotalNumInputChannels() == 15, "15 inputs (3 mics x O1 O2 R1 R2 + AER G C D)", p->getTotalNumInputChannels());
+    check (p->getTotalNumOutputChannels() == 2, "stereo output (AER output off by default)", p->getTotalNumOutputChannels());
     check (p->supportsDoublePrecisionProcessing(), "64-bit processing supported", 1);
-    check (p->getParameters().size() == 64, "parameter count", p->getParameters().size());
+    check (p->getParameters().size() == 151, "parameter count", p->getParameters().size());
+    auto setParam = [&] (const char* name, float v01) {
+        for (auto* prm : p->getParameters()) if (prm->getName (128) == juce::String::fromUTF8 (name)) { prm->setValueNotifyingHost (v01); return; }
+        check (false, name, 0);
+    };
+    // Generic run: impulse on the given input channels, returns the peak position and value on output channel outCh.
+    auto impulse = [&] (bool dbl, std::vector<int> inCh, int outCh, double& peak, int nCh) -> double {
+        p->setProcessingPrecision (dbl ? juce::AudioProcessor::doublePrecision : juce::AudioProcessor::singlePrecision);
+        p->prepareToPlay (48000, 512);
+        const int lat = p->getLatencySamples();
+        juce::MidiBuffer midi;
+        double peakPos = -1; int pos = 0; peak = 0;
+        for (int blk = 0; blk < (lat + 2048) / 512 + 2; ++blk)
+        {
+            juce::AudioBuffer<double> b (nCh, 512); b.clear();
+            juce::AudioBuffer<float> f (nCh, 512); f.clear();
+            if (blk == 0) for (int c : inCh) { b.setSample (c, 0, 1.0); f.setSample (c, 0, 1.0f); }
+            if (dbl) p->processBlock (b, midi); else p->processBlock (f, midi);
+            for (int i = 0; i < 512; ++i)
+            {
+                const double v = dbl ? b.getSample (outCh, i) : f.getSample (outCh, i);
+                if (std::abs (v) > peak) { peak = std::abs (v); peakPos = pos + i; }
+            }
+            pos += 512;
+        }
+        p->releaseResources();
+        return peakPos - lat;
+    };
 
     auto run = [&] (bool dbl) -> double {
         p->setProcessingPrecision (dbl ? juce::AudioProcessor::doublePrecision : juce::AudioProcessor::singlePrecision);
@@ -35,14 +62,14 @@ int main (int argc, char** argv)
         {
             if (dbl)
             {
-                juce::AudioBuffer<double> b (12, 512); b.clear();
+                juce::AudioBuffer<double> b (15, 512); b.clear();
                 if (blk == 0) for (int m = 0; m < 3; ++m) { b.setSample (m * 4, 0, 1.0); b.setSample (m * 4 + 2, 0, 1.0); }
                 p->processBlock (b, midi);
                 for (int i = 0; i < 512; ++i) if (std::abs (b.getSample (0, i)) > peak) { peak = std::abs (b.getSample (0, i)); peakPos = pos + i; }
             }
             else
             {
-                juce::AudioBuffer<float> b (12, 512); b.clear();
+                juce::AudioBuffer<float> b (15, 512); b.clear();
                 if (blk == 0) for (int m = 0; m < 3; ++m) { b.setSample (m * 4, 0, 1.0f); b.setSample (m * 4 + 2, 0, 1.0f); }
                 p->processBlock (b, midi);
                 for (int i = 0; i < 512; ++i) if (std::abs (b.getSample (0, i)) > peak) { peak = std::abs (b.getSample (0, i)); peakPos = pos + i; }
@@ -57,6 +84,34 @@ int main (int argc, char** argv)
     const double latListen = run (false);
     run (true);
     check (latListen > 0, "latency in listen mode (samples)", latListen);
+
+    // Delta AER: impulse on AER G only arrives on L at the same latency (min-phase EQ, then linear-phase EQ)
+    for (int lin = 0; lin < 2; ++lin)
+    {
+        setParam ("AER · Phase des EQ", lin ? 1.0f : 0.0f);
+        p->prepareToPlay (48000, 512); p->releaseResources();
+        double pk = 0;
+        const double off = impulse (true, { 12 }, 0, pk, 15);
+        check (off == 0, lin ? "AER lin EQ: impulse on L at latency (offset)" : "AER min EQ: impulse on L at latency (offset)", off);
+        check (std::abs (pk - 1) < 1e-6, lin ? "AER lin EQ: flat EQ gives unity" : "AER min EQ: flat EQ gives unity", pk);
+        if (lin) check (p->getLatencySamples() == latListen, "AER lin EQ: same latency as the linear crossover", p->getLatencySamples());
+    }
+    setParam ("AER · Phase des EQ", 0.0f);
+
+    // Separate AER output: enable the second output bus, AER goes to channels 2-3 and leaves the main output
+    {
+        auto layout = p->getBusesLayout();
+        layout.outputBuses.getReference (1) = juce::AudioChannelSet::stereo();
+        check (p->setBusesLayout (layout), "AER separate output can be enabled", 1);
+        check (p->getTotalNumOutputChannels() == 4, "outputs with AER separate", p->getTotalNumOutputChannels());
+        double pkMain = 0, pkAer = 0;
+        impulse (false, { 12 }, 0, pkMain, 15);
+        const double off = impulse (false, { 12 }, 2, pkAer, 15);
+        check (pkMain < 1e-9, "AER separate: nothing on main L", pkMain);
+        check (off == 0 && std::abs (pkAer - 1) < 1e-6, "AER separate: AER G on output 3 at latency", pkAer);
+        layout.outputBuses.getReference (1) = juce::AudioChannelSet::disabled();
+        p->setBusesLayout (layout);
+    }
 
     // switch to Export quality via the host parameter and let the plugin rebuild
     for (auto* prm : p->getParameters())

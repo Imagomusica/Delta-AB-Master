@@ -266,6 +266,33 @@ int main()
         check (std::abs (lowDiff) < 0.5, "HF pan 100%, mic on L: 50 Hz shared L/C (dB apart)", lowDiff);
         check (highLeak < -40, "HF pan 100%, mic on L: 10 kHz stays on L (C leak, dB)", highLeak);
     }
+    // Delta AER EQ: the linear-phase FIR has the same amplitude curve as the minimum-phase biquads
+    {
+        const double fs = 48000;
+        AerEqParams e;
+        e.lcOn = true; e.lcHz = 80; e.lcSlope = 4;
+        e.hcOn = true; e.hcHz = 16000; e.hcSlope = 1;
+        e.bell[0] = { 300, -4, 2.0 }; e.bell[1] = { 2500, 3, 0.7 }; e.bell[2] = { 6000, -2.5, 4.0 };
+        e.lowShelf = { 150, 2, 0.707 }; e.highShelf = { 10000, 3, 1.0 };
+        const auto sec = eqSections (e, fs);
+        for (bool exportQ : { false, true })
+        {
+            const auto h = designLinearPhaseEq (e, fs, firLength (fs, exportQ));
+            double worst = 0;
+            for (double f = exportQ ? 30 : 100; f < 20000; f *= 1.05)
+                { const double d = std::abs (db (magAt (h, f, fs)) - db (sectionsMagnitude (sec, f, fs))); if (d > worst) { worst = d; if (getenv ("DBG")) std::printf ("   f %.0f d %.3f\n", f, d); } }
+            check (worst < (exportQ ? 0.05 : 0.2), std::string ("AER EQ linear = minimum phase curve, ") + (exportQ ? "export 30 Hz" : "listen 100 Hz") + " - 20 kHz (max dB diff)", worst);
+        }
+        for (bool exportQ : { false, true })
+        {
+            const auto h = designLinearPhaseEq (e, fs, firLength (fs, exportQ));
+            const double want = db (sectionsMagnitude (sec, 20, fs)), got = db (magAt (h, 20, fs));
+            check (got < want + (exportQ ? 1.0 : 10.0), std::string ("AER EQ linear, low cut 24 dB at 80 Hz: 20 Hz is cut (") + (exportQ ? "export" : "listen") + std::string ("), want ") + std::to_string (want) + " dB, got", got);
+        }
+        const double atBell = db (sectionsMagnitude (sec, 300, fs));
+        check (std::abs (atBell + 4) < 0.3, "AER EQ: bell -4 dB at 300 Hz (dB)", atBell);
+    }
+
     std::printf ("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

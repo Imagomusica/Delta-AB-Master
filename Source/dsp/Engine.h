@@ -6,6 +6,7 @@
 // Mic 1 = left, mic 2 = right, mic 3 = centre (the only mic whose delay is user-set).
 #include "Convolver.h"
 #include "Filters.h"
+#include "AerEq.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -21,11 +22,12 @@ struct CrossoverConfig {
     bool exportQuality = false;
     Slope slope = Slope::dB12;
     std::array<double, 3> fc { 700, 700, 700 };
+    bool aerEqLinear = false;
 
     bool operator== (const CrossoverConfig& o) const
     {
         return fs == o.fs && linearPhase == o.linearPhase && exportQuality == o.exportQuality
-            && slope == o.slope && fc == o.fc;
+            && slope == o.slope && fc == o.fc && aerEqLinear == o.aerEqLinear;
     }
     bool operator!= (const CrossoverConfig& o) const { return ! (*this == o); }
 };
@@ -36,8 +38,7 @@ inline int firLength (double fs, bool exportQuality)
     const double base = exportQuality ? 65536.0 : 4096.0;   // at 48 kHz
     return (1 << ceilLog2 ((int) std::lround (base * fs / 48000.0))) - 1;
 }
-// Convolution block grows with the sample rate (512 at 44.1/48 kHz), so the partition count stays the same.
-inline int convBlock (double fs) { return 512 * std::max (1, 1 << ceilLog2 ((int) std::floor (fs / 48000.0 + 1e-9))); }
+
 
 // Hilbert length for phase panning: about 43 ms (listen) or 340 ms (export) of filter.
 constexpr double kHfPanSplitHz = 700.0;   // HF pan: below this the image stays nearer the middle
@@ -117,10 +118,11 @@ private:
 struct CrossoverSet {
     CrossoverConfig cfg;
     std::array<MicCrossover, 3> mic;
-    std::array<FifoConvolver, 3> hilbert;   // phase panning
-    std::array<FifoConvolver, 3> splitLow, splitLowH;   // HF pan: low band (700 Hz) and its Hilbert companion
-    std::array<IntDelay, 3> hilbertDirect;
-    int latency = 0;
+    // pan stage for 6 channels: 0..2 Delta AB mics, 3..5 Delta AER channels
+    std::array<FifoConvolver, 6> hilbert, splitLow, splitLowH;
+    std::array<IntDelay, 6> hilbertDirect;
+    std::array<IntDelay, 3> abPad, aerPad;     // align AB crossover and AER EQ latencies
+    int core = 0, latency = 0;
     void build (const CrossoverConfig& c)
     {
         cfg = c;
@@ -130,30 +132,48 @@ struct CrossoverSet {
         const auto lp = designSplitLowpass (kHfPanSplitHz, c.fs, 2, HN);
         const auto hlp = designHilbertLowpass (kHfPanSplitHz, c.fs, 2, HN);
         const int hl = convBlock (c.fs) + ((int) h.size() - 1) / 2;
-        for (int m = 0; m < 3; ++m)
+        for (int k = 0; k < 6; ++k)
         {
-            hilbert[(size_t) m].prepare (h, convBlock (c.fs));
-            splitLow[(size_t) m].prepare (lp, convBlock (c.fs));
-            splitLowH[(size_t) m].prepare (hlp, convBlock (c.fs));
-            hilbertDirect[(size_t) m].prepare (hl);
+            hilbert[(size_t) k].prepare (h, convBlock (c.fs));
+            splitLow[(size_t) k].prepare (lp, convBlock (c.fs));
+            splitLowH[(size_t) k].prepare (hlp, convBlock (c.fs));
+            hilbertDirect[(size_t) k].prepare (hl);
         }
-        latency = mic[0].latency() + hl;
+        const int abLat = mic[0].latency();
+        const int aerLat = aerEqLatency (c);
+        core = std::max (abLat, aerLat);
+        for (auto& d : abPad) d.prepare (core - abLat);
+        for (auto& d : aerPad) d.prepare (core - aerLat);
+        latency = core + hl;
+    }
+    static int aerEqLatency (const CrossoverConfig& c)
+    {
+        return c.aerEqLinear ? convBlock (c.fs) + (firLength (c.fs, c.exportQuality) - 1) / 2 : 0;
     }
 };
 
 // Real-time parameters (read every block, smoothed where needed).
-struct MicParams {
-    bool swapInputs = false;     // false: input 1 = omni, input 2 = ribbon
-    double matchDb = 0;          // gain applied to the ribbon before the crossover
-    bool ribbonInLows = false;   // false: omni in the lows, ribbon in the highs
-    double focusDb = 0;          // capsule in the highs
-    double bloomDb = 0;          // capsule in the lows
+struct PanParams {
     double pan = 0;              // -1 = L, 0 = C, +1 = R
     double panLevel = 1.0;       // 0..1 share of level panning
     double panDelay = 0.0;       // 0..1 share of time panning (far bus delayed)
     double panPhase = 0.0;       // 0..1 share of phase panning (constant phase offset, no filtering)
     double panHF = 0.0;          // 0..1 HF pan: the band below 700 Hz is panned less (linear-phase split, exact sum)
-    bool analyse = false;        // measure O/R level around the crossover frequency
+};
+
+struct MicParams : PanParams {
+    bool swapInputs = false;     // false: input 1 = X, input 2 = Y
+    double matchDb = 0;          // gain applied to Y before the crossover
+    bool ribbonInLows = false;   // true: Y in the lows, X in the highs
+    double focusDb = 0;          // source in the highs
+    double bloomDb = 0;          // source in the lows
+    bool analyse = false;        // measure X/Y level around the crossover frequency
+};
+
+struct AerParams : PanParams {
+    AerEqParams eq;
+    double delayMs = 0;          // -10 .. +100 ms
+    double faderDb = 0;
 };
 
 struct EngineParams {
@@ -166,33 +186,88 @@ struct EngineParams {
     double panLawDb = -3.0;      // level at the middle between two buses: -3, -4.5 or -6 dB
     double panDelayMaxMs = 0.7;  // max inter-bus delay: 0.7 .. 11.2 ms, or 30 ms (Haas)
     double outputDb = 0;
+    std::array<AerParams, 3> aer;          // Delta AER channels: L, C, R
+    double aerOutDb = 0;
+};
+
+// Pan: per bus gains (full band and low band), constant phase rotation, pure delay.
+class PanChannel {
+public:
+    void prepare (double sampleRate, int maxPanSamples)
+    {
+        fs = sampleRate;
+        for (auto& d : pd) d.prepare (maxPanSamples);
+        for (auto* a : { &g, &gl, &co, &si }) for (auto& s : *a) s.prepare (fs);
+        first = true;
+    }
+    template <typename Targets>
+    void setTargets (const Targets& t)
+    {
+        for (int b = 0; b < 3; ++b)
+        {
+            if (first)
+            {
+                g[(size_t) b].setImmediate (t.g[b]); gl[(size_t) b].setImmediate (t.gLow[b]);
+                co[(size_t) b].setImmediate (std::cos (t.theta[b])); si[(size_t) b].setImmediate (std::sin (t.theta[b]));
+            }
+            else
+            {
+                g[(size_t) b].setTarget (t.g[b]); gl[(size_t) b].setTarget (t.gLow[b]);
+                co[(size_t) b].setTarget (std::cos (t.theta[b])); si[(size_t) b].setTarget (std::sin (t.theta[b]));
+            }
+            pd[(size_t) b].setDelay (FractionalDelay::kHalf + t.tauMs[b] * 1e-3 * fs);
+        }
+        first = false;
+    }
+    // full / hFull: signal and its Hilbert; low / hLow: band below 700 Hz and its Hilbert.
+    void process (const double* full, const double* hFull, const double* low, const double* hLow, double* const* dst, int n)
+    {
+        for (int b = 0; b < 3; ++b)
+        {
+            auto& G = g[(size_t) b]; auto& GL = gl[(size_t) b]; auto& C = co[(size_t) b]; auto& S = si[(size_t) b];
+            auto& D = pd[(size_t) b];
+            double* out = dst[b];
+            for (int i = 0; i < n; ++i)
+            {
+                const double gH = G.next(), gL = GL.next();
+                const double a  = gH * full[i]  + (gL - gH) * low[i];
+                const double ha = gH * hFull[i] + (gL - gH) * hLow[i];
+                out[i] += D.process (C.next() * a - S.next() * ha);   // phase advance by theta
+            }
+        }
+    }
+private:
+    double fs = 48000;
+    bool first = true;
+    std::array<FractionalDelay, 3> pd;
+    std::array<Smoother, 3> g, gl, co, si;
 };
 
 class Engine {
 public:
     static constexpr double kMaxDelayMs = 10.0;
+    static constexpr double kMaxAerDelayMs = 100.0;
     static constexpr double kMaxPanDelayMs = 30.0;  // Haas range
 
     void prepare (double sampleRate, int maxBlock)
     {
         fs = sampleRate;
         maxN = std::max (1, maxBlock);
-        for (auto* v : { &o, &r, &lo, &hi, &mono })
+        for (auto* v : { &lo, &hi })
+            for (auto& b : *v) b.assign ((size_t) maxN, 0.0);
+        for (auto* v : { &mono, &hx, &lowBand, &lowBandH })
             for (auto& b : *v) b.assign ((size_t) maxN, 0.0);
         for (auto& b : bus) b.assign ((size_t) maxN, 0.0);
         baseDelay = (int) std::ceil (kMaxDelayMs * 1e-3 * fs) + FractionalDelay::kHalf;
         for (auto& d : delay) d.prepare (2 * baseDelay + 4);
+        for (auto& d : aerDelay) d.prepare (baseDelay + (int) std::ceil (kMaxAerDelayMs * 1e-3 * fs) + 4);
         const int maxPan = FractionalDelay::kHalf + (int) std::ceil (kMaxPanDelayMs * 1e-3 * fs) + 4;
-        for (auto& md : panDelay) for (auto& d : md) d.prepare (maxPan);
-        for (auto& b : hx) b.assign ((size_t) maxN, 0.0);
-        for (auto& b : lowBand) b.assign ((size_t) maxN, 0.0);
-        for (auto& b : lowBandH) b.assign ((size_t) maxN, 0.0);
+        for (auto& pc : pan) pc.prepare (fs, maxPan);
         for (auto& s : smooth) s.prepare (fs);
-        for (int i = 0; i < kNumSmoothers; ++i) smooth[(size_t) i].setImmediate (i < 6 ? 1.0 : 0.0);
-        for (int m = 0; m < 3; ++m) for (int b = 0; b < 3; ++b) sm (kRot + m * 6 + b * 2).setImmediate (1.0);
         firstBlock = true;
         for (auto& a : analysers) a = {};
         lastLowCut.fill (-1);
+        for (auto& e : aerMinEq) { e.params = {}; e.valid = false; e.sec.clear(); e.sec.reserve (16); e.tmp.reserve (16); }
     }
 
     int extraLatency() const { return baseDelay; }
@@ -200,22 +275,37 @@ public:
     // Total plugin latency for a given crossover set.
     int totalLatency (const CrossoverSet& set) const { return set.latency + baseDelay + FractionalDelay::kHalf; }
 
-    // in: 6 channels (mic1 O,R  mic2 O,R  mic3 O,R as routed), out: 2 channels.
-    void process (CrossoverSet& set, const EngineParams& p, const double* const* in, double* const* out, int n)
+    // in: 6 AB channels (mic1 X,Y  mic2 X,Y  mic3 X,Y) then 3 AER channels (L, C, R).
+    // out: main stereo; aerOut: separate AER stereo, or nullptr to mix the AER into the main output.
+    // eq: the 3 linear-phase AER EQ filters (used when set.cfg.aerEqLinear; entries may be nullptr).
+    void process (CrossoverSet& set, AerEqFilter* const* eq, const EngineParams& p, const double* const* in,
+                  double* const* out, double* const* aerOut, int n)
     {
         int done = 0;
         while (done < n)
         {
             const int k = std::min (maxN, n - done);
-            const double* inPtr[6];
-            for (int c = 0; c < 6; ++c) inPtr[c] = in[c] + done;
+            const double* inPtr[9];
+            for (int c = 0; c < 9; ++c) inPtr[c] = in[c] + done;
             double* outPtr[2] = { out[0] + done, out[1] + done };
-            processChunk (set, p, inPtr, outPtr, k);
+            double* aerPtr[2] = { nullptr, nullptr };
+            if (aerOut != nullptr) { aerPtr[0] = aerOut[0] + done; aerPtr[1] = aerOut[1] + done; }
+            processChunk (set, eq, p, inPtr, outPtr, aerOut != nullptr ? aerPtr : nullptr, k);
             done += k;
         }
     }
 
-    // Level analyser results (dB to add to the ribbon so it matches the omni).
+    // AB-only convenience (AER inputs silent, AER mixed into main).
+    void process (CrossoverSet& set, const EngineParams& p, const double* const* in, double* const* out, int n)
+    {
+        if (silence.size() < (size_t) n) silence.assign ((size_t) n, 0.0);
+        const double* in9[9];
+        for (int c = 0; c < 6; ++c) in9[c] = in[c];
+        for (int c = 6; c < 9; ++c) in9[c] = silence.data();
+        process (set, nullptr, p, in9, out, nullptr, n);
+    }
+
+    // Level analyser results (dB to add to Y so it matches X).
     struct Analyser {
         Biquad bpO, bpR;
         double eO = 0, eR = 0;
@@ -226,38 +316,40 @@ public:
     std::array<std::atomic<bool>, 3> measureValid {};
 
 private:
-    static constexpr int kRot = 19;                          // cos/sin per mic and bus
-    static constexpr int kLowG = kRot + 18;                  // low-band pan gains per mic and bus
-    static constexpr int kNumSmoothers = 6 + 9 + 3 + 1 + 18 + 9; // focus/bloom, pan gains, faders, centre send, rotations, low gains
+    // smoother indices
+    static constexpr int kFB = 0;          // focus/bloom: 6
+    static constexpr int kFader = 6;       // AB bus faders: 3
+    static constexpr int kCSend = 9;       // centre send: 1
+    static constexpr int kAerFader = 10;   // AER channel faders: 3
+    static constexpr int kNumSmoothers = 13;
 
-    void processChunk (CrossoverSet& set, const EngineParams& p, const double* const* in, double* const* out, int n)
+    void processChunk (CrossoverSet& set, AerEqFilter* const* eq, const EngineParams& p, const double* const* in,
+                       double* const* out, double* const* aerOut, int n)
     {
         // smoothed targets
+        auto setT = [&] (int i, double v) { if (firstBlock) sm (i).setImmediate (v); else sm (i).setTarget (v); };
         for (int m = 0; m < 3; ++m)
         {
             const auto& mp = p.mic[(size_t) m];
-            sm (m * 2).setTarget (dbToGain (mp.focusDb));
-            sm (m * 2 + 1).setTarget (dbToGain (mp.bloomDb));
-            PanTargets t = panTargets (mp, p.panLawDb, p.panDelayMaxMs);
-            for (int b = 0; b < 3; ++b)
-            {
-                sm (6 + m * 3 + b).setTarget (t.g[b]);
-                sm (kLowG + m * 3 + b).setTarget (t.gLow[b]);
-                sm (kRot + m * 6 + b * 2).setTarget (std::cos (t.theta[b]));
-                sm (kRot + m * 6 + b * 2 + 1).setTarget (std::sin (t.theta[b]));
-                panDelay[(size_t) m][(size_t) b].setDelay (FractionalDelay::kHalf + t.tauMs[b] * 1e-3 * fs);
-            }
-        }
-        for (int b = 0; b < 3; ++b) sm (15 + b).setTarget (dbToGain (p.faderDb[(size_t) b]));
-        sm (18).setTarget (dbToGain (p.centreSendDb));
-        if (firstBlock) { snapSmoothers (p); firstBlock = false; }
-
-        // delays: base latency on every mic, centre mic offset by the user delay
-        for (int m = 0; m < 3; ++m)
+            setT (kFB + m * 2, dbToGain (mp.focusDb));
+            setT (kFB + m * 2 + 1, dbToGain (mp.bloomDb));
+            pan[(size_t) m].setTargets (panTargets (mp, p.panLawDb, p.panDelayMaxMs));
             delay[(size_t) m].setDelay (baseDelay + std::clamp (p.delayMs[(size_t) m], -kMaxDelayMs, kMaxDelayMs) * 1e-3 * fs);
 
-        for (auto& b : bus) std::fill (b.begin(), b.begin() + n, 0.0);
+            const auto& ap = p.aer[(size_t) m];
+            setT (kAerFader + m, dbToGain (ap.faderDb));
+            pan[(size_t) (3 + m)].setTargets (panTargets (ap, p.panLawDb, p.panDelayMaxMs));
+            aerDelay[(size_t) m].setDelay (baseDelay + std::clamp (ap.delayMs, -kMaxDelayMs, kMaxAerDelayMs) * 1e-3 * fs);
+        }
+        for (int b = 0; b < 3; ++b) setT (kFader + b, dbToGain (p.faderDb[(size_t) b]));
+        setT (kCSend, dbToGain (p.centreSendDb));
+        firstBlock = false;
 
+        for (auto& b : bus) std::fill (b.begin(), b.begin() + n, 0.0);
+        double* abBus[3]  = { bus[0].data(), bus[1].data(), bus[2].data() };
+        double* aerBus[3] = { bus[3].data(), bus[4].data(), bus[5].data() };
+
+        // ---- Delta AB
         for (int m = 0; m < 3; ++m)
         {
             const auto& mp = p.mic[(size_t) m];
@@ -268,7 +360,7 @@ private:
 
             double* low = lo[(size_t) m].data();
             double* high = hi[(size_t) m].data();
-            auto& sF = sm (m * 2); auto& sB = sm (m * 2 + 1);
+            auto& sF = sm (kFB + m * 2); auto& sB = sm (kFB + m * 2 + 1);
             for (int i = 0; i < n; ++i)
             {
                 const double om = oIn[i], rb = rIn[i] * match;
@@ -278,42 +370,51 @@ private:
             }
             double* mo = mono[(size_t) m].data();
             set.mic[(size_t) m].process (low, high, mo, n);
-
-            // centre delay, then the Hilbert pair used by phase panning
+            auto& pad = set.abPad[(size_t) m];
             auto& d = delay[(size_t) m];
-            for (int i = 0; i < n; ++i) mo[i] = d.process (mo[i]);
-            double* h = hx[(size_t) m].data();
-            double* lb = lowBand[(size_t) m].data();
-            double* hlb = lowBandH[(size_t) m].data();
-            set.hilbert[(size_t) m].process (mo, h, n);
-            set.splitLow[(size_t) m].process (mo, lb, n);
-            set.splitLowH[(size_t) m].process (mo, hlb, n);
-            auto& hd = set.hilbertDirect[(size_t) m];
-            for (int i = 0; i < n; ++i) mo[i] = hd.process (mo[i]);
-            // mo / h now hold the full band (signal and its Hilbert); lb / hlb the band below 700 Hz.
-
-            // pan: per bus gains (high and low band), constant phase rotation and pure delay
-            for (int b = 0; b < 3; ++b)
-            {
-                auto& g = sm (6 + m * 3 + b);
-                auto& gl = sm (kLowG + m * 3 + b);
-                auto& co = sm (kRot + m * 6 + b * 2);
-                auto& si = sm (kRot + m * 6 + b * 2 + 1);
-                auto& pd = panDelay[(size_t) m][(size_t) b];
-                double* dst = bus[(size_t) b].data();
-                for (int i = 0; i < n; ++i)
-                {
-                    const double gH = g.next(), gL = gl.next();
-                    // gH * (full - low) + gL * low, same for the Hilbert companions
-                    const double a  = gH * mo[i] + (gL - gH) * lb[i];
-                    const double ha = gH * h[i]  + (gL - gH) * hlb[i];
-                    const double v = co.next() * a - si.next() * ha;   // phase advance by theta
-                    dst[i] += pd.process (v);
-                }
-            }
+            for (int i = 0; i < n; ++i) mo[i] = d.process (pad.process (mo[i]));
+            panStage (set, m, abBus, n);
         }
 
-        // bus faders + low cut
+        // ---- Delta AER
+        for (int c = 0; c < 3; ++c)
+        {
+            const auto& ap = p.aer[(size_t) c];
+            double* x = mono[(size_t) (3 + c)].data();
+            const double* src = in[6 + c];
+            if (set.cfg.aerEqLinear)
+            {
+                // a filter built for another rate or length would break the alignment: stay silent until the right one arrives
+                auto* f = eq != nullptr ? eq[c] : nullptr;
+                if (f != nullptr && f->fs == set.cfg.fs && f->N == firLength (set.cfg.fs, set.cfg.exportQuality))
+                    f->conv.process (src, x, n);
+                else
+                    std::fill (x, x + n, 0.0);
+            }
+            else
+            {
+                auto& e = aerMinEq[(size_t) c];
+                if (! e.valid || e.params != ap.eq)
+                {
+                    eqSections (ap.eq, fs, e.tmp);   // no allocation: capacity reserved in prepare
+                    if (e.tmp.size() == e.sec.size()) for (size_t k = 0; k < e.sec.size(); ++k) { e.tmp[k].z1 = e.sec[k].z1; e.tmp[k].z2 = e.sec[k].z2; }
+                    std::swap (e.sec, e.tmp); e.params = ap.eq; e.valid = true;
+                }
+                for (int i = 0; i < n; ++i)
+                {
+                    double v = src[i];
+                    for (auto& q : e.sec) v = q.process (v);
+                    x[i] = v;
+                }
+            }
+            auto& pad = set.aerPad[(size_t) c];
+            auto& d = aerDelay[(size_t) c];
+            auto& f = sm (kAerFader + c);
+            for (int i = 0; i < n; ++i) x[i] = d.process (pad.process (x[i])) * f.next();
+            panStage (set, 3 + c, aerBus, n);
+        }
+
+        // ---- AB bus faders + low cut
         for (int b = 0; b < 3; ++b)
         {
             const double hz = p.lowCutHz[(size_t) b];
@@ -324,7 +425,7 @@ private:
                 lowCut[(size_t) b].z1 = st.z1; lowCut[(size_t) b].z2 = st.z2;
                 lastLowCut[(size_t) b] = hz;
             }
-            auto& f = sm (15 + b);
+            auto& f = sm (kFader + b);
             double* x = bus[(size_t) b].data();
             for (int i = 0; i < n; ++i)
             {
@@ -334,34 +435,35 @@ private:
             }
         }
 
-        const double outG = dbToGain (p.outputDb);
-        auto& cs = sm (18);
+        // ---- stereo sums
+        const double outG = dbToGain (p.outputDb), aerG = dbToGain (p.aerOutDb);
+        auto& cs = sm (kCSend);
         for (int i = 0; i < n; ++i)
         {
-            const double c = bus[1][(size_t) i] * cs.next();
-            out[0][i] = (bus[0][(size_t) i] + c) * outG;
-            out[1][i] = (bus[2][(size_t) i] + c) * outG;
+            const double k = cs.next();
+            const double c = bus[1][(size_t) i] * k, ca = bus[4][(size_t) i] * k;
+            const double aL = (bus[3][(size_t) i] + ca) * aerG, aR = (bus[5][(size_t) i] + ca) * aerG;
+            double L = bus[0][(size_t) i] + c, R = bus[2][(size_t) i] + c;
+            if (aerOut != nullptr) { aerOut[0][i] = aL; aerOut[1][i] = aR; }
+            else { L += aL; R += aR; }
+            out[0][i] = L * outG;
+            out[1][i] = R * outG;
         }
     }
 
-    void snapSmoothers (const EngineParams& p)
+    // Hilbert pair + low band split, then the pan into three buses. Uses mono[k] as input.
+    void panStage (CrossoverSet& set, int k, double* const* dst, int n)
     {
-        for (int m = 0; m < 3; ++m)
-        {
-            const auto& mp = p.mic[(size_t) m];
-            sm (m * 2).setImmediate (dbToGain (mp.focusDb));
-            sm (m * 2 + 1).setImmediate (dbToGain (mp.bloomDb));
-            PanTargets t = panTargets (mp, p.panLawDb, p.panDelayMaxMs);
-            for (int b = 0; b < 3; ++b)
-            {
-                sm (6 + m * 3 + b).setImmediate (t.g[b]);
-                sm (kLowG + m * 3 + b).setImmediate (t.gLow[b]);
-                sm (kRot + m * 6 + b * 2).setImmediate (std::cos (t.theta[b]));
-                sm (kRot + m * 6 + b * 2 + 1).setImmediate (std::sin (t.theta[b]));
-            }
-        }
-        for (int b = 0; b < 3; ++b) sm (15 + b).setImmediate (dbToGain (p.faderDb[(size_t) b]));
-        sm (18).setImmediate (dbToGain (p.centreSendDb));
+        double* mo = mono[(size_t) k].data();
+        double* h = hx[(size_t) k].data();
+        double* lb = lowBand[(size_t) k].data();
+        double* hlb = lowBandH[(size_t) k].data();
+        set.hilbert[(size_t) k].process (mo, h, n);
+        set.splitLow[(size_t) k].process (mo, lb, n);
+        set.splitLowH[(size_t) k].process (mo, hlb, n);
+        auto& hd = set.hilbertDirect[(size_t) k];
+        for (int i = 0; i < n; ++i) mo[i] = hd.process (mo[i]);
+        pan[(size_t) k].process (mo, h, lb, hlb, dst, n);
     }
 
     void analyse (int m, bool on, double fc, const double* oIn, const double* rIn, int n)
@@ -388,14 +490,15 @@ private:
     }
 
 public:
-    // Pan between the two neighbouring buses (L-C or C-R). Three cues, each with its own amount:
+    // Pan between the two neighbouring buses (L-C or C-R). Cues, each with its own amount:
     //  level : pan law gains (-3 / -4.5 / -6 dB at the middle)
     //  delay : the far bus is delayed, up to maxMs (pure delay, flat amplitude; 30 ms = Haas)
     //  phase : constant phase offset between the two buses, up to +-45 deg (FIR Hilbert, flat amplitude)
-    // A mic sitting exactly on a bus feeds only that bus, with no delay and no phase change.
+    //  HF    : the band below 700 Hz is panned less (linear-phase split, exact sum)
+    // A channel sitting exactly on a bus feeds only that bus, with no delay and no phase change (HF pan aside).
     struct PanTargets { double g[3] {}; double gLow[3] {}; double theta[3] {}; double tauMs[3] {}; };
 
-    static PanTargets panTargets (const MicParams& mp, double lawDb, double maxMs)
+    static PanTargets panTargets (const PanParams& mp, double lawDb, double maxMs)
     {
         PanTargets t;
         const double p = std::clamp (mp.pan, -1.0, 1.0);
@@ -416,31 +519,24 @@ public:
         return t;
     }
 
-    // 3-way pan, constant power between neighbours: -1 = L, 0 = C, +1 = R.
-    static void panGains (double p, double& gL, double& gC, double& gR)
-    {
-        p = std::clamp (p, -1.0, 1.0);
-        if (p <= 0) { const double t = (p + 1) * kPi / 2; gL = std::cos (t); gC = std::sin (t); gR = 0; }
-        else        { const double t = p * kPi / 2;       gC = std::cos (t); gR = std::sin (t); gL = 0; }
-        if (std::abs (gL) < 1e-15) gL = 0;
-        if (std::abs (gC) < 1e-15) gC = 0;
-        if (std::abs (gR) < 1e-15) gR = 0;
-    }
-
 private:
     Smoother& sm (int i) { return smooth[(size_t) i]; }
+
+    struct MinEq { AerEqParams params; std::vector<Biquad> sec, tmp; bool valid = false; };
 
     double fs = 48000;
     int maxN = 512, baseDelay = 0;
     bool firstBlock = true;
-    std::array<std::vector<double>, 3> o, r, lo, hi, mono, bus;
-    std::array<FractionalDelay, 3> delay;
-    std::array<std::array<FractionalDelay, 3>, 3> panDelay;
-    std::array<std::vector<double>, 3> hx, lowBand, lowBandH;
+    std::array<std::vector<double>, 3> lo, hi;
+    std::array<std::vector<double>, 6> mono, hx, lowBand, lowBandH, bus;
+    std::array<FractionalDelay, 3> delay, aerDelay;
+    std::array<PanChannel, 6> pan;
     std::array<Smoother, kNumSmoothers> smooth;
     std::array<Biquad, 3> lowCut;
     std::array<double, 3> lastLowCut { -1, -1, -1 };
     std::array<Analyser, 3> analysers;
+    std::array<MinEq, 3> aerMinEq;
+    std::vector<double> silence;
 };
 
 } // namespace dab

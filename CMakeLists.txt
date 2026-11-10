@@ -27,7 +27,7 @@ juce_add_plugin(DeltaAB
     NEEDS_MIDI_OUTPUT FALSE
     COPY_PLUGIN_AFTER_BUILD FALSE)
 
-target_sources(DeltaAB PRIVATE Source/PluginProcessor.cpp)
+target_sources(DeltaAB PRIVATE Source/PluginProcessor.cpp Source/PluginEditor.cpp)
 target_include_directories(DeltaAB PRIVATE Source)
 
 target_compile_definitions(DeltaAB PUBLIC

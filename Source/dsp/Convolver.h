@@ -7,6 +7,9 @@
 
 namespace dab {
 
+// Convolution block grows with the sample rate (512 at 44.1/48 kHz), so the partition count stays the same.
+inline int convBlock (double fs) { return 512 * std::max (1, 1 << ceilLog2 ((int) std::floor (fs / 48000.0 + 1e-9))); }
+
 class PartitionedConvolver {
 public:
     void prepare (const std::vector<double>& ir, int blockSizePow2)

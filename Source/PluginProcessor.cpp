@@ -1,4 +1,5 @@
 #include "PluginProcessor.h"
+#include "PluginEditor.h"
 
 using APF = juce::AudioParameterFloat;
 using APB = juce::AudioParameterBool;
@@ -8,6 +9,7 @@ using Range = juce::NormalisableRange<float>;
 static juce::String u (const char* s) { return juce::String::fromUTF8 (s); }
 
 static const char* micId[3]   = { "m1", "m2", "m3" };
+static juce::String aid (int a, const char* p) { return "a" + juce::String (a + 1) + "_" + p; }
 static const char* micName[3] = { "Micro 1 (G)", "Micro 2 (D)", "Micro 3 (C)" };
 static const char* busId[3]   = { "L", "C", "R" };
 static const char* busName[3] = { "Bus G", "Bus C", "Bus D" };
@@ -20,6 +22,9 @@ struct Combo { int x, y; bool autoYInLows; };
 static const Combo combos[6] = { { 0, 2, false }, { 0, 3, true }, { 1, 2, false }, { 1, 3, true }, { 0, 1, true }, { 2, 3, true } };
 
 static juce::String pid (int m, const char* p) { return juce::String (micId[m]) + "_" + p; }
+
+static const char* aerName[3] = { "AER G", "AER C", "AER D" };
+static const int kSlopes[3] = { 1, 2, 4 };
 
 juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayout()
 {
@@ -86,13 +91,65 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaABProcessor::createLayo
     for (int i = 1; i <= 8; ++i) sends.add (juce::String (-1.5 * i, 1) + " dB");
     l.add (std::make_unique<APC> (juce::ParameterID { "c_send", 1 }, "Envoi du centre dans G et D", sends, 1));
     l.add (std::make_unique<APF> (juce::ParameterID { "out", 1 }, "Sortie", db (-24, 12, 0.1f), 0.0f, attrDb));
+
+    // Delta AER: 3 omnis L, C, R
+    auto hz = juce::AudioParameterFloatAttributes().withLabel ("Hz");
+    auto pct = juce::AudioParameterFloatAttributes().withLabel ("%");
+    const juce::StringArray slopes { "6 dB/oct", "12 dB/oct", "24 dB/oct" };
+    l.add (std::make_unique<APC> (juce::ParameterID { "aer_eq_phase", 1 }, u ("AER · Phase des EQ"),
+                                  juce::StringArray { "Minimale", u ("Linéaire") }, 0));
+    l.add (std::make_unique<APB> (juce::ParameterID { "aer_link", 1 }, u ("AER · Faders liés"), false));
+    l.add (std::make_unique<APF> (juce::ParameterID { "aer_out", 1 }, u ("AER · Sortie"), db (-24, 12, 0.1f), 0.0f, attrDb));
+    const float aerPan[3] = { -1.0f, 0.0f, 1.0f };
+    const float bellF[3] = { 250.0f, 1000.0f, 4000.0f };
+    for (int a = 0; a < 3; ++a)
+    {
+        const juce::String n (aerName[a]);
+        auto id = [a] (const char* x) { return aid (a, x); };
+        l.add (std::make_unique<APB> (juce::ParameterID { id ("lc_on"), 1 }, n + " · Low cut", false));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("lc_hz"), 1 }, n + u (" · Low cut fréquence"), Range (10, 1000, 1, 0.3f), 40.0f, hz));
+        l.add (std::make_unique<APC> (juce::ParameterID { id ("lc_slope"), 1 }, n + " · Low cut pente", slopes, 1));
+        l.add (std::make_unique<APB> (juce::ParameterID { id ("hc_on"), 1 }, n + " · High cut", false));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("hc_hz"), 1 }, n + u (" · High cut fréquence"), Range (1000, 22000, 10, 0.4f), 18000.0f, hz));
+        l.add (std::make_unique<APC> (juce::ParameterID { id ("hc_slope"), 1 }, n + " · High cut pente", slopes, 1));
+        for (int b = 0; b < 3; ++b)
+        {
+            const juce::String bn = n + " · Cloche " + juce::String (b + 1);
+            const juce::String bp = "b" + juce::String (b + 1);
+            l.add (std::make_unique<APF> (juce::ParameterID { aid (a, (bp + "_f").toRawUTF8()), 1 }, bn + u (" fréquence"), Range (20, 20000, 1, 0.25f), bellF[b], hz));
+            l.add (std::make_unique<APF> (juce::ParameterID { aid (a, (bp + "_g").toRawUTF8()), 1 }, bn + " gain", db (-18, 18, 0.1f), 0.0f, attrDb));
+            l.add (std::make_unique<APF> (juce::ParameterID { aid (a, (bp + "_q").toRawUTF8()), 1 }, bn + " Q", Range (0.1f, 10.0f, 0.01f, 0.4f), 1.0f));
+        }
+        const char* shN[2] = { " · Shelf grave", " · Shelf aigu" };
+        const char* shP[2] = { "ls", "hs" };
+        const float shF[2] = { 120.0f, 8000.0f };
+        for (int k = 0; k < 2; ++k)
+        {
+            const juce::String sp (shP[k]);
+            l.add (std::make_unique<APF> (juce::ParameterID { aid (a, (sp + "_f").toRawUTF8()), 1 }, n + u (shN[k]) + u (" fréquence"), Range (20, 20000, 1, 0.25f), shF[k], hz));
+            l.add (std::make_unique<APF> (juce::ParameterID { aid (a, (sp + "_g").toRawUTF8()), 1 }, n + u (shN[k]) + " gain", db (-18, 18, 0.1f), 0.0f, attrDb));
+            l.add (std::make_unique<APF> (juce::ParameterID { aid (a, (sp + "_q").toRawUTF8()), 1 }, n + u (shN[k]) + " Q", Range (0.3f, 2.0f, 0.01f), 0.707f));
+        }
+        // delay in ms, also shown in metres (sound at 343 m/s)
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("delay"), 1 }, n + u (" · Délai"), Range (-10, 100, 0.01f), 0.0f,
+                                      juce::AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction (
+                                          [] (float v, int) { return juce::String (v, 2) + " ms (" + juce::String (v * 0.343f, 2) + " m)"; })));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("fader"), 1 }, n + " · Fader", db (-60, 12, 0.1f), 0.0f, attrDb));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("pan"), 1 }, n + u (" · Pan G-C-D"), Range (-1, 1, 0.01f), aerPan[a]));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("pan_lvl"), 1 }, n + u (" · Pan niveau"), Range (0, 100, 1), 100.0f, pct));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("pan_dly"), 1 }, n + u (" · Pan délai"), Range (0, 100, 1), 0.0f, pct));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("pan_ph"), 1 }, n + u (" · Pan phase"), Range (0, 100, 1), 0.0f, pct));
+        l.add (std::make_unique<APF> (juce::ParameterID { id ("pan_hf"), 1 }, n + u (" · Pan HF (grave au centre)"), Range (0, 100, 1), 0.0f, pct));
+    }
     return l;
 }
 
 DeltaABProcessor::DeltaABProcessor()
     : AudioProcessor (BusesProperties()
                           .withInput ("Entrées (3 micros x O1 O2 R1 R2)", juce::AudioChannelSet::create7point1point4(), true)
-                          .withOutput ("Sortie", juce::AudioChannelSet::stereo(), true)),
+                          .withInput ("AER (G C D)", juce::AudioChannelSet::createLCR(), true)
+                          .withOutput ("Sortie", juce::AudioChannelSet::stereo(), true)
+                          .withOutput ("AER séparé", juce::AudioChannelSet::stereo(), false)),
       apvts (*this, nullptr, "DeltaAB", createLayout())
 {
     startTimerHz (20);
@@ -101,6 +158,12 @@ DeltaABProcessor::DeltaABProcessor()
 DeltaABProcessor::~DeltaABProcessor()
 {
     stopTimer();
+    for (int a = 0; a < 3; ++a)
+    {
+        delete eqActive[(size_t) a];
+        delete eqPending[(size_t) a].exchange (nullptr);
+        delete eqRetired[(size_t) a].exchange (nullptr);
+    }
     delete active;
     delete pending.exchange (nullptr);
     delete retired.exchange (nullptr);
@@ -109,7 +172,10 @@ DeltaABProcessor::~DeltaABProcessor()
 bool DeltaABProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
     const int in = layouts.getMainInputChannels();
-    return (in == 6 || in == 12) && layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
+    if (! (in == 6 || in == 12) || layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo()) return false;
+    if (layouts.inputBuses.size() > 1 && ! (layouts.inputBuses[1].isDisabled() || layouts.inputBuses[1].size() == 3)) return false;
+    if (layouts.outputBuses.size() > 1 && ! (layouts.outputBuses[1].isDisabled() || layouts.outputBuses[1] == juce::AudioChannelSet::stereo())) return false;
+    return true;
 }
 
 dab::CrossoverConfig DeltaABProcessor::currentConfig() const
@@ -126,6 +192,7 @@ dab::CrossoverConfig DeltaABProcessor::currentConfig() const
         const int x = juce::jlimit (0, kNumX, (int) pv (pid (m, "xover")));
         c.fc[(size_t) m] = x == 0 ? focal : xoverHz[x - 1];
     }
+    c.aerEqLinear = (int) pv ("aer_eq_phase") == 1;
     return c;
 }
 
@@ -141,7 +208,23 @@ void DeltaABProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     builtCfg = currentConfig();
     active = new dab::CrossoverSet();
     active->build (builtCfg);
+    for (int a = 0; a < 3; ++a)
+    {
+        delete eqPending[(size_t) a].exchange (nullptr);
+        delete eqRetired[(size_t) a].exchange (nullptr);
+        delete eqActive[(size_t) a];
+        eqActive[(size_t) a] = nullptr;
+        if (builtCfg.aerEqLinear) eqActive[(size_t) a] = makeEq (a);
+        eqBuilt[(size_t) a] = eqActive[(size_t) a];
+    }
     setLatencySamples (engine.totalLatency (*active));
+}
+
+dab::AerEqFilter* DeltaABProcessor::makeEq (int a) const
+{
+    auto* f = new dab::AerEqFilter();
+    f->build (aerEq (a), sr, dab::firLength (sr, (int) pv ("quality") == 1));
+    return f;
 }
 
 void DeltaABProcessor::timerCallback()
@@ -159,6 +242,54 @@ void DeltaABProcessor::timerCallback()
         if (lat != getLatencySamples()) setLatencySamples (lat);
     }
 
+    // Linear-phase AER EQ: one filter per channel, rebuilt when its EQ, the rate or the length changes.
+    if (builtCfg.aerEqLinear && active != nullptr)
+    {
+        const int N = dab::firLength (sr, builtCfg.exportQuality);
+        for (int a = 0; a < 3; ++a)
+        {
+            delete eqRetired[(size_t) a].exchange (nullptr);
+            const auto e = aerEq (a);
+            const auto* b = eqBuilt[(size_t) a];
+            const bool stale = b == nullptr || b->params != e || b->fs != sr || b->N != N;
+            if (stale && eqPending[(size_t) a].load() == nullptr && eqRetired[(size_t) a].load() == nullptr)
+            {
+                auto* f = new dab::AerEqFilter();
+                f->build (e, sr, N);
+                eqBuilt[(size_t) a] = f;
+                eqPending[(size_t) a].store (f);
+            }
+        }
+    }
+    for (int a = 0; a < 3; ++a) delete eqRetired[(size_t) a].exchange (nullptr);
+
+    // AER faders linked: a move of one fader moves the other two by the same number of dB.
+    {
+        std::array<float, 3> f;
+        int moved = -1, nMoved = 0;
+        for (int a = 0; a < 3; ++a)
+        {
+            f[(size_t) a] = pv (aid (a, "fader"));
+            if (f[(size_t) a] != lastAerFader[(size_t) a]) { moved = a; ++nMoved; }
+        }
+        if (pv ("aer_link") > 0.5f && nMoved == 1 && linkPrimed)
+        {
+            const float d = f[(size_t) moved] - lastAerFader[(size_t) moved];
+            for (int a = 0; a < 3; ++a)
+                if (a != moved)
+                    if (auto* prm = apvts.getParameter (aid (a, "fader")))
+                    {
+                        const float nv = juce::jlimit (-60.0f, 12.0f, f[(size_t) a] + d);
+                        prm->beginChangeGesture();
+                        prm->setValueNotifyingHost (prm->convertTo0to1 (nv));
+                        prm->endChangeGesture();
+                        f[(size_t) a] = pv (aid (a, "fader"));
+                    }
+        }
+        lastAerFader = f;
+        linkPrimed = true;
+    }
+
     // O/R analysis: when "Analyser" is switched off, the measured correction is written to "Appariement".
     for (int m = 0; m < 3; ++m)
     {
@@ -172,6 +303,19 @@ void DeltaABProcessor::timerCallback()
         }
         wasAnalysing[(size_t) m] = a;
     }
+}
+
+dab::AerEqParams DeltaABProcessor::aerEq (int a) const
+{
+    dab::AerEqParams e;
+    auto v = [&] (const char* x) { return (double) pv (aid (a, x)); };
+    e.lcOn = v ("lc_on") > 0.5; e.lcHz = v ("lc_hz"); e.lcSlope = kSlopes[juce::jlimit (0, 2, (int) v ("lc_slope"))];
+    e.hcOn = v ("hc_on") > 0.5; e.hcHz = v ("hc_hz"); e.hcSlope = kSlopes[juce::jlimit (0, 2, (int) v ("hc_slope"))];
+    const char* bf[3][3] = { { "b1_f", "b1_g", "b1_q" }, { "b2_f", "b2_g", "b2_q" }, { "b3_f", "b3_g", "b3_q" } };
+    for (int b = 0; b < 3; ++b) e.bell[(size_t) b] = { v (bf[b][0]), v (bf[b][1]), v (bf[b][2]) };
+    e.lowShelf = { v ("ls_f"), v ("ls_g"), v ("ls_q") };
+    e.highShelf = { v ("hs_f"), v ("hs_g"), v ("hs_q") };
+    return e;
 }
 
 void DeltaABProcessor::readParams (dab::EngineParams& p) const
@@ -207,22 +351,51 @@ void DeltaABProcessor::readParams (dab::EngineParams& p) const
     }
     p.centreSendDb = -1.5 * (1 + (int) pv ("c_send"));
     p.outputDb = pv ("out");
+
+    for (int a = 0; a < 3; ++a)
+    {
+        auto& ap = p.aer[(size_t) a];
+        ap.eq = aerEq (a);
+        ap.delayMs = pv (aid (a, "delay"));
+        ap.faderDb = pv (aid (a, "fader"));
+        ap.pan = pv (aid (a, "pan"));
+        ap.panLevel = pv (aid (a, "pan_lvl")) / 100.0;
+        ap.panDelay = pv (aid (a, "pan_dly")) / 100.0;
+        ap.panPhase = pv (aid (a, "pan_ph")) / 100.0;
+        ap.panHF = pv (aid (a, "pan_hf")) / 100.0;
+    }
+    p.aerOutDb = pv ("aer_out");
 }
 
-void DeltaABProcessor::processDouble (const double* const* in, int numIn, double* const* out, int n)
+void DeltaABProcessor::processDouble (const double* const* in, int numIn, const double* const* aerIn, int numAerIn,
+                                      double* const* out, double* const* aerOut, int n)
 {
     if (auto* s = pending.exchange (nullptr))
     {
         retired.store (active);
         active = s;
     }
-    if (active == nullptr) { juce::FloatVectorOperations::clear (out[0], n); juce::FloatVectorOperations::clear (out[1], n); return; }
+    for (int a = 0; a < 3; ++a)
+        if (auto* f = eqPending[(size_t) a].exchange (nullptr))
+        {
+            eqRetired[(size_t) a].store (eqActive[(size_t) a]);
+            eqActive[(size_t) a] = f;
+        }
+    if (active == nullptr)
+    {
+        for (int c = 0; c < 2; ++c)
+        {
+            juce::FloatVectorOperations::clear (out[c], n);
+            if (aerOut != nullptr) juce::FloatVectorOperations::clear (aerOut[c], n);
+        }
+        return;
+    }
 
-    // Source selection. 12 inputs: per mic O1, O2, R1, R2. 6 inputs: per mic O, R.
+    // Source selection. 12 inputs: per mic O1, O2, R1, R2. 6 inputs: per mic O, R. Then AER L, C, R.
     scratch.clear (kSilence, 0, n);
     const double* silence = scratch.getReadPointer (kSilence);
     auto ch = [&] (int c) { return c < numIn ? in[c] : silence; };
-    const double* ip[6];
+    const double* ip[9];
     for (int m = 0; m < 3; ++m)
     {
         const auto& cb = combos[juce::jlimit (0, 5, (int) pv (pid (m, "combo")))];
@@ -238,53 +411,77 @@ void DeltaABProcessor::processDouble (const double* const* in, int numIn, double
             ip[m * 2 + 1] = ch (m * 2 + (sw ? 0 : 1));
         }
     }
+    for (int a = 0; a < 3; ++a) ip[6 + a] = a < numAerIn ? aerIn[a] : silence;
+
     dab::EngineParams p;
     readParams (p);
-    engine.process (*active, p, ip, out, n);
+    dab::AerEqFilter* eq[3] = { eqActive[0], eqActive[1], eqActive[2] };
+    engine.process (*active, eq, p, ip, out, aerOut, n);
+}
+
+// Channel layout of the process buffer: main in (12 or 6), AER in (3), and outputs main (2), AER (2) from channel 0.
+DeltaABProcessor::Io DeltaABProcessor::io (int bufferChannels) const
+{
+    Io r;
+    r.numIn = juce::jmin (12, getChannelCountOfBus (true, 0));
+    r.aerInStart = getChannelCountOfBus (true, 0);
+    r.numAerIn = getBusCount (true) > 1 && getBus (true, 1)->isEnabled() ? juce::jmin (3, getChannelCountOfBus (true, 1)) : 0;
+    r.aerOutStart = getChannelCountOfBus (false, 0);
+    r.aerOutOn = getBusCount (false) > 1 && getBus (false, 1)->isEnabled() && getChannelCountOfBus (false, 1) >= 2
+                 && r.aerOutStart + 2 <= bufferChannels;
+    r.numIn = juce::jmin (r.numIn, bufferChannels);
+    r.numAerIn = juce::jlimit (0, juce::jmax (0, bufferChannels - r.aerInStart), r.numAerIn);
+    return r;
 }
 
 void DeltaABProcessor::processBlock (juce::AudioBuffer<double>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
-    const int n = buffer.getNumSamples(), numIn = juce::jmin (12, getTotalNumInputChannels(), buffer.getNumChannels());
-    if (buffer.getNumChannels() < 2) return;
+    const int n = buffer.getNumSamples(), nch = buffer.getNumChannels();
+    if (nch < 2) return;
     if (scratch.getNumSamples() < n) scratch.setSize (kScratchCh, n, false, false, true);
+    const auto r = io (nch);
+    // Inputs and outputs share channels: copy the inputs out first.
+    for (int c = 0; c < r.numIn; ++c) scratch.copyFrom (c, 0, buffer, c, 0, n);
+    for (int c = 0; c < r.numAerIn; ++c) scratch.copyFrom (12 + c, 0, buffer, r.aerInStart + c, 0, n);
+    const double* in[12];
+    const double* aerIn[3];
+    for (int c = 0; c < 12; ++c) in[c] = scratch.getReadPointer (c);
+    for (int c = 0; c < 3; ++c) aerIn[c] = scratch.getReadPointer (12 + c);
     double* out[2] = { buffer.getWritePointer (0), buffer.getWritePointer (1) };
-    processDouble (buffer.getArrayOfReadPointers(), numIn, out, n);
-    for (int c = 2; c < buffer.getNumChannels(); ++c) buffer.clear (c, 0, n);
+    double* aerOut[2] = { nullptr, nullptr };
+    if (r.aerOutOn) { aerOut[0] = buffer.getWritePointer (r.aerOutStart); aerOut[1] = buffer.getWritePointer (r.aerOutStart + 1); }
+    processDouble (in, r.numIn, aerIn, r.numAerIn, out, r.aerOutOn ? aerOut : nullptr, n);
+    for (int c = r.aerOutOn ? r.aerOutStart + 2 : 2; c < nch; ++c) buffer.clear (c, 0, n);
+    if (r.aerOutOn) for (int c = 2; c < r.aerOutStart; ++c) buffer.clear (c, 0, n);
 }
 
 void DeltaABProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
-    const int n = buffer.getNumSamples(), numIn = juce::jmin (12, getTotalNumInputChannels(), buffer.getNumChannels());
-    if (buffer.getNumChannels() < 2) return;
+    const int n = buffer.getNumSamples(), nch = buffer.getNumChannels();
+    if (nch < 2) return;
     if (scratch.getNumSamples() < n) scratch.setSize (kScratchCh, n, false, false, true);
-
-    for (int c = 0; c < numIn; ++c)
-    {
-        const float* src = buffer.getReadPointer (c);
-        double* dst = scratch.getWritePointer (c);
-        for (int i = 0; i < n; ++i) dst[i] = src[i];
-    }
+    const auto r = io (nch);
+    auto toD = [&] (int src, int dst) { const float* s = buffer.getReadPointer (src); double* d = scratch.getWritePointer (dst); for (int i = 0; i < n; ++i) d[i] = s[i]; };
+    for (int c = 0; c < r.numIn; ++c) toD (c, c);
+    for (int c = 0; c < r.numAerIn; ++c) toD (r.aerInStart + c, 12 + c);
     const double* in[12];
+    const double* aerIn[3];
     for (int c = 0; c < 12; ++c) in[c] = scratch.getReadPointer (c);
-    // outputs go to channels 0 and 1 of scratch after inputs were consumed (engine reads all inputs first per chunk)
-    double* out[2] = { scratch.getWritePointer (0), scratch.getWritePointer (1) };
-    processDouble (in, numIn, out, n);
-    for (int c = 0; c < 2; ++c)
-    {
-        float* dst = buffer.getWritePointer (c);
-        const double* src = scratch.getReadPointer (c);
-        for (int i = 0; i < n; ++i) dst[i] = (float) src[i];
-    }
-    for (int c = 2; c < buffer.getNumChannels(); ++c) buffer.clear (c, 0, n);
+    for (int c = 0; c < 3; ++c) aerIn[c] = scratch.getReadPointer (12 + c);
+    double* out[2] = { scratch.getWritePointer (kOut), scratch.getWritePointer (kOut + 1) };
+    double* aerOut[2] = { scratch.getWritePointer (kOut + 2), scratch.getWritePointer (kOut + 3) };
+    processDouble (in, r.numIn, aerIn, r.numAerIn, out, r.aerOutOn ? aerOut : nullptr, n);
+    buffer.clear();
+    auto toF = [&] (int src, int dst) { const double* s = scratch.getReadPointer (src); float* d = buffer.getWritePointer (dst); for (int i = 0; i < n; ++i) d[i] = (float) s[i]; };
+    toF (kOut, 0); toF (kOut + 1, 1);
+    if (r.aerOutOn) { toF (kOut + 2, r.aerOutStart); toF (kOut + 3, r.aerOutStart + 1); }
 }
 
 juce::AudioProcessorEditor* DeltaABProcessor::createEditor()
 {
-    // Generic editor for now; the analog-console interface comes next.
-    return new juce::GenericAudioProcessorEditor (*this);
+    return new DeltaABEditor (*this);
 }
 
 void DeltaABProcessor::getStateInformation (juce::MemoryBlock& destData)
