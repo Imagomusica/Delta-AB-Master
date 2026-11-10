@@ -27,12 +27,13 @@ juce_add_plugin(DeltaAB
     NEEDS_MIDI_OUTPUT FALSE
     COPY_PLUGIN_AFTER_BUILD FALSE)
 
-target_sources(DeltaAB PRIVATE Source/PluginProcessor.cpp Source/PluginEditor.cpp)
+target_sources(DeltaAB PRIVATE Source/PluginProcessor.cpp Source/PluginEditor.cpp Source/Inserts.cpp)
 target_include_directories(DeltaAB PRIVATE Source)
 
 target_compile_definitions(DeltaAB PUBLIC
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0
-    JUCE_DISPLAY_SPLASH_SCREEN=0)
+    JUCE_DISPLAY_SPLASH_SCREEN=0
+    JUCE_PLUGINHOST_VST3=1)
 
 if(MSVC)
     target_compile_options(DeltaAB PRIVATE /utf-8)
@@ -60,4 +61,9 @@ if(DELTAAB_HOST_TEST)
     target_include_directories(ui_snapshot PRIVATE Source $<TARGET_PROPERTY:DeltaAB,INCLUDE_DIRECTORIES>)
     target_compile_definitions(ui_snapshot PRIVATE $<TARGET_PROPERTY:DeltaAB,COMPILE_DEFINITIONS>)
     target_link_libraries(ui_snapshot PRIVATE DeltaAB)
+
+    add_executable(insert_test tests/insert_test.cpp)
+    target_include_directories(insert_test PRIVATE Source $<TARGET_PROPERTY:DeltaAB,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(insert_test PRIVATE $<TARGET_PROPERTY:DeltaAB,COMPILE_DEFINITIONS>)
+    target_link_libraries(insert_test PRIVATE DeltaAB)
 endif()

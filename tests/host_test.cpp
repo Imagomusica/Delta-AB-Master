@@ -128,7 +128,7 @@ int main (int argc, char** argv)
     // AER output off and Mix on: the AER goes into the mix (AER off, so EN-MS 1 sits at 6-7 and Mix at 8-9)
     {
         auto layout = p->getBusesLayout();
-        const int mixBus = layout.outputBuses.size() - 1;
+        const int mixBus = layout.outputBuses.size() - 2;   // last = Insert DA
         layout.outputBuses.getReference (3) = juce::AudioChannelSet::disabled();
         layout.outputBuses.getReference (mixBus) = juce::AudioChannelSet::stereo();
         check (p->setBusesLayout (layout), "AER output off, Mix output on", 1);

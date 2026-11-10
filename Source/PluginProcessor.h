@@ -2,6 +2,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "dsp/Engine.h"
 #include "dsp/Meter.h"
+#include "Inserts.h"
 
 class DeltaABProcessor : public juce::AudioProcessor, private juce::Timer
 {
@@ -41,6 +42,7 @@ public:
     float meterRmsDb (int ch) const { return engine.meterRmsDb[(size_t) ch].load(); }
     // Master meters: the sum of every flow (what the Pyramix bus will add up), for scope, peak, VU, true peak.
     dab::MasterMeter master;
+    InsertRack rack;   // insert slots: hosted VST3 or DA/AD loop
     double sampleRate() const { return sr; }
 
 private:
@@ -57,7 +59,8 @@ private:
                 std::array<int, dab::kMaxSpots> spotStart {}, spotIn {};
                 bool aerOutOn = false;
                 std::array<int, 3 + dab::kMaxSpots> flowStart {};
-                std::array<bool, 3 + dab::kMaxSpots> flowOn {}; };
+                std::array<bool, 3 + dab::kMaxSpots> flowOn {};
+                int hwRetStart = 0, hwSendStart = 0; bool hwRetOn = false, hwSendOn = false; };
     static constexpr int kNumFlowOut = 3 + dab::kMaxSpots;   // stereo outputs: AB mics, spots
     double* const* flowPtrs = nullptr;
     Io io (int bufferChannels) const;
@@ -84,7 +87,8 @@ private:
     std::array<bool, 3> wasAnalysing { false, false, false };
     // scratch: main inputs, AER inputs, spot inputs, then 6 outputs (main, AER, spots)
     static constexpr int kInMain = 0, kInAer = 12, kInSpots = 15, kOut = kInSpots + 2 * dab::kMaxSpots,
-                         kFlowOut = kOut + 6, kScratchCh = kFlowOut + 2 * (3 + dab::kMaxSpots);
+                         kFlowOut = kOut + 6, kHwRet = kFlowOut + 2 * (3 + dab::kMaxSpots),
+                         kHwSend = kHwRet + 2, kScratchCh = kHwSend + 2;
     juce::AudioBuffer<double> scratch;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DeltaABProcessor)

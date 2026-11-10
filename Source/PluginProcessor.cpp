@@ -191,11 +191,13 @@ juce::AudioProcessor::BusesProperties DeltaABProcessor::makeBuses()
          .withInput ("AER.01-03", juce::AudioChannelSet::createLCR(), true);
     for (int k = 0; k < dab::kMaxSpots; ++k)
         b = b.withInput ("EN-MS." + juce::String (k + 1).paddedLeft ('0', 2) + " (cardio, ruban)", juce::AudioChannelSet::stereo(), k == 0);
+    b = b.withInput (juce::String::fromUTF8 ("Insert AD (retour)"), juce::AudioChannelSet::stereo(), false);
     const char* micOut[3] = { "AB.01", "AB.02", "AB.03" };
     for (int m = 0; m < 3; ++m) b = b.withOutput (micOut[m], juce::AudioChannelSet::stereo(), true);
     b = b.withOutput ("AER", juce::AudioChannelSet::stereo(), true);
     for (int k = 0; k < dab::kMaxSpots; ++k) b = b.withOutput ("EN-MS." + juce::String (k + 1).paddedLeft ('0', 2), juce::AudioChannelSet::stereo(), k == 0);
     b = b.withOutput ("Mix", juce::AudioChannelSet::stereo(), false);
+    b = b.withOutput (juce::String::fromUTF8 ("Insert DA (départ)"), juce::AudioChannelSet::stereo(), false);
     return b;
 }
 
@@ -203,6 +205,7 @@ DeltaABProcessor::DeltaABProcessor()
     : AudioProcessor (makeBuses()),
       apvts (*this, nullptr, "DeltaAB", createLayout())
 {
+    engine.hook = &rack;
     startTimerHz (20);
 }
 
@@ -259,6 +262,7 @@ void DeltaABProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     sr = sampleRate;
     master.prepare (sampleRate);
+    rack.prepare (sampleRate, juce::jmax (512, samplesPerBlock));
     engine.prepare (sampleRate, juce::jmax (512, samplesPerBlock));
     scratch.setSize (kScratchCh, juce::jmax (512, samplesPerBlock));
 
@@ -277,7 +281,7 @@ void DeltaABProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
         if (builtCfg.aerEqLinear) eqActive[(size_t) a] = makeEq (a);
         eqBuilt[(size_t) a] = eqActive[(size_t) a];
     }
-    setLatencySamples (engine.totalLatency (*active));
+    setLatencySamples (engine.totalLatency (*active) + rack.maxLatency());
 }
 
 dab::AerEqFilter* DeltaABProcessor::makeEq (int a) const
@@ -290,6 +294,12 @@ dab::AerEqFilter* DeltaABProcessor::makeEq (int a) const
 void DeltaABProcessor::timerCallback()
 {
     delete retired.exchange (nullptr);
+    // an insert came, went or changed its latency (or a PING finished): report the new total
+    if (active != nullptr && pending.load() == nullptr)
+    {
+        const int lat = engine.totalLatency (*active) + rack.maxLatency();
+        if (lat != getLatencySamples()) setLatencySamples (lat);
+    }
 
     const auto cfg = currentConfig();
     if (active != nullptr && cfg != builtCfg && pending.load() == nullptr && retired.load() == nullptr)
@@ -297,7 +307,7 @@ void DeltaABProcessor::timerCallback()
         auto* s = new dab::CrossoverSet();
         s->build (cfg);
         builtCfg = cfg;
-        const int lat = engine.totalLatency (*s);
+        const int lat = engine.totalLatency (*s) + rack.maxLatency();
         pending.store (s);
         if (lat != getLatencySamples()) setLatencySamples (lat);
     }
@@ -526,6 +536,9 @@ DeltaABProcessor::Io DeltaABProcessor::io (int bufferChannels) const
     r.aerOutStart = start (false, 3);   r.aerOutOn = busCh (false, 3) >= 2 && r.aerOutStart + 2 <= clampN;
     const int mixBus = 4 + dab::kMaxSpots;
     r.mixStart = start (false, mixBus); r.mixOn = busCh (false, mixBus) >= 2 && r.mixStart + 2 <= clampN;
+    const int retBus = 2 + dab::kMaxSpots, sendBus = mixBus + 1;
+    r.hwRetStart = start (true, retBus);   r.hwRetOn = busCh (true, retBus) >= 2 && r.hwRetStart + 2 <= clampN;
+    r.hwSendStart = start (false, sendBus); r.hwSendOn = busCh (false, sendBus) >= 2 && r.hwSendStart + 2 <= clampN;
     return r;
 }
 
@@ -551,6 +564,12 @@ void DeltaABProcessor::processAny (juce::AudioBuffer<T>& buffer)
     take (0, r.numMain, kInMain, 12);
     take (r.aerStart, r.numAer, kInAer, 3);
     for (int k = 0; k < dab::kMaxSpots; ++k) take (r.spotStart[(size_t) k], r.spotIn[(size_t) k], kInSpots + 2 * k, 2);
+    take (r.hwRetStart, r.hwRetOn ? 2 : 0, kHwRet, 2);
+    for (int c = 0; c < 2; ++c) juce::FloatVectorOperations::clear (scratch.getWritePointer (kHwSend + c), n);
+    double* hwSend[2] = { scratch.getWritePointer (kHwSend), scratch.getWritePointer (kHwSend + 1) };
+    const double* hwRet[2] = { scratch.getReadPointer (kHwRet), scratch.getReadPointer (kHwRet + 1) };
+    rack.beginBlock (r.hwSendOn ? hwSend : nullptr, r.hwRetOn ? hwRet : nullptr, n);
+    rack.computeCompensation (engine.comp);
 
     const double* in[kOut];
     for (int c = 0; c < kOut; ++c) in[c] = scratch.getReadPointer (c);
@@ -573,6 +592,7 @@ void DeltaABProcessor::processAny (juce::AudioBuffer<T>& buffer)
     flowPtrs = flows;
     processDouble (in, r.numMain, o, r.aerOutOn ? o + 2 : nullptr, nullptr, n);
     flowPtrs = nullptr;
+    rack.endBlock();
     {   // master meter: main mix + AER when the AER has its own output
         double ml[256], mr[256];
         for (int s0 = 0; s0 < n; s0 += 256)
@@ -593,6 +613,7 @@ void DeltaABProcessor::processAny (juce::AudioBuffer<T>& buffer)
     if (r.aerOutOn) { give (kOut + 2, r.aerOutStart); give (kOut + 3, r.aerOutStart + 1); }
     for (int f = 0; f < kNumFlowOut; ++f)
         if (r.flowOn[(size_t) f]) { give (kFlowOut + 2 * f, r.flowStart[(size_t) f]); give (kFlowOut + 2 * f + 1, r.flowStart[(size_t) f] + 1); }
+    if (r.hwSendOn) { give (kHwSend, r.hwSendStart); give (kHwSend + 1, r.hwSendStart + 1); }
 }
 
 void DeltaABProcessor::processBlock (juce::AudioBuffer<double>& buffer, juce::MidiBuffer&) { processAny (buffer); }
@@ -605,13 +626,25 @@ juce::AudioProcessorEditor* DeltaABProcessor::createEditor()
 
 void DeltaABProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    if (auto xml = apvts.copyState().createXml()) copyXmlToBinary (*xml, destData);
+    auto st = apvts.copyState();
+    st.removeChild (st.getChildWithName ("INSERTS"), nullptr);
+    st.appendChild (rack.saveState(), nullptr);
+    if (auto xml = st.createXml()) copyXmlToBinary (*xml, destData);
 }
 
 void DeltaABProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
-        if (xml->hasTagName (apvts.state.getType())) apvts.replaceState (juce::ValueTree::fromXml (*xml));
+        if (xml->hasTagName (apvts.state.getType()))
+        {
+            auto st = juce::ValueTree::fromXml (*xml);
+            auto ins = st.getChildWithName ("INSERTS").createCopy();
+            st.removeChild (st.getChildWithName ("INSERTS"), nullptr);
+            apvts.replaceState (st);
+            // hosted plugins are created on the message thread
+            if (juce::MessageManager::getInstance()->isThisTheMessageThread()) rack.restoreState (ins);
+            else juce::MessageManager::callAsync ([this, ins] { rack.restoreState (ins); });
+        }
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new DeltaABProcessor(); }

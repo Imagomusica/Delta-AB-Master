@@ -453,17 +453,109 @@ void MatchMeter::paint (juce::Graphics& g)
     g.drawText (t, r, juce::Justification::centred);
 }
 
+namespace {
+struct PluginWindow : juce::DocumentWindow
+{
+    PluginWindow (const juce::String& name, juce::AudioProcessorEditor* ed, std::function<void()> onClose)
+        : juce::DocumentWindow (name, juce::Colours::black, juce::DocumentWindow::closeButton), closed (std::move (onClose))
+    {
+        setUsingNativeTitleBar (true);
+        setContentOwned (ed, true);
+        setResizable (ed->isResizable(), false);
+        setAlwaysOnTop (true);
+        centreWithSize (getWidth(), getHeight());
+        setVisible (true);
+    }
+    void closeButtonPressed() override { if (closed) juce::MessageManager::callAsync (closed); }
+    std::function<void()> closed;
+};
+}
+
+InsertSlot::~InsertSlot() { window.reset(); }
+
+void InsertSlot::openWindow()
+{
+    auto* pl = proc.rack.plugin (slot);
+    if (pl == nullptr) return;
+    if (window != nullptr) { window->toFront (true); return; }
+    if (auto* ed = pl->createEditorIfNeeded())
+        window = std::make_unique<PluginWindow> (pl->getName(), ed,
+                                                 [sp = juce::Component::SafePointer<InsertSlot> (this)] { if (sp) sp->window.reset(); });
+}
+
+void InsertSlot::mouseDown (const juce::MouseEvent& e)
+{
+    if (e.getNumberOfClicks() > 1) return;
+    auto& rack = proc.rack;
+    juce::PopupMenu m, plugs;
+    rack.knownPlugins().addToMenu (plugs, juce::KnownPluginList::sortByManufacturer);
+    m.addSectionHeader (upper (text));
+    m.addSubMenu ("Charger un VST3", plugs, rack.knownPlugins().getNumTypes() > 0);
+    m.addItem (90001, u ("Scanner les VST3 installés…"));
+    m.addSeparator();
+    const int k = rack.kind (slot);
+    for (int j = 0; j < InsertRack::kLoops; ++j)
+        m.addItem (90010 + j, "Boucle DA/AD " + juce::String (j + 1) + "  (sortie Insert DA " + juce::String (j + 1) + u (" → entrée Insert AD ") + juce::String (j + 1) + ")",
+                   true, k == InsertRack::kHardware && rack.hardwareLoop (slot) == j);
+    if (k == InsertRack::kHardware) m.addItem (90020, u ("PING : mesurer l’aller-retour DA/AD"));
+    if (k == InsertRack::kPlugin) m.addItem (90030, u ("Ouvrir la fenêtre du plugin"));
+    if (k != InsertRack::kEmpty) m.addItem (90040, "Vider le slot");
+    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this),
+        [sp = juce::Component::SafePointer<InsertSlot> (this)] (int r) {
+            if (sp == nullptr || r == 0) return;
+            auto& rk = sp->proc.rack;
+            if (r == 90001) { rk.scan(); return; }
+            if (r >= 90010 && r < 90010 + InsertRack::kLoops) { sp->window.reset(); rk.setHardware (sp->slot, r - 90010); }
+            else if (r == 90020) rk.ping (rk.hardwareLoop (sp->slot));
+            else if (r == 90030) sp->openWindow();
+            else if (r == 90040) { sp->window.reset(); rk.clear (sp->slot); }
+            else
+            {
+                const int idx = juce::KnownPluginList::getIndexChosenByMenu (rk.knownPlugins().getTypes(), r);
+                if (idx >= 0)
+                {
+                    sp->window.reset();
+                    rk.loadPlugin (sp->slot, rk.knownPlugins().getTypes()[idx], [sp] (const juce::String& err) {
+                        if (sp == nullptr) return;
+                        if (err.isNotEmpty()) juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Delta AB", err);
+                        else sp->openWindow();
+                        sp->repaint();
+                    });
+                }
+            }
+            sp->repaint();
+        });
+}
+
 void InsertSlot::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat().reduced (0.5f);
-    g.setColour (kDim);
-    const float dash[] = { 3.0f, 3.0f };
-    juce::Path p; p.addRectangle (r);
-    juce::Path d; juce::PathStrokeType (1.0f).createDashedStroke (d, p, dash, 2);
-    g.fillPath (d);
-    g.setColour (kGrey);
+    auto& rack = proc.rack;
+    const int k = rack.kind (slot);
+    if (k == InsertRack::kEmpty)
+    {
+        g.setColour (kDim);
+        const float dash[] = { 3.0f, 3.0f };
+        juce::Path p; p.addRectangle (r);
+        juce::Path d; juce::PathStrokeType (1.0f).createDashedStroke (d, p, dash, 2);
+        g.fillPath (d);
+        g.setColour (kGrey);
+        g.setFont (monoFont (9.0f));
+        g.drawFittedText (upper (text), getLocalBounds().reduced (2), juce::Justification::centred, 1, 0.6f);
+        return;
+    }
+    // loaded: white plate, black text, latency on the right
+    g.setColour (kWhite); g.fillRect (r);
+    g.setColour (kBlack);
     g.setFont (monoFont (9.0f));
-    g.drawFittedText (upper (text), getLocalBounds().reduced (2), juce::Justification::centred, 1, 0.6f);
+    juce::String right;
+    if (k == InsertRack::kHardware)
+        right = rack.pinging (rack.hardwareLoop (slot)) ? "PING" : juce::String (1000.0 * rack.slotLatency (slot) / proc.sampleRate(), 2) + "ms";
+    else if (rack.slotLatency (slot) > 0)
+        right = juce::String (rack.slotLatency (slot));
+    auto tr = getLocalBounds().reduced (3, 1);
+    if (right.isNotEmpty()) g.drawText (right, tr.removeFromRight (40), juce::Justification::centredRight);
+    g.drawFittedText (upper (rack.name (slot)), tr, juce::Justification::centredLeft, 1, 0.6f);
 }
 
 // ------------------------------------------------------------------ master section
@@ -720,9 +812,9 @@ Switch& Strip::switch2 (APVTS& s, const juce::String& id, const juce::String& a,
     return *t;
 }
 
-void Strip::insert (const juce::String& text)
+void Strip::insert (DeltaABProcessor& p, int slot, const juce::String& text)
 {
-    auto* t = new InsertSlot (text); owned.add (t);
+    auto* t = new InsertSlot (p, slot, text); owned.add (t);
     addAndMakeVisible (t);
     items.push_back ({ { t }, 18 });
 }
@@ -940,12 +1032,12 @@ Console::Console (DeltaABProcessor& p)
     for (int a = 0; a < 3; ++a)
     {
         auto& st = *(aer[a] = std::make_unique<Strip> (aerTitle[a], [this, a] { openAer (a); }));
-        st.insert ("insert vst");
+        st.insert (p, 3 * a, "insert vst");
         st.toggle (s, aid (a, "lc_on"), "low cut");
         st.toggle (s, aid (a, "hc_on"), "high cut");
         st.knob (s, aid (a, "delay"), u ("délai"), true);
-        st.insert ("insert rev / DA-AD");
-        st.insert ("insert comp");
+        st.insert (p, 3 * a + 1, "insert rev / DA-AD");
+        st.insert (p, 3 * a + 2, "insert comp");
         st.knob (s, aid (a, "pan"), "pan");
         st.fader (s, aid (a, "fader"));
         addAndMakeVisible (st);
@@ -958,7 +1050,7 @@ Console::Console (DeltaABProcessor& p)
         st.switch2 (s, sid (k, "mode"), "M/S", "xover");
         st.knob (s, sid (k, "cardio"), "level M");
         st.knob (s, sid (k, "ribbon"), "level S");
-        st.insert ("insert");
+        st.insert (p, 9 + k, "insert");
         st.switch2 (s, sid (k, "out"), "somme", u ("stéréo"));
         st.knob (s, sid (k, "pan"), "pan");
         st.fader (s, sid (k, "fader"));
@@ -1012,6 +1104,7 @@ void Console::timerCallback()
 {
     for (auto& st : ab) st->tick();
     masterPanel.tick();
+    if (++slowTick % 10 == 0) { for (auto& st : aer) st->repaint(); spotHolder.repaint(); }
     for (int k = 0; k < juce::jmax (0, shownSpots); ++k) spot[k]->tick();
     if ((int) proc.apvts.getRawParameterValue ("spots_n")->load() != shownSpots) { layoutSpots(); repaint(); }
     if (detail != nullptr && detailAer >= 0)

@@ -120,12 +120,19 @@ struct MasterPanel : juce::Component
     int ptsPos = 0;
 };
 
-// Placeholder for an insert slot (VST or hardware), not active yet.
+// Insert slot: click for the menu (load a VST3, DA/AD loop 1 or 2, PING, open the plugin window, clear).
 struct InsertSlot : juce::Component
 {
-    explicit InsertSlot (const juce::String& t) : text (t) {}
+    InsertSlot (DeltaABProcessor& p, int s, const juce::String& t) : proc (p), slot (s), text (t) {}
+    ~InsertSlot() override;
     void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override { openWindow(); }
+    void openWindow();
+    DeltaABProcessor& proc;
+    int slot;
     juce::String text;
+    std::unique_ptr<juce::DocumentWindow> window;
 };
 
 // One console strip: title, DETAIL button, a column of controls, then the fader at the bottom.
@@ -136,7 +143,7 @@ struct Strip : juce::Component
     Choice& choice (APVTS&, const juce::String& id, const juce::String& caption);
     Toggle& toggle (APVTS&, const juce::String& id, const juce::String& text);
     Switch& switch2 (APVTS&, const juce::String& id, const juce::String& a, const juce::String& b);
-    void insert (const juce::String& text);
+    void insert (DeltaABProcessor&, int slot, const juce::String& text);
     void selector (APVTS&, const juce::String& id, const juce::String& caption, int h);
     Switch& switchN (APVTS&, const juce::String& id, const juce::StringArray& names);
     void knobRow (APVTS&, std::initializer_list<std::pair<juce::String, juce::String>>, int h, bool values);
@@ -215,7 +222,7 @@ private:
 
     MasterPanel masterPanel;
     std::unique_ptr<Detail> detail;
-    int shownSpots = -1;
+    int shownSpots = -1, slowTick = 0;
     int detailAer = -1;
     dab::AerEqParams shownEq;
 

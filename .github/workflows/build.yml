@@ -40,6 +40,12 @@ jobs:
             build/host_test_artefacts/Release/host_test.exe "build/DeltaAB_artefacts/Release/VST3/Delta AB.vst3"
           fi
 
+      - name: Insert test (DA/AD loop, PING, latency compensation)
+        if: runner.os == 'Linux'
+        run: |
+          cmake --build build --config Release --target insert_test --parallel 4
+          xvfb-run -a build/insert_test
+
       - name: Upload VST3
         uses: actions/upload-artifact@v4
         with:

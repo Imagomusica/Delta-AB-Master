@@ -310,6 +310,17 @@ private:
     std::array<Smoother, 3> g, gl, co, si;
 };
 
+// Inserts hosted outside the DSP code (VST plugins, DA/AD hardware loops). Slots: AER channel a: 3a (before the EQ),
+// 3a+1 and 3a+2 (after delay and fader); EN-MS spot k: 9+k (after its fader, r = right side in stereo M/S, else nullptr).
+// offset: position of this chunk in the host block (for the hardware loop buffers).
+struct InsertHook
+{
+    virtual ~InsertHook() = default;
+    virtual bool active (int slot) const = 0;
+    virtual void insert (int slot, double* l, double* r, int n, int offset) = 0;
+};
+static constexpr int kInsertSlots = 9 + kMaxSpots;
+
 class Engine {
 public:
     static constexpr double kMaxDelayMs = 10.0;
@@ -326,6 +337,9 @@ public:
             for (auto& b : *v) b.assign ((size_t) maxN, 0.0);
         spotHi.assign ((size_t) maxN, 0.0);
         for (auto& b : spotIn) b.assign ((size_t) maxN, 0.0);
+        insBuf.assign ((size_t) maxN, 0.0);
+        for (auto& b : compRing) b.assign ((size_t) kMaxComp, 0.0);
+        compPos.fill (0); compLast.fill (0);
         meterPow.fill (0.0);
         inGain.fill (1.0);
         for (auto& m : meterRmsDb) m.store (-300.0f);
@@ -351,6 +365,12 @@ public:
 
     // Total plugin latency for a given crossover set.
     int totalLatency (const CrossoverSet& set) const { return set.latency + baseDelay + FractionalDelay::kHalf; }
+
+    // Insert latency compensation: each pan channel is delayed by comp[ch] samples (set by the host of the inserts,
+    // = largest insert latency minus this channel's own), so every flow stays aligned.
+    static constexpr int kMaxComp = 1 << 16;
+    InsertHook* hook = nullptr;
+    std::array<int, kPanCh> comp {};
 
     // in (kNumIn): 6 AB channels (mic1 X,Y  mic2 X,Y  mic3 X,Y), 3 AER channels (L, C, R), then per spot cardio, ribbon.
     // out: main stereo; aerOut / spotsOut: separate stereo outputs, or nullptr to mix into the main output.
@@ -378,6 +398,7 @@ public:
                 flowPtr[(size_t) c] = flows != nullptr && flows[c] != nullptr ? flows[c] + done : nullptr;
                 if (flowPtr[(size_t) c] != nullptr) std::fill (flowPtr[(size_t) c], flowPtr[(size_t) c] + k, 0.0);   // flows add up
             }
+            chunkOffset = done;
             processChunk (set, eq, p, inPtr, outPtr, aerOut != nullptr ? aerPtr : nullptr, spotsOut != nullptr ? spPtr : nullptr, k);
             done += k;
         }
@@ -496,6 +517,7 @@ private:
             auto& d = delay[(size_t) m];
             auto& lv = sm (kMicLevel + m);
             for (int i = 0; i < n; ++i) mo[i] = d.process (pad.process (mo[i])) * lv.next();
+            compensate (m, mo, n);
             panStage (set, m, abBus, n);
         }
 
@@ -505,6 +527,12 @@ private:
             const auto& ap = p.aer[(size_t) c];
             double* x = mono[(size_t) (3 + c)].data();
             const double* src = in[6 + c];
+            if (hook != nullptr && hook->active (3 * c))
+            {
+                std::copy (src, src + n, insBuf.data());
+                hook->insert (3 * c, insBuf.data(), nullptr, n, chunkOffset);
+                src = insBuf.data();
+            }
             if (set.cfg.aerEqLinear)
             {
                 // a filter built for another rate or length would break the alignment: stay silent until the right one arrives
@@ -534,6 +562,9 @@ private:
             auto& d = aerDelay[(size_t) c];
             auto& f = sm (kAerFader + c);
             for (int i = 0; i < n; ++i) x[i] = d.process (pad.process (x[i])) * f.next();
+            for (int sl = 1; sl <= 2; ++sl)
+                if (hook != nullptr && hook->active (3 * c + sl)) hook->insert (3 * c + sl, x, nullptr, n, chunkOffset);
+            compensate (3 + c, x, n);
             panStage (set, 3 + c, aerBus, n);
         }
 
@@ -607,10 +638,16 @@ private:
                     mo[i] = d.process (pad.process (mo[i])) * g;
                     moR[i] = dR.process (padR.process (moR[i])) * g;
                 }
+                if (hook != nullptr && hook->active (9 + k)) hook->insert (9 + k, mo, moR, n, chunkOffset);
+                compensate (6 + kMaxSpots + k, moR, n);
                 panStage (set, 6 + kMaxSpots + k, spotBus, n);
             }
             else
+            {
                 for (int i = 0; i < n; ++i) mo[i] = d.process (pad.process (mo[i])) * f.next();
+                if (hook != nullptr && hook->active (9 + k)) hook->insert (9 + k, mo, nullptr, n, chunkOffset);
+            }
+            compensate (6 + k, mo, n);
             panStage (set, 6 + k, spotBus, n);
         }
 
@@ -690,6 +727,21 @@ private:
         }
         else
             pan[(size_t) k].process (mo, h, lb, hlb, dst, n);
+    }
+
+    void compensate (int ch, double* x, int n)
+    {
+        const int d = std::clamp (comp[(size_t) ch], 0, kMaxComp - 1);
+        auto& ring = compRing[(size_t) ch];
+        int& w = compPos[(size_t) ch];
+        if (d == 0 && compLast[(size_t) ch] == 0) return;
+        compLast[(size_t) ch] = d;
+        for (int i = 0; i < n; ++i)
+        {
+            ring[(size_t) w] = x[i];
+            x[i] = ring[(size_t) ((w - d) & (kMaxComp - 1))];
+            w = (w + 1) & (kMaxComp - 1);
+        }
     }
 
     void meter (int ch, double pk, double e, int n)
@@ -781,6 +833,10 @@ private:
     std::array<double, kMeterCh> meterPow {};
     std::array<double, kMeterCh> inGain {};
     std::array<std::vector<double>, 2> spotIn;
+    std::vector<double> insBuf;
+    std::array<std::vector<double>, kPanCh> compRing;
+    std::array<int, kPanCh> compPos {}, compLast {};
+    int chunkOffset = 0;
     std::array<MinEq, 3> aerMinEq;
     std::vector<double> silence;
 };
