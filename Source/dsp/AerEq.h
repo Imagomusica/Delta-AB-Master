@@ -129,7 +129,7 @@ struct AerEqFilter {
     void build (const AerEqParams& p, double sampleRate, int length)
     {
         params = p; fs = sampleRate; N = length;
-        conv.prepare (designLinearPhaseEq (p, sampleRate, length), convBlock (sampleRate));
+        conv.prepare (designLinearPhaseEq (p, sampleRate, length), convBlock (sampleRate, length));
     }
 };
 

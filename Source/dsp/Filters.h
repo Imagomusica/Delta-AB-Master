@@ -101,7 +101,8 @@ public:
         current = samples;
         I = (int) std::floor (samples);
         const double f = samples - I;
-        if (f == 0.0)
+        integer = f == 0.0;
+        if (integer)
         {
             std::fill (c, c + kTaps, 0.0);
             c[kHalf] = 1.0;
@@ -123,6 +124,12 @@ public:
     inline double process (double x)
     {
         buf[(size_t) w] = x;
+        if (integer)   // same result as the kernel below (a single 1 at kHalf), without the 128 taps
+        {
+            const double y = buf[(size_t) ((w - I) & mask)];
+            w = (w + 1) & mask;
+            return y;
+        }
         const int base = w - (I - kHalf);
         double y = 0;
         for (int k = 0; k < kTaps; ++k) y += c[k] * buf[(size_t) ((base - k) & mask)];
@@ -140,6 +147,7 @@ public:
 private:
     std::vector<double> buf;
     int mask = 0, w = 0, I = kHalf;
+    bool integer = true;
     double current = -1;
     double c[kTaps] {};
 };
@@ -149,6 +157,8 @@ class Smoother {
 public:
     void prepare (double fs, double seconds = 0.02) { len = std::max (1, (int) (fs * seconds)); }
     void setImmediate (double v) { cur = tgt = v; steps = 0; }
+    double current() const { return cur; }
+    double target() const { return tgt; }
     void setTarget (double v)
     {
         if (v == tgt) return;

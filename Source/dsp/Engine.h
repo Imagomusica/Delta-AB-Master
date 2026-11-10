@@ -15,6 +15,10 @@ namespace dab {
 
 enum class Slope { dB6 = 1, dB12 = 2, dB24 = 4 };
 
+constexpr int kMaxSpots = 16;                 // EN-MS spot mics (ribbon + cardioid)
+constexpr int kPanCh = 6 + kMaxSpots;         // pan channels: 3 AB mics, 3 AER, spots
+constexpr int kNumIn = 9 + 2 * kMaxSpots;     // engine inputs: 6 AB (X, Y), 3 AER, spots (cardio, ribbon)
+
 // Everything that requires rebuilding filters (done off the audio thread).
 struct CrossoverConfig {
     double fs = 48000;
@@ -23,11 +27,12 @@ struct CrossoverConfig {
     Slope slope = Slope::dB12;
     std::array<double, 3> fc { 700, 700, 700 };
     bool aerEqLinear = false;
+    std::array<double, kMaxSpots> spotFc = [] { std::array<double, kMaxSpots> a {}; a.fill (700); return a; }();
 
     bool operator== (const CrossoverConfig& o) const
     {
         return fs == o.fs && linearPhase == o.linearPhase && exportQuality == o.exportQuality
-            && slope == o.slope && fc == o.fc && aerEqLinear == o.aerEqLinear;
+            && slope == o.slope && fc == o.fc && aerEqLinear == o.aerEqLinear && spotFc == o.spotFc;
     }
     bool operator!= (const CrossoverConfig& o) const { return ! (*this == o); }
 };
@@ -53,15 +58,23 @@ class MicCrossover {
 public:
     void build (const CrossoverConfig& cfg, int mic)
     {
+        const double fc = cfg.fc[(size_t) mic];
+        build (cfg, fc, cfg.linearPhase ? designLinearPhaseLowpass (fc, cfg.fs, (int) cfg.slope, firLength (cfg.fs, cfg.exportQuality))
+                                        : std::vector<double>());
+    }
+
+    // lpFir: the linear-phase low-pass for this fc (shared between channels with the same frequency).
+    void build (const CrossoverConfig& cfg, double fc, const std::vector<double>& lpFir)
+    {
         linear = cfg.linearPhase;
-        const double fc = cfg.fc[(size_t) mic], fs = cfg.fs;
+        const double fs = cfg.fs;
         if (linear)
         {
-            const int N = firLength (fs, cfg.exportQuality);
-            const auto h = designLinearPhaseLowpass (fc, fs, (int) cfg.slope, N);
-            conv.prepare (h, convBlock (fs));
-            lat = convBlock (fs) + (N - 1) / 2;
+            const int N = (int) lpFir.size();
+            conv.prepare (lpFir, convBlock (fs, N));
+            lat = convBlock (fs, N) + (N - 1) / 2;
             direct.prepare (lat);
+            bypassD.prepare (lat);
         }
         else
         {
@@ -83,6 +96,9 @@ public:
     }
 
     int latency() const { return lat; }
+
+    // No crossover: same latency as the crossover, no filtering (EN-MS spots in M/S mode).
+    void bypass (double* x, int n) { if (linear) for (int i = 0; i < n; ++i) x[i] = bypassD.process (x[i]); }
 
     // low/high are scratch buffers and may be overwritten.
     void process (double* low, double* high, double* out, int n)
@@ -109,7 +125,7 @@ private:
     bool linear = true;
     int lat = 0;
     FifoConvolver conv;
-    IntDelay direct;
+    IntDelay direct, bypassD;
     Biquad lp[2], hp[2];
     int nStages = 0;
     double sign = 1.0;
@@ -118,25 +134,37 @@ private:
 struct CrossoverSet {
     CrossoverConfig cfg;
     std::array<MicCrossover, 3> mic;
-    // pan stage for 6 channels: 0..2 Delta AB mics, 3..5 Delta AER channels
-    std::array<FifoConvolver, 6> hilbert, splitLow, splitLowH;
-    std::array<IntDelay, 6> hilbertDirect;
+    std::array<MicCrossover, kMaxSpots> spot;
+    // pan stage: 0..2 Delta AB mics, 3..5 Delta AER channels, 6.. EN-MS spots
+    std::array<FifoConvolver, kPanCh> hilbert, splitLow, splitLowH;
+    std::array<IntDelay, kPanCh> hilbertDirect;
     std::array<IntDelay, 3> abPad, aerPad;     // align AB crossover and AER EQ latencies
+    std::array<IntDelay, kMaxSpots> spotPad;
     int core = 0, latency = 0;
     void build (const CrossoverConfig& c)
     {
         cfg = c;
-        for (int m = 0; m < 3; ++m) mic[(size_t) m].build (c, m);
+        // one low-pass design per distinct frequency
+        std::vector<std::pair<double, std::vector<double>>> lps;
+        auto lpFor = [&] (double fc) -> const std::vector<double>& {
+            for (auto& e : lps) if (e.first == fc) return e.second;
+            lps.emplace_back (fc, c.linearPhase ? designLinearPhaseLowpass (fc, c.fs, (int) c.slope, firLength (c.fs, c.exportQuality))
+                                                : std::vector<double>());
+            return lps.back().second;
+        };
+        for (int m = 0; m < 3; ++m) mic[(size_t) m].build (c, c.fc[(size_t) m], lpFor (c.fc[(size_t) m]));
+        for (int k = 0; k < kMaxSpots; ++k) spot[(size_t) k].build (c, c.spotFc[(size_t) k], lpFor (c.spotFc[(size_t) k]));
         const int HN = hilbertLength (c.fs, c.exportQuality);
         const auto h = designHilbert (HN);
         const auto lp = designSplitLowpass (kHfPanSplitHz, c.fs, 2, HN);
         const auto hlp = designHilbertLowpass (kHfPanSplitHz, c.fs, 2, HN);
-        const int hl = convBlock (c.fs) + ((int) h.size() - 1) / 2;
-        for (int k = 0; k < 6; ++k)
+        const int hb = convBlock (c.fs, HN);
+        const int hl = hb + ((int) h.size() - 1) / 2;
+        for (int k = 0; k < kPanCh; ++k)
         {
-            hilbert[(size_t) k].prepare (h, convBlock (c.fs));
-            splitLow[(size_t) k].prepare (lp, convBlock (c.fs));
-            splitLowH[(size_t) k].prepare (hlp, convBlock (c.fs));
+            hilbert[(size_t) k].prepare (h, hb);
+            splitLow[(size_t) k].prepare (lp, hb);
+            splitLowH[(size_t) k].prepare (hlp, hb);
             hilbertDirect[(size_t) k].prepare (hl);
         }
         const int abLat = mic[0].latency();
@@ -144,11 +172,13 @@ struct CrossoverSet {
         core = std::max (abLat, aerLat);
         for (auto& d : abPad) d.prepare (core - abLat);
         for (auto& d : aerPad) d.prepare (core - aerLat);
+        for (auto& d : spotPad) d.prepare (core - abLat);   // spots use the same crossover type as the AB mics
         latency = core + hl;
     }
     static int aerEqLatency (const CrossoverConfig& c)
     {
-        return c.aerEqLinear ? convBlock (c.fs) + (firLength (c.fs, c.exportQuality) - 1) / 2 : 0;
+        const int N = firLength (c.fs, c.exportQuality);
+        return c.aerEqLinear ? convBlock (c.fs, N) + (N - 1) / 2 : 0;
     }
 };
 
@@ -168,10 +198,22 @@ struct MicParams : PanParams {
     double focusDb = 0;          // source in the highs
     double bloomDb = 0;          // source in the lows
     bool analyse = false;        // measure X/Y level around the crossover frequency
+    double levelDb = 0;          // mic output level (after the sum, before the pan)
 };
 
 struct AerParams : PanParams {
     AerEqParams eq;
+    double delayMs = 0;          // -10 .. +100 ms
+    double faderDb = 0;
+};
+
+// EN-MS spot: cardioid (Mid) + ribbon figure-8 aimed sideways (Side).
+struct SpotParams : PanParams {
+    bool crossover = false;      // false: M/S (M + S summed, the ribbon polarity picks the side); true: crossover as in Delta AB
+    double matchDb = 0;          // ribbon gain before M/S or crossover
+    bool ribbonInLows = false;   // crossover mode
+    bool ribbonInvert = false;   // M/S mode: S polarity, aims the virtual mic to the other side
+    double cardioDb = 0, ribbonDb = 0;   // level of each branch after M/S or crossover
     double delayMs = 0;          // -10 .. +100 ms
     double faderDb = 0;
 };
@@ -188,6 +230,9 @@ struct EngineParams {
     double outputDb = 0;
     std::array<AerParams, 3> aer;          // Delta AER channels: L, C, R
     double aerOutDb = 0;
+    std::array<SpotParams, kMaxSpots> spot;
+    int numSpots = 8;
+    double spotsOutDb = 0;
 };
 
 // Pan: per bus gains (full band and low band), constant phase rotation, pure delay.
@@ -219,6 +264,15 @@ public:
         }
         first = false;
     }
+    // The phase cue needs the Hilbert signal, the HF cue needs the low band; both cost a convolution each.
+    bool needsHilbert() const { for (auto& s : si) if (s.current() != 0.0 || s.target() != 0.0) return true; return false; }
+    bool needsLowBand() const
+    {
+        for (int b = 0; b < 3; ++b)
+            if (g[(size_t) b].current() != gl[(size_t) b].current() || g[(size_t) b].target() != gl[(size_t) b].target()) return true;
+        return false;
+    }
+
     // full / hFull: signal and its Hilbert; low / hLow: band below 700 Hz and its Hilbert.
     void process (const double* full, const double* hFull, const double* low, const double* hLow, double* const* dst, int n)
     {
@@ -257,10 +311,12 @@ public:
             for (auto& b : *v) b.assign ((size_t) maxN, 0.0);
         for (auto* v : { &mono, &hx, &lowBand, &lowBandH })
             for (auto& b : *v) b.assign ((size_t) maxN, 0.0);
+        spotHi.assign ((size_t) maxN, 0.0);
         for (auto& b : bus) b.assign ((size_t) maxN, 0.0);
         baseDelay = (int) std::ceil (kMaxDelayMs * 1e-3 * fs) + FractionalDelay::kHalf;
         for (auto& d : delay) d.prepare (2 * baseDelay + 4);
         for (auto& d : aerDelay) d.prepare (baseDelay + (int) std::ceil (kMaxAerDelayMs * 1e-3 * fs) + 4);
+        for (auto& d : spotDelay) d.prepare (baseDelay + (int) std::ceil (kMaxAerDelayMs * 1e-3 * fs) + 4);
         const int maxPan = FractionalDelay::kHalf + (int) std::ceil (kMaxPanDelayMs * 1e-3 * fs) + 4;
         for (auto& pc : pan) pc.prepare (fs, maxPan);
         for (auto& s : smooth) s.prepare (fs);
@@ -275,22 +331,24 @@ public:
     // Total plugin latency for a given crossover set.
     int totalLatency (const CrossoverSet& set) const { return set.latency + baseDelay + FractionalDelay::kHalf; }
 
-    // in: 6 AB channels (mic1 X,Y  mic2 X,Y  mic3 X,Y) then 3 AER channels (L, C, R).
-    // out: main stereo; aerOut: separate AER stereo, or nullptr to mix the AER into the main output.
+    // in (kNumIn): 6 AB channels (mic1 X,Y  mic2 X,Y  mic3 X,Y), 3 AER channels (L, C, R), then per spot cardio, ribbon.
+    // out: main stereo; aerOut / spotsOut: separate stereo outputs, or nullptr to mix into the main output.
     // eq: the 3 linear-phase AER EQ filters (used when set.cfg.aerEqLinear; entries may be nullptr).
     void process (CrossoverSet& set, AerEqFilter* const* eq, const EngineParams& p, const double* const* in,
-                  double* const* out, double* const* aerOut, int n)
+                  double* const* out, double* const* aerOut, double* const* spotsOut, int n)
     {
         int done = 0;
         while (done < n)
         {
             const int k = std::min (maxN, n - done);
-            const double* inPtr[9];
-            for (int c = 0; c < 9; ++c) inPtr[c] = in[c] + done;
+            const double* inPtr[kNumIn];
+            for (int c = 0; c < kNumIn; ++c) inPtr[c] = in[c] + done;
             double* outPtr[2] = { out[0] + done, out[1] + done };
             double* aerPtr[2] = { nullptr, nullptr };
+            double* spPtr[2] = { nullptr, nullptr };
             if (aerOut != nullptr) { aerPtr[0] = aerOut[0] + done; aerPtr[1] = aerOut[1] + done; }
-            processChunk (set, eq, p, inPtr, outPtr, aerOut != nullptr ? aerPtr : nullptr, k);
+            if (spotsOut != nullptr) { spPtr[0] = spotsOut[0] + done; spPtr[1] = spotsOut[1] + done; }
+            processChunk (set, eq, p, inPtr, outPtr, aerOut != nullptr ? aerPtr : nullptr, spotsOut != nullptr ? spPtr : nullptr, k);
             done += k;
         }
     }
@@ -299,10 +357,9 @@ public:
     void process (CrossoverSet& set, const EngineParams& p, const double* const* in, double* const* out, int n)
     {
         if (silence.size() < (size_t) n) silence.assign ((size_t) n, 0.0);
-        const double* in9[9];
-        for (int c = 0; c < 6; ++c) in9[c] = in[c];
-        for (int c = 6; c < 9; ++c) in9[c] = silence.data();
-        process (set, nullptr, p, in9, out, nullptr, n);
+        const double* all[kNumIn];
+        for (int c = 0; c < kNumIn; ++c) all[c] = c < 6 ? in[c] : silence.data();
+        process (set, nullptr, p, all, out, nullptr, nullptr, n);
     }
 
     // Level analyser results (dB to add to Y so it matches X).
@@ -321,10 +378,13 @@ private:
     static constexpr int kFader = 6;       // AB bus faders: 3
     static constexpr int kCSend = 9;       // centre send: 1
     static constexpr int kAerFader = 10;   // AER channel faders: 3
-    static constexpr int kNumSmoothers = 13;
+    static constexpr int kSpotG = 13;      // spot cardio / ribbon levels: 2 per spot
+    static constexpr int kSpotFader = kSpotG + 2 * kMaxSpots;
+    static constexpr int kMicLevel = kSpotFader + kMaxSpots;   // AB mic output levels: 3
+    static constexpr int kNumSmoothers = kMicLevel + 3;
 
     void processChunk (CrossoverSet& set, AerEqFilter* const* eq, const EngineParams& p, const double* const* in,
-                       double* const* out, double* const* aerOut, int n)
+                       double* const* out, double* const* aerOut, double* const* spotsOut, int n)
     {
         // smoothed targets
         auto setT = [&] (int i, double v) { if (firstBlock) sm (i).setImmediate (v); else sm (i).setTarget (v); };
@@ -333,6 +393,7 @@ private:
             const auto& mp = p.mic[(size_t) m];
             setT (kFB + m * 2, dbToGain (mp.focusDb));
             setT (kFB + m * 2 + 1, dbToGain (mp.bloomDb));
+            setT (kMicLevel + m, dbToGain (mp.levelDb));
             pan[(size_t) m].setTargets (panTargets (mp, p.panLawDb, p.panDelayMaxMs));
             delay[(size_t) m].setDelay (baseDelay + std::clamp (p.delayMs[(size_t) m], -kMaxDelayMs, kMaxDelayMs) * 1e-3 * fs);
 
@@ -341,6 +402,16 @@ private:
             pan[(size_t) (3 + m)].setTargets (panTargets (ap, p.panLawDb, p.panDelayMaxMs));
             aerDelay[(size_t) m].setDelay (baseDelay + std::clamp (ap.delayMs, -kMaxDelayMs, kMaxAerDelayMs) * 1e-3 * fs);
         }
+        const int numSpots = std::clamp (p.numSpots, 0, kMaxSpots);
+        for (int k = 0; k < numSpots; ++k)
+        {
+            const auto& sp = p.spot[(size_t) k];
+            setT (kSpotG + 2 * k, dbToGain (sp.cardioDb));
+            setT (kSpotG + 2 * k + 1, dbToGain (sp.ribbonDb) * (! sp.crossover && sp.ribbonInvert ? -1.0 : 1.0));
+            setT (kSpotFader + k, dbToGain (sp.faderDb));
+            pan[(size_t) (6 + k)].setTargets (panTargets (sp, p.panLawDb, p.panDelayMaxMs));
+            spotDelay[(size_t) k].setDelay (baseDelay + std::clamp (sp.delayMs, -kMaxDelayMs, kMaxAerDelayMs) * 1e-3 * fs);
+        }
         for (int b = 0; b < 3; ++b) setT (kFader + b, dbToGain (p.faderDb[(size_t) b]));
         setT (kCSend, dbToGain (p.centreSendDb));
         firstBlock = false;
@@ -348,6 +419,7 @@ private:
         for (auto& b : bus) std::fill (b.begin(), b.begin() + n, 0.0);
         double* abBus[3]  = { bus[0].data(), bus[1].data(), bus[2].data() };
         double* aerBus[3] = { bus[3].data(), bus[4].data(), bus[5].data() };
+        double* spotBus[3] = { bus[6].data(), bus[7].data(), bus[8].data() };
 
         // ---- Delta AB
         for (int m = 0; m < 3; ++m)
@@ -372,7 +444,8 @@ private:
             set.mic[(size_t) m].process (low, high, mo, n);
             auto& pad = set.abPad[(size_t) m];
             auto& d = delay[(size_t) m];
-            for (int i = 0; i < n; ++i) mo[i] = d.process (pad.process (mo[i]));
+            auto& lv = sm (kMicLevel + m);
+            for (int i = 0; i < n; ++i) mo[i] = d.process (pad.process (mo[i])) * lv.next();
             panStage (set, m, abBus, n);
         }
 
@@ -414,6 +487,39 @@ private:
             panStage (set, 3 + c, aerBus, n);
         }
 
+        // ---- EN-MS spots (spots beyond numSpots are off and cost nothing)
+        for (int k = 0; k < numSpots; ++k)
+        {
+            const auto& sp = p.spot[(size_t) k];
+            const double* cIn = in[9 + 2 * k];
+            const double* rIn = in[10 + 2 * k];
+            const double match = dbToGain (sp.matchDb);
+            double* mo = mono[(size_t) (6 + k)].data();
+            auto& gC = sm (kSpotG + 2 * k); auto& gR = sm (kSpotG + 2 * k + 1);
+            if (sp.crossover)
+            {
+                double* low = lo[0].data();     // AB scratch, free here
+                double* high = spotHi.data();
+                for (int i = 0; i < n; ++i)
+                {
+                    const double c = cIn[i] * gC.next(), r = rIn[i] * match * gR.next();
+                    low[i]  = sp.ribbonInLows ? r : c;
+                    high[i] = sp.ribbonInLows ? c : r;
+                }
+                set.spot[(size_t) k].process (low, high, mo, n);
+            }
+            else
+            {
+                for (int i = 0; i < n; ++i) mo[i] = cIn[i] * gC.next() + rIn[i] * match * gR.next();
+                set.spot[(size_t) k].bypass (mo, n);
+            }
+            auto& pad = set.spotPad[(size_t) k];
+            auto& d = spotDelay[(size_t) k];
+            auto& f = sm (kSpotFader + k);
+            for (int i = 0; i < n; ++i) mo[i] = d.process (pad.process (mo[i])) * f.next();
+            panStage (set, 6 + k, spotBus, n);
+        }
+
         // ---- AB bus faders + low cut
         for (int b = 0; b < 3; ++b)
         {
@@ -436,7 +542,7 @@ private:
         }
 
         // ---- stereo sums
-        const double outG = dbToGain (p.outputDb), aerG = dbToGain (p.aerOutDb);
+        const double outG = dbToGain (p.outputDb), aerG = dbToGain (p.aerOutDb), spG = dbToGain (p.spotsOutDb);
         auto& cs = sm (kCSend);
         for (int i = 0; i < n; ++i)
         {
@@ -446,6 +552,10 @@ private:
             double L = bus[0][(size_t) i] + c, R = bus[2][(size_t) i] + c;
             if (aerOut != nullptr) { aerOut[0][i] = aL; aerOut[1][i] = aR; }
             else { L += aL; R += aR; }
+            const double cs2 = bus[7][(size_t) i] * k;
+            const double sL = (bus[6][(size_t) i] + cs2) * spG, sR = (bus[8][(size_t) i] + cs2) * spG;
+            if (spotsOut != nullptr) { spotsOut[0][i] = sL; spotsOut[1][i] = sR; }
+            else { L += sL; R += sR; }
             out[0][i] = L * outG;
             out[1][i] = R * outG;
         }
@@ -458,9 +568,17 @@ private:
         double* h = hx[(size_t) k].data();
         double* lb = lowBand[(size_t) k].data();
         double* hlb = lowBandH[(size_t) k].data();
-        set.hilbert[(size_t) k].process (mo, h, n);
-        set.splitLow[(size_t) k].process (mo, lb, n);
-        set.splitLowH[(size_t) k].process (mo, hlb, n);
+        // Convolutions whose result is multiplied by zero are skipped (and cleared, so they restart clean).
+        auto run = [&] (FifoConvolver& c, bool need, bool& was, double* dst)
+        {
+            if (need) { if (! was) c.reset(); c.process (mo, dst, n); }
+            else c.skip (dst, n);
+            was = need;
+        };
+        const bool needH = pan[(size_t) k].needsHilbert(), needL = pan[(size_t) k].needsLowBand();
+        run (set.hilbert[(size_t) k], needH, usedH[(size_t) k], h);
+        run (set.splitLow[(size_t) k], needL, usedL[(size_t) k], lb);
+        run (set.splitLowH[(size_t) k], needL && needH, usedLH[(size_t) k], hlb);
         auto& hd = set.hilbertDirect[(size_t) k];
         for (int i = 0; i < n; ++i) mo[i] = hd.process (mo[i]);
         pan[(size_t) k].process (mo, h, lb, hlb, dst, n);
@@ -528,9 +646,13 @@ private:
     int maxN = 512, baseDelay = 0;
     bool firstBlock = true;
     std::array<std::vector<double>, 3> lo, hi;
-    std::array<std::vector<double>, 6> mono, hx, lowBand, lowBandH, bus;
+    std::array<std::vector<double>, kPanCh> mono, hx, lowBand, lowBandH;
+    std::array<std::vector<double>, 9> bus;   // AB L C R, AER L C R, spots L C R
+    std::vector<double> spotHi;
     std::array<FractionalDelay, 3> delay, aerDelay;
-    std::array<PanChannel, 6> pan;
+    std::array<FractionalDelay, kMaxSpots> spotDelay;
+    std::array<PanChannel, kPanCh> pan;
+    std::array<bool, kPanCh> usedH {}, usedL {}, usedLH {};
     std::array<Smoother, kNumSmoothers> smooth;
     std::array<Biquad, 3> lowCut;
     std::array<double, 3> lastLowCut { -1, -1, -1 };

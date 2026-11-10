@@ -7,8 +7,13 @@
 
 namespace dab {
 
-// Convolution block grows with the sample rate (512 at 44.1/48 kHz), so the partition count stays the same.
-inline int convBlock (double fs) { return 512 * std::max (1, 1 << ceilLog2 ((int) std::floor (fs / 48000.0 + 1e-9))); }
+// Convolution block for a filter of N taps: 512 at 44.1/48 kHz (more at higher rates), and at most 16 partitions
+// for long filters (export), which keeps the cost low; the extra latency only matters when listening.
+inline int convBlock (double fs, int N)
+{
+    const int base = 512 * std::max (1, 1 << ceilLog2 ((int) std::floor (fs / 48000.0 + 1e-9)));
+    return std::max (base, 1 << std::max (0, ceilLog2 (N + 1) - 4));
+}
 
 class PartitionedConvolver {
 public:
@@ -36,6 +41,13 @@ public:
     }
 
     int blockSize() const { return B; }
+
+    void reset()
+    {
+        for (auto& x : X) std::fill (x.begin(), x.end(), cd (0.0));
+        std::fill (inBuf.begin(), inBuf.end(), 0.0);
+        fdlPos = 0;
+    }
 
     // Processes exactly B samples.
     void processBlock (const double* in, double* out)
@@ -78,6 +90,21 @@ public:
     }
 
     int latency() const { return B; }
+
+    void reset()
+    {
+        conv.reset();
+        std::fill (inF.begin(), inF.end(), 0.0);
+        std::fill (outF.begin(), outF.end(), 0.0);
+        pos = 0;
+    }
+
+    // Keeps the block clock running without convolving (input taken as silence, output silent).
+    void skip (double* out, int n)
+    {
+        std::fill (out, out + n, 0.0);
+        pos = (pos + n) % B;
+    }
 
     void process (const double* in, double* out, int n)
     {

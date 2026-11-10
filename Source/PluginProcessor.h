@@ -37,14 +37,18 @@ public:
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
+    static BusesProperties withSpots (BusesProperties);
     void timerCallback() override;
     dab::CrossoverConfig currentConfig() const;
     void readParams (dab::EngineParams&) const;
     dab::AerEqParams aerEq (int a) const;
     dab::AerEqFilter* makeEq (int a) const;
-    void processDouble (const double* const* in, int numIn, const double* const* aerIn, int numAerIn,
-                        double* const* out, double* const* aerOut, int n);
-    struct Io { int numIn = 0, aerInStart = 0, numAerIn = 0, aerOutStart = 2; bool aerOutOn = false; };
+    void processDouble (const double* const* in, int numMain, double* const* out,
+                        double* const* aerOut, double* const* spotsOut, int n);
+    template <typename T> void processAny (juce::AudioBuffer<T>&);
+    struct Io { int numMain = 0, aerStart = 0, numAer = 0, aerOutStart = 2, spotOutStart = 2;
+                std::array<int, dab::kMaxSpots> spotStart {}, spotIn {};
+                bool aerOutOn = false, spotOutOn = false; };
     Io io (int bufferChannels) const;
 
     float pv (const juce::String& id) const { return apvts.getRawParameterValue (id)->load(); }
@@ -67,8 +71,8 @@ private:
     bool linkPrimed = false;
 
     std::array<bool, 3> wasAnalysing { false, false, false };
-    // scratch: 0..11 main inputs, 12..14 AER inputs, 15 silence, 16..19 outputs (float path)
-    static constexpr int kSilence = 15, kOut = 16, kScratchCh = 20;
+    // scratch: main inputs, AER inputs, spot inputs, then 6 outputs (main, AER, spots)
+    static constexpr int kInMain = 0, kInAer = 12, kInSpots = 15, kOut = kInSpots + 2 * dab::kMaxSpots, kScratchCh = kOut + 6;
     juce::AudioBuffer<double> scratch;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DeltaABProcessor)
