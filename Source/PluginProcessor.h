@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "dsp/Engine.h"
+#include "dsp/Meter.h"
 
 class DeltaABProcessor : public juce::AudioProcessor, private juce::Timer
 {
@@ -38,6 +39,9 @@ public:
     // Gain-match meters (after the input gains): mic m X = 2m, Y = 2m+1; spot k cardio = 6+2k, ribbon = 7+2k.
     float takeMeterPeak (int ch) { return engine.meterPeak[(size_t) ch].exchange (0.0f); }
     float meterRmsDb (int ch) const { return engine.meterRmsDb[(size_t) ch].load(); }
+    // Master meters: the sum of every flow (what the Pyramix bus will add up), for scope, peak, VU, true peak.
+    dab::MasterMeter master;
+    double sampleRate() const { return sr; }
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();

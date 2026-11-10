@@ -258,6 +258,7 @@ dab::CrossoverConfig DeltaABProcessor::currentConfig() const
 void DeltaABProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     sr = sampleRate;
+    master.prepare (sampleRate);
     engine.prepare (sampleRate, juce::jmax (512, samplesPerBlock));
     scratch.setSize (kScratchCh, juce::jmax (512, samplesPerBlock));
 
@@ -572,6 +573,19 @@ void DeltaABProcessor::processAny (juce::AudioBuffer<T>& buffer)
     flowPtrs = flows;
     processDouble (in, r.numMain, o, r.aerOutOn ? o + 2 : nullptr, nullptr, n);
     flowPtrs = nullptr;
+    {   // master meter: main mix + AER when the AER has its own output
+        double ml[256], mr[256];
+        for (int s0 = 0; s0 < n; s0 += 256)
+        {
+            const int m = juce::jmin (256, n - s0);
+            for (int i = 0; i < m; ++i)
+            {
+                ml[i] = o[0][s0 + i] + (r.aerOutOn ? o[2][s0 + i] : 0.0);
+                mr[i] = o[1][s0 + i] + (r.aerOutOn ? o[3][s0 + i] : 0.0);
+            }
+            master.process (ml, mr, m);
+        }
+    }
 
     buffer.clear();
     auto give = [&] (int slot, int dst) { const double* s = scratch.getReadPointer (slot); T* d = buffer.getWritePointer (dst); for (int i = 0; i < n; ++i) d[i] = (T) s[i]; };

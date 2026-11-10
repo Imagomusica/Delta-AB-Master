@@ -40,6 +40,7 @@ int main (int argc, char** argv)
     if (auto* c = ed->findChildWithID ("console")) (void) c;
     std::function<void (juce::Component&)> tickAll = [&] (juce::Component& c) {
         if (auto* s = dynamic_cast<ui::Strip*> (&c)) s->tick();
+        if (auto* m = dynamic_cast<ui::MasterPanel*> (&c)) { m->tick(); m->tick(); }
         for (auto* ch : c.getChildren()) tickAll (*ch);
     };
     tickAll (*ed);

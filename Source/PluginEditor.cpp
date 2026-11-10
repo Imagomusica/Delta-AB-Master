@@ -418,7 +418,7 @@ void MatchMeter::tick()
     {
         const float pk = proc.takeMeterPeak (ch[i]);
         const float db = pk > 1e-6f ? 20.0f * std::log10 (pk) : -100.0f;
-        peakDb[i] = juce::jmax (db, peakDb[i] - 1.5f);   // falls about 20 dB/s at 15 Hz
+        peakDb[i] = juce::jmax (db, peakDb[i] - 0.75f);   // falls about 20 dB/s at 30 Hz
         rmsDb[i] = proc.meterRmsDb (ch[i]);
     }
     repaint();
@@ -464,6 +464,218 @@ void InsertSlot::paint (juce::Graphics& g)
     g.setColour (kGrey);
     g.setFont (monoFont (9.0f));
     g.drawFittedText (upper (text), getLocalBounds().reduced (2), juce::Justification::centred, 1, 0.6f);
+}
+
+// ------------------------------------------------------------------ master section
+static float toDb (double pow) { return pow > 1e-30 ? (float) (10.0 * std::log10 (pow)) : -300.0f; }
+static float ampDb (float a) { return a > 1e-15f ? 20.0f * std::log10 (a) : -300.0f; }
+
+void MasterPanel::tick()
+{
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    const float dt = lastMs > 0 ? (float) juce::jlimit (0.005, 0.5, (now - lastMs) / 1000.0) : 1.0f / 30.0f;
+    lastMs = now;
+    const auto st = proc.master.take();
+    for (int c = 0; c < 2; ++c)
+    {
+        // Nagra peak modulometer: instant rise, falls 20 dB in 1.7 s
+        ppm[c] = juce::jmax (ampDb (st.peak[c]), ppm[c] - 20.0f * dt / 1.7f);
+        // VU: 300 ms integration
+        const float aV = std::exp (-dt / 0.3f), aR = std::exp (-dt / 3.0f);
+        if (st.n > 0)
+        {
+            vuPow[c] = aV * vuPow[c] + (1 - aV) * (float) st.meanSq[c];
+            rmsPow[c] = aR * rmsPow[c] + (1 - aR) * (float) st.meanSq[c];
+        }
+        peakHold[c] = juce::jmax (peakHold[c], ampDb (st.peak[c]));
+        tpHold[c] = juce::jmax (tpHold[c], ampDb (st.truePeak[c]));
+    }
+    if (st.n > 0)
+    {
+        const float aS = std::exp (-dt / 0.4f);
+        stPow = aS * stPow + (1 - aS) * (float) juce::jmax (st.meanSq[0], st.meanSq[1]);
+        corr = 0.8f * corr + 0.2f * (float) st.corr;
+        hist[(size_t) histPos] = toDb (stPow);
+        histPos = (histPos + 1) % (int) hist.size();
+        histN = juce::jmin (histN + 1, (int) hist.size());
+        // low level = 10th percentile, high = 95th, of the short-term level over the last minute (silence below -70 dBFS ignored)
+        std::vector<float> v;
+        v.reserve ((size_t) histN);
+        for (int i = 0; i < histN; ++i) if (hist[(size_t) i] > -70.0f) v.push_back (hist[(size_t) i]);
+        if (v.size() > 10)
+        {
+            std::sort (v.begin(), v.end());
+            lowDb = v[(size_t) (0.10 * (double) (v.size() - 1))];
+            highDb = v[(size_t) (0.95 * (double) (v.size() - 1))];
+        }
+    }
+    // scope points
+    float l[1024], r[1024];
+    int n;
+    float mx = 0;
+    while ((n = proc.master.popScope (l, r, 1024)) > 0)
+        for (int i = 0; i < n; ++i)
+        {
+            px[(size_t) ptsPos] = l[i]; py[(size_t) ptsPos] = r[i];
+            ptsPos = (ptsPos + 1) % kPts;
+        }
+    for (int i = 0; i < kPts; ++i) mx = juce::jmax (mx, std::abs (px[(size_t) i]), std::abs (py[(size_t) i]));
+    // auto gain: the trace fills the screen, slowly
+    const float want = mx > 1e-5f ? juce::jlimit (1.0f, 1000.0f, 0.8f / mx) : scopeGain;
+    scopeGain = want < scopeGain ? want : scopeGain + (want - scopeGain) * 0.05f;
+    repaint();
+}
+
+void MasterPanel::mouseDown (const juce::MouseEvent&)
+{
+    for (int c = 0; c < 2; ++c) { peakHold[c] = -100; tpHold[c] = -100; }
+    std::fill (hist.begin(), hist.end(), -300.0f); histN = 0; lowDb = highDb = -300;
+}
+
+// Nagra IS style modulometer: round window in a chrome ring, white dial, scale bunched at the bottom,
+// open at the top, thick band above 0, two needles (G black, D grey), plate over the pivot.
+static void drawNagra (juce::Graphics& g, juce::Rectangle<float> b, const juce::String& title, float topDb,
+                       std::initializer_list<std::pair<float, juce::String>> marks, float zeroDb, const float needleDb[2])
+{
+    const float R = juce::jmin (b.getWidth(), b.getHeight()) / 2 - 2;
+    const auto c = b.getCentre();
+    g.setColour (juce::Colour (0xff9a9a9a)); g.fillEllipse (c.x - R, c.y - R, 2 * R, 2 * R);
+    g.setColour (juce::Colour (0xff5a5a5a)); g.fillEllipse (c.x - R * 0.93f, c.y - R * 0.93f, R * 1.86f, R * 1.86f);
+    const float Rf = R * 0.9f;
+    g.setColour (juce::Colour (0xfff4f4f0)); g.fillEllipse (c.x - Rf, c.y - Rf, 2 * Rf, 2 * Rf);
+    const juce::Point<float> pv (c.x, c.y + Rf * 0.55f);
+    auto ang = [&] (float db) {
+        if (db <= -200) return -52.0f;
+        const float t = juce::jlimit (0.0f, 1.0f, std::pow (10.0f, (db - topDb) / 20.0f));
+        return -52.0f + 104.0f * std::pow (t, 0.62f);
+    };
+    auto pt = [&] (float aDeg, float r) { const float a = juce::degreesToRadians (aDeg); return juce::Point<float> (pv.x + r * std::sin (a), pv.y - r * std::cos (a)); };
+    const float Rs = Rf * 1.02f;
+    juce::Path arc; arc.addCentredArc (pv.x, pv.y, Rs, Rs, 0, juce::degreesToRadians (-52.0f), juce::degreesToRadians (52.0f), true);
+    g.setColour (kBlack); g.strokePath (arc, juce::PathStrokeType (1.2f));
+    juce::Path over; over.addCentredArc (pv.x, pv.y, Rs + 2.5f, Rs + 2.5f, 0, juce::degreesToRadians (ang (zeroDb)), juce::degreesToRadians (52.0f), true);
+    g.strokePath (over, juce::PathStrokeType (4.0f));
+    for (auto& [db, txt] : marks)
+    {
+        const float a = ang (db);
+        g.drawLine (juce::Line<float> (pt (a, Rs), pt (a, Rs + 7)), 1.4f);
+        g.setFont (monoFont (juce::jmax (7.0f, R * 0.085f)));
+        const auto q = pt (a, Rs + 15);
+        g.drawText (txt, juce::Rectangle<float> (q.x - 14, q.y - 5, 28, 10), juce::Justification::centred);
+    }
+    g.setFont (monoFont (juce::jmax (7.0f, R * 0.08f)));
+    g.drawText (title, juce::Rectangle<float> (c.x - R, pv.y - Rf * 0.62f, 2 * R, 12), juce::Justification::centred);
+    // needles: D (grey) under G (black)
+    const juce::Colour nc[2] = { kBlack, juce::Colour (0xff808080) };
+    for (int k = 1; k >= 0; --k)
+        g.setColour (nc[k]), g.drawLine (juce::Line<float> (pv, pt (ang (needleDb[k]), Rs + 6)), k == 0 ? 1.6f : 1.4f);
+    // plate over the pivot (chord of the window)
+    const float chY = pv.y - 6, half = std::sqrt (juce::jmax (0.0f, Rf * Rf - (chY - c.y) * (chY - c.y)));
+    {
+        juce::Graphics::ScopedSaveState ss (g);
+        juce::Path face; face.addEllipse (c.x - Rf, c.y - Rf, 2 * Rf, 2 * Rf);
+        g.reduceClipRegion (face);
+        g.setColour (juce::Colour (0xffb5b5b5)); g.fillRect (c.x - Rf, chY, 2 * Rf, Rf * 2);
+        g.setColour (juce::Colour (0xff333333)); g.drawLine (c.x - half, chY, c.x + half, chY, 1.0f);
+    }
+    juce::ignoreUnused (half);
+    g.setFont (monoFont (8.0f));
+    g.setColour (kBlack); g.drawText ("G", juce::Rectangle<float> (c.x - 26, chY + 4, 20, 10), juce::Justification::centredRight);
+    g.setColour (juce::Colour (0xff606060)); g.drawText ("D", juce::Rectangle<float> (c.x + 6, chY + 4, 20, 10), juce::Justification::centredLeft);
+}
+
+void MasterPanel::paint (juce::Graphics& g)
+{
+    auto r = getLocalBounds().toFloat();
+    g.setColour (kWhite);
+    g.drawRect (r, 2.0f);
+    r.reduce (10, 8);
+    g.setFont (monoFont (20.0f));
+    g.drawText (u ("MASTER Σ"), r.removeFromTop (26), juce::Justification::centredLeft);
+    r.removeFromTop (4);
+
+    // ---- scope (vectorscope: M up, S across) + correlation
+    auto sc = r.removeFromTop (r.getWidth() * 0.62f);
+    g.setColour (juce::Colour (0xff0c0c0c)); g.fillRect (sc);
+    g.setColour (kDim);
+    g.drawRect (sc, 1.0f);
+    const auto c = sc.getCentre();
+    const float rad = juce::jmin (sc.getWidth(), sc.getHeight()) / 2 - 4;
+    g.drawLine (c.x, sc.getY(), c.x, sc.getBottom(), 1.0f);
+    g.drawLine (sc.getX(), c.y, sc.getRight(), c.y, 1.0f);
+    g.drawLine (c.x - rad * 0.7f, c.y - rad * 0.7f, c.x + rad * 0.7f, c.y + rad * 0.7f, 0.5f);
+    g.drawLine (c.x - rad * 0.7f, c.y + rad * 0.7f, c.x + rad * 0.7f, c.y - rad * 0.7f, 0.5f);
+    g.setFont (monoFont (9.0f)); g.setColour (kGrey);
+    g.drawText ("M", juce::Rectangle<float> (c.x + 3, sc.getY() + 2, 12, 10), juce::Justification::left);
+    g.drawText ("G", juce::Rectangle<float> (c.x - rad * 0.7f - 12, c.y - rad * 0.7f - 10, 10, 10), juce::Justification::centred);
+    g.drawText ("D", juce::Rectangle<float> (c.x + rad * 0.7f + 2, c.y - rad * 0.7f - 10, 10, 10), juce::Justification::centred);
+    g.drawText ("x" + juce::String (scopeGain, scopeGain < 10 ? 1 : 0), sc.reduced (4).toNearestInt(), juce::Justification::bottomRight);
+    g.setColour (kWhite.withAlpha (0.55f));
+    const float k = scopeGain * rad * 0.7071f;
+    for (int i = 0; i < kPts; ++i)
+    {
+        const float L = px[(size_t) i], Rr = py[(size_t) i];
+        const float x = c.x + (Rr - L) * k, y = c.y - (L + Rr) * k;   // S across (D to the right), M up
+        if (sc.contains (x, y)) g.fillRect (x, y, 1.2f, 1.2f);
+    }
+    r.removeFromTop (4);
+    auto cb = r.removeFromTop (12);
+    g.setColour (kWhite); g.setFont (monoFont (9.0f));
+    g.drawText ("-1", cb.removeFromLeft (16), juce::Justification::centredLeft);
+    g.drawText ("+1", cb.removeFromRight (16), juce::Justification::centredRight);
+    g.setColour (kDim); g.fillRect (cb.reduced (0, 3));
+    g.setColour (kWhite);
+    g.fillRect (cb.getCentreX() - 0.5f, cb.getY(), 1.0f, cb.getHeight());
+    const float xc = cb.getCentreX() + corr * cb.getWidth() / 2;
+    g.fillRect (juce::jmin (xc, cb.getCentreX()), cb.getY() + 3, std::abs (xc - cb.getCentreX()), cb.getHeight() - 6);
+    r.removeFromTop (10);
+
+    // ---- Nagra modulometers: peak (dBFS) and VU (0 VU = -18 dBFS)
+    auto mr = r.removeFromTop (r.getWidth() / 2);
+    const float vuDb[2] = { toDb (vuPow[0]) + 18.0f, toDb (vuPow[1]) + 18.0f };
+    drawNagra (g, mr.removeFromLeft (mr.getWidth() / 2).reduced (3), "PEAK dBFS", 0.0f,
+               { { -300.0f, u ("-∞") }, { -30.0f, "-30" }, { -20.0f, "-20" }, { -12.0f, "-12" }, { -9.0f, "-9" }, { -6.0f, "-6" }, { -3.0f, "-3" }, { 0.0f, "0" } },
+               -9.0f, ppm);
+    drawNagra (g, mr.reduced (3), "VU", 3.0f,
+               { { -300.0f, u ("-∞") }, { -20.0f, "-20" }, { -10.0f, "-10" }, { -7.0f, "-7" }, { -5.0f, "-5" }, { -3.0f, "-3" }, { -1.0f, "-1" }, { 0.0f, "0" }, { 3.0f, "+3" } },
+               0.0f, vuDb);
+    r.removeFromTop (8);
+
+    // ---- dynamics
+    auto fmt = [] (float db) { return db < -150 ? juce::String (u ("-∞")) : juce::String (db, 1); };
+    struct RowT { const char* name; juce::String a, b; };
+    const RowT rows[] = {
+        { "RMS 3 s", fmt (toDb (rmsPow[0])), fmt (toDb (rmsPow[1])) },
+        { "PEAK", fmt (peakHold[0]), fmt (peakHold[1]) },
+        { "TRUE PEAK", fmt (tpHold[0]), fmt (tpHold[1]) },
+        { "LOW LEVEL", fmt (lowDb), "" },
+        { "DYN RANGE", lowDb > -150 && highDb > -150 ? juce::String (highDb - lowDb, 1) + " dB" : juce::String (u ("—")), "" },
+    };
+    g.setFont (monoFont (10.0f));
+    g.setColour (kGrey);
+    auto hdr = r.removeFromTop (14);
+    g.drawText ("dBFS", hdr.removeFromLeft (hdr.getWidth() * 0.46f), juce::Justification::centredLeft);
+    g.drawText ("G", hdr.removeFromLeft (hdr.getWidth() / 2), juce::Justification::centredRight);
+    g.drawText ("D", hdr, juce::Justification::centredRight);
+    for (auto& row : rows)
+    {
+        auto line = r.removeFromTop (19);
+        g.setColour (kDim); g.drawHorizontalLine ((int) line.getBottom(), line.getX(), line.getRight());
+        const bool hot = juce::String (row.name) == "TRUE PEAK" && juce::jmax (tpHold[0], tpHold[1]) > -1.0f;
+        if (hot) { g.setColour (kWhite); g.fillRect (line.reduced (0, 1)); }
+        g.setColour (hot ? kBlack : kWhite);
+        g.setFont (monoFont (11.0f));
+        g.drawText (row.name, line.removeFromLeft (line.getWidth() * 0.46f), juce::Justification::centredLeft);
+        g.setFont (monoFont (13.0f));
+        if (row.b.isEmpty()) g.drawText (row.a, line, juce::Justification::centredRight);
+        else
+        {
+            g.drawText (row.a, line.removeFromLeft (line.getWidth() / 2), juce::Justification::centredRight);
+            g.drawText (row.b, line, juce::Justification::centredRight);
+        }
+    }
+    g.setColour (kGrey); g.setFont (monoFont (8.5f));
+    g.drawText (u ("CLIC = RESET  ·  LOW / DYN : 1 MIN"), r.removeFromTop (16), juce::Justification::centredLeft);
 }
 
 // ------------------------------------------------------------------ strip
@@ -697,8 +909,10 @@ Console::Console (DeltaABProcessor& p)
       focus (p.apvts, "m_focus", "focus"),
       bloom (p.apvts, "m_bloom", "bloom"),
       aerPhase (p.apvts, "aer_eq_phase", "EQ min", "EQ lin"),
-      aerLink (p.apvts, "aer_link", u ("faders liés"))
+      aerLink (p.apvts, "aer_link", u ("faders liés")),
+      masterPanel (p)
 {
+    addAndMakeVisible (masterPanel);
     auto& s = p.apvts;
     for (juce::Component* c : { (juce::Component*) &phase, (juce::Component*) &quality, (juce::Component*) &slope,
                                 (juce::Component*) &focal, (juce::Component*) &panLaw, (juce::Component*) &panMax,
@@ -759,7 +973,7 @@ Console::Console (DeltaABProcessor& p)
     remove1.onClick = [this, count] { setSpotCount (count() - 1); };
 
     setSize (kW, kH);
-    startTimerHz (15);
+    startTimerHz (30);
 }
 
 Console::~Console()
@@ -797,6 +1011,7 @@ void Console::layoutSpots()
 void Console::timerCallback()
 {
     for (auto& st : ab) st->tick();
+    masterPanel.tick();
     for (int k = 0; k < juce::jmax (0, shownSpots); ++k) spot[k]->tick();
     if ((int) proc.apvts.getRawParameterValue ("spots_n")->load() != shownSpots) { layoutSpots(); repaint(); }
     if (detail != nullptr && detailAer >= 0)
@@ -994,7 +1209,10 @@ void Console::resized()
     auto groupW = [] (int strips, int w = kStripW) { return strips * w + (strips - 1) * kGap + 2 * kPad; };
     rAb = r.removeFromLeft (groupW (3, kAbW));   r.removeFromLeft (12);
     rAer = r.removeFromLeft (groupW (3));  r.removeFromLeft (12);
+    rMaster = r.removeFromRight (380);
+    r.removeFromRight (12);
     rSpots = r;
+    masterPanel.setBounds (rMaster);
 
     auto placeStrips = [] (juce::Rectangle<int> g, std::unique_ptr<Strip>* st, int n, int w = kStripW)
     {

@@ -98,6 +98,28 @@ struct MatchMeter : juce::Component
     float peakDb[2] { -100.0f, -100.0f }, rmsDb[2] { -300.0f, -300.0f };
 };
 
+// Master section (right side): scope, Nagra-style peak and VU modulometers, dynamic range readings.
+// Fed by the processor's master meter (sum of every flow). A click resets the holds.
+struct MasterPanel : juce::Component
+{
+    explicit MasterPanel (DeltaABProcessor& p) : proc (p) { hist.assign (1800, -300.0f); }
+    void tick();
+    void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+
+    DeltaABProcessor& proc;
+    double lastMs = 0;
+    float ppm[2] { -100, -100 }, vuPow[2] {}, rmsPow[2] {}, stPow = 0;
+    float peakHold[2] { -100, -100 }, tpHold[2] { -100, -100 };
+    float corr = 0, scopeGain = 4.0f;
+    std::vector<float> hist;   // short-term (400 ms) level, 60 s at 30 Hz, for low level and dynamic range
+    int histPos = 0, histN = 0;
+    float lowDb = -300, highDb = -300;
+    static constexpr int kPts = 2048;
+    std::array<float, kPts> px {}, py {};
+    int ptsPos = 0;
+};
+
 // Placeholder for an insert slot (VST or hardware), not active yet.
 struct InsertSlot : juce::Component
 {
@@ -191,12 +213,13 @@ private:
     juce::Component spotHolder;
     juce::TextButton add4 { "+4" }, add8 { "+8" }, remove1 { "-1" };
 
+    MasterPanel masterPanel;
     std::unique_ptr<Detail> detail;
     int shownSpots = -1;
     int detailAer = -1;
     dab::AerEqParams shownEq;
 
-    juce::Rectangle<int> rTop, rAb, rAer, rSpots, rConsole, rSign;
+    juce::Rectangle<int> rTop, rAb, rAer, rSpots, rMaster, rConsole, rSign;
 };
 
 } // namespace ui
