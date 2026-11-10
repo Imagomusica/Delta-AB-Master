@@ -189,7 +189,8 @@ Knob::Knob (APVTS& s, const juce::String& id, const juce::String& text, bool fad
         slider.onDragStart = [this] { dragStartValue = slider.getValue(); showMove(); move.setVisible (true); };
         slider.onValueChange = [this] { if (move.isVisible()) showMove(); };
         slider.onDragEnd = [this] {
-            juce::Timer::callAfterDelay (1200, [sp = juce::Component::SafePointer<Knob> (this)] { if (sp != nullptr) sp->move.setVisible (false); });
+            juce::Component::SafePointer<Knob> sp (this);
+            juce::Timer::callAfterDelay (1200, [sp] { if (sp != nullptr) sp->move.setVisible (false); });
         };
     }
     if (metres)
