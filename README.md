@@ -40,7 +40,7 @@ Puis les bus G, C, D : fader, low cut 6 dB/oct (20 à 200 Hz), envoi du centre d
 ## Modes
 
 - **Phase linéaire** : la somme des deux branches redonne exactement le signal, à la précision du 64 bits. « Écoute » utilise un filtre court (environ 100 ms de latence à 48 kHz, panpot compris), « Export » un filtre long (environ 0,9 s). Les deux tournent en temps réel.
-- **Phase minimale** : filtres Linkwitz-Riley (1er ordre en 6 dB/oct), latence de 10 ms seulement.
+- **Phase minimale** : filtres Linkwitz-Riley (1er ordre en 6 dB/oct), latence d’environ 45 ms (délai du centre et panpot de phase).
 
 La latence est annoncée au DAW, qui la compense. Les 10 ms fixes servent au délai négatif du micro central (G et D sont alors retardés à sa place).
 
