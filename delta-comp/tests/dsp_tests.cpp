@@ -95,7 +95,7 @@ int main()
         Engine e; e.prepare (fs, 2);
         Params p = neutral(); p.dnOn = p.upOn = p.llOn = p.pkOn = true; p.target = -14;
         p.thr1 = 0; p.ratio1 = 2; p.thr2 = 6; p.ratio2 = 4; p.upThr = -10; p.upRatio = 2; p.upRange = 100;
-        p.llThr = -30; p.llRatio = 2; p.llRange = 3; p.crest = 10; p.pkRatio = 4;
+        p.llThr = -30; p.llRatio = 2; p.llRange = 3; p.crest = 10; p.pkCrest = true; p.pkRatio = 4;
         e.setParams (p);
         check (std::abs (e.curveC1 (-10) + 2) < 1e-9, "C: 4 dB over threshold 1, 2:1 -> -2 dB", e.curveC1 (-10));
         const double tot = e.curveC1 (-4) + e.curveC2 (-4);   // 10 over thr1, 4 over thr2: -(10/2) - (1/2-1/4)*4 = -6
@@ -103,17 +103,18 @@ int main()
         check (std::abs (e.curveA (-30) - 100 * std::tanh (3.0 / 100)) < 1e-9, "A: 6 dB under upward threshold, 1:2 -> +3 dB", e.curveA (-30));
         check (e.curveA (-80) == 0.0, "A: silence (-80 LUFS) is not lifted", e.curveA (-80));
         check (std::abs (e.curveB (-14) + 3 * std::tanh (15.0 / 3)) < 1e-9, "B: low-level downward capped by its range (3 dB)", e.curveB (-14));
-        check (std::abs (e.peakThr() - (-4)) < 1e-9, "D: peak threshold = threshold 1 + crest = -4 dBFS", e.peakThr());
+        e.pkRmsDb = -14;
+        check (std::abs (e.peakThr() - (-4)) < 1e-9, "D: crest mode, threshold = running RMS -14 + crest 10 = -4 dBFS", e.peakThr());
         check (std::abs (e.curveD (0) + 3) < 1e-9, "D: peak 4 dB over, 4:1 -> -3 dB", e.curveD (0));
     }
     {   // transparency, latency
         Engine e; e.prepare (fs, 2); e.setParams (neutral());
-        std::vector<double> l (4096, 0.0), r (4096, 0.0); l[0] = 0.5; r[0] = -0.25;
+        std::vector<double> l (16384, 0.0), r (16384, 0.0); l[0] = 0.5; r[0] = -0.25;
         double* io[2] = { l.data(), r.data() };
-        e.process (io, 2, 4096);
+        e.process (io, 2, 16384);
         double err = 0;
-        for (int i = 0; i < 4096; ++i) if (i != e.latency()) err = std::max (err, std::abs (l[(size_t) i]) + std::abs (r[(size_t) i]));
-        check (e.latency() > 256 && e.latency() < 1024, "latency at 48 kHz: look-ahead + gain FIR, constant", e.latency());
+        for (int i = 0; i < 16384; ++i) if (i != e.latency()) err = std::max (err, std::abs (l[(size_t) i]) + std::abs (r[(size_t) i]));
+        check (e.latency() > 256 && e.latency() < 8192, "latency at 48 kHz: look-ahead + gain FIR, constant", e.latency());
         err = std::max ({ err, std::abs (l[(size_t) e.latency()] - 0.5), std::abs (r[(size_t) e.latency()] + 0.25) });
         check (err < 1e-12, "all stages off: transparent (< -240 dB error), delayed by latency()", err);
     }
@@ -123,10 +124,10 @@ int main()
         const double out = runSine (e, fs, -6, 1, 1000);
         char msg[96]; std::snprintf (msg, sizeof msg, "oversampling %dx: 1 kHz passes at unity (+-0.05 dB)", f);
         check (std::abs (out + 6) < 0.05, msg, out);
-        std::vector<double> l (2048, 0.0), r (2048, 0.0); l[0] = 1;
+        std::vector<double> l (16384, 0.0), r (16384, 0.0); l[0] = 1;
         double* io[2] = { l.data(), r.data() };
-        e.process (io, 2, 2048);
-        int pk = 0; for (int i = 0; i < 2048; ++i) if (std::abs (l[(size_t) i]) > std::abs (l[(size_t) pk])) pk = i;
+        e.process (io, 2, 16384);
+        int pk = 0; for (int i = 0; i < 16384; ++i) if (std::abs (l[(size_t) i]) > std::abs (l[(size_t) pk])) pk = i;
         std::snprintf (msg, sizeof msg, "oversampling %dx: impulse peak at latency()", f);
         check (pk == e.latency(), msg, pk);
     }

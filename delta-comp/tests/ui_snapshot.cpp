@@ -25,6 +25,7 @@ int main (int argc, char** argv)
         juce::MemoryBlock st; p->getStateInformation (st); proc.clearInsert(); p->setStateInformation (st.getData(), (int) st.getSize());
         std::printf ("state round trip: insert %s\n", proc.insertName().toRawUTF8());
     }
+    for (auto* id : { "llOn", "ambOn" }) proc.apvts.getParameter (id)->setValueNotifyingHost (1.0f);   // every zone visible
     juce::AudioBuffer<double> b (2, 400); juce::MidiBuffer midi; juce::Random rnd (3);
     double tail = 0; long n = 0;
     for (int col = 0; col < ui::Sand::kCols; ++col)

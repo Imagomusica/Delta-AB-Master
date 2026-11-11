@@ -25,6 +25,7 @@
 #include <cmath>
 #include <mutex>
 #include <vector>
+#include <complex>
 
 namespace dcomp
 {
@@ -330,10 +331,11 @@ struct Params
     // Ambiance (ambient retrieval), placed after stage 1 = A, 2 = B, 3 = C, 4 = D
     bool ambOn = false; double ambiance = 0.5;   // amount 0..1
     double ambThr = -20, ambRatio = 2, ambAtt = 20, ambRel = 400, ambPreMs = 20;
-    bool ambAuto = true; int ambStage = 3; double ambTr = 0.5;   // ambTr: transients removed from the lifted ambiance, 0..1
+    bool ambAuto = true; int ambStage = 3; double ambTr = 0.5; double kStereo = 0.3;   // kStereo: constant ambience extraction 0..1
+    bool trOn = true, msOn = true, tiltOn = true; double tilt = 0.0, tiltPivot = 1000.0;   // tilt dB/oct   // ambTr: transients removed from the lifted ambiance, 0..1
 
     // T transient shaper (Bittersweet spirit): -1 rounds the attacks off, +1 accentuates them
-    double transient = 0.0; double trDurMs = 30.0;
+    double transient = 0.0; double trDurMs = 30.0; int trTarget = 0;   // 0 stereo, 1 mid, 2 side
     // A upward low level
     bool upOn = true;  double upThr = -14, upRatio = 1.5, upRange = 4, upAtt = 50, upRel = 600;
     // B downward low level (gentle, capped by range)
@@ -344,7 +346,7 @@ struct Params
     double thr2 = 4, ratio2 = 4,   att2 = 10, rel2 = 150;
     double hyst = 0;           // dB: release only starts when the gain has more than this to recover (C and D)
     // D downward peak
-    bool pkOn = true;  double crest = 12, pkRatio = 4, pkAtt = 0.5, pkRel = 80;
+    bool pkOn = true;  double crest = 12, pkRatio = 4, pkAtt = 0.5, pkRel = 80, pkThr = -3; bool pkCrest = false;   // threshold dBFS, or seuil 1 + crest
     // M/S end section
     double widthDb = 0.0;          // side gain
     double centreDb = 0.0;         // centre (mid) level, 0.1 dB steps
@@ -365,6 +367,125 @@ struct OutputMeter   // accumulated by the audio thread, taken by the editor
     double peak[kMaxCh] {}, tp[kMaxCh] {}, sumSq[kMaxCh] {};
     double inPeak[kMaxCh] {}, inSumSq[kMaxCh] {};
     int n = 0;
+};
+
+
+// Linear tilt EQ: a straight line in dB per octave through a pivot (flat beyond 20 Hz / 20 kHz), linear phase.
+// Long FIR (8191 taps, Kaiser window) from the exact target magnitude, run as a uniformly partitioned
+// overlap-save convolution (blocks of 256). Constant latency whatever the setting; changes crossfade over a block.
+struct TiltEq
+{
+    static constexpr int B = 256, P = 32, N = B * P, F = 2 * B;   // N - 1 taps used, centre (N - 2) / 2
+    using cd = std::complex<double>;
+    static void fft (cd* a, int n, bool inv)
+    {
+        for (int i = 1, j = 0; i < n; ++i) { int bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) std::swap (a[i], a[j]); }
+        for (int len = 2; len <= n; len <<= 1)
+        {
+            const double ang = (inv ? 2.0 : -2.0) * kPi / len; const cd wl (std::cos (ang), std::sin (ang));
+            for (int i = 0; i < n; i += len) { cd w (1); for (int j = 0; j < len / 2; ++j) { const cd u = a[i + j], v = a[i + j + len / 2] * w; a[i + j] = u + v; a[i + j + len / 2] = u - v; w *= wl; } }
+        }
+        if (inv) for (int i = 0; i < n; ++i) a[i] /= (double) n;
+    }
+    static constexpr int latency() { return B + (N - 2) / 2; }
+    double fs = 48000, curSlope = 0, curPivot = 1000; bool designed = false;
+    int pos = 0, fdlIdx = 0; bool fading = false;
+    std::vector<cd> H[2];                 // P partitions x F bins, current [0] and next [1]
+    std::vector<cd> fdl[2];               // per channel: P input spectra
+    std::vector<double> inPrev[2], inCur[2], outCur[2], outNew[2];
+    std::vector<cd> work, big;
+    void prepare (double sampleRate)
+    {
+        fs = sampleRate;
+        for (int k = 0; k < 2; ++k)
+        {
+            H[k].assign ((size_t) (P * F), cd (0)); fdl[k].assign ((size_t) (P * F), cd (0));
+            inPrev[k].assign (B, 0.0); inCur[k].assign (B, 0.0); outCur[k].assign (B, 0.0); outNew[k].assign (B, 0.0);
+        }
+        work.assign (F, cd (0)); big.assign ((size_t) (4 * N), cd (0));
+        design (H[0], 0.0, 1000.0); curSlope = 0; curPivot = 1000; designed = true; reset();
+    }
+    void reset()
+    {
+        for (int k = 0; k < 2; ++k)
+        {
+            std::fill (fdl[k].begin(), fdl[k].end(), cd (0)); std::fill (inPrev[k].begin(), inPrev[k].end(), 0.0);
+            std::fill (inCur[k].begin(), inCur[k].end(), 0.0); std::fill (outCur[k].begin(), outCur[k].end(), 0.0);
+        }
+        pos = 0; fdlIdx = 0; fading = false;
+    }
+    static double targetDb (double f, double slope, double pivot)
+    {
+        return slope * std::log2 (std::clamp (f, 20.0, 20000.0) / pivot);
+    }
+    void design (std::vector<cd>& Hd, double slope, double pivot)
+    {
+        const int M = 4 * N;   // frequency sampling grid
+        for (int k = 0; k <= M / 2; ++k)
+        {
+            const double g = std::pow (10.0, targetDb (k * fs / M, slope, pivot) / 20.0);
+            big[(size_t) k] = g; if (k > 0 && k < M / 2) big[(size_t) (M - k)] = g;
+        }
+        fft (big.data(), M, true);   // real, even -> zero-phase impulse
+        const int half = (N - 2) / 2; const double beta = 10.0;
+        auto i0 = [] (double x) { double sum = 1, t = 1; for (int k = 1; k < 60; ++k) { t *= (x / (2 * k)) * (x / (2 * k)); sum += t; if (t < 1e-18 * sum) break; } return sum; };
+        std::vector<double>& h = inNewScratch; h.assign ((size_t) N, 0.0);
+        for (int n = -half; n <= half; ++n)
+        {
+            const double r = (double) n / (half + 1);
+            h[(size_t) (n + half)] = big[(size_t) ((n + M) % M)].real() * i0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0 (beta);
+        }
+        for (int part = 0; part < P; ++part)
+        {
+            for (int i = 0; i < F; ++i) work[(size_t) i] = i < B ? h[(size_t) (part * B + i)] : 0.0;
+            fft (work.data(), F, false);
+            std::copy (work.begin(), work.end(), Hd.begin() + part * F);
+        }
+    }
+    std::vector<double> inNewScratch;
+    void setTarget (double slope, double pivot) { wantSlope = slope; wantPivot = pivot; }
+    double wantSlope = 0, wantPivot = 1000;
+    void convolve (int c, const std::vector<cd>& Hd, std::vector<double>& out)
+    {
+        std::fill (work.begin(), work.end(), cd (0));
+        for (int part = 0; part < P; ++part)
+        {
+            const cd* X = &fdl[c][(size_t) (((fdlIdx - part + P) % P) * F)];
+            const cd* Hp = &Hd[(size_t) (part * F)];
+            for (int i = 0; i < F; ++i) work[(size_t) i] += X[i] * Hp[i];
+        }
+        fft (work.data(), F, true);
+        for (int i = 0; i < B; ++i) out[(size_t) i] = work[(size_t) (B + i)].real();
+    }
+    void block (int C)
+    {
+        fdlIdx = (fdlIdx + 1) % P;
+        for (int c = 0; c < C; ++c)
+        {
+            for (int i = 0; i < B; ++i) { work[(size_t) i] = inPrev[c][(size_t) i]; work[(size_t) (B + i)] = inCur[c][(size_t) i]; }
+            fft (work.data(), F, false);
+            std::copy (work.begin(), work.end(), fdl[c].begin() + fdlIdx * F);
+            inPrev[c] = inCur[c];
+        }
+        const bool change = std::abs (wantSlope - curSlope) > 1e-9 || std::abs (wantPivot - curPivot) > 1e-9;
+        if (change) { design (H[1], wantSlope, wantPivot); fading = true; }
+        for (int c = 0; c < C; ++c)
+        {
+            convolve (c, H[0], outCur[c]);
+            if (fading)
+            {
+                convolve (c, H[1], outNew[c]);
+                for (int i = 0; i < B; ++i) { const double r = (i + 0.5) / B; outCur[c][(size_t) i] = (1 - r) * outCur[c][(size_t) i] + r * outNew[c][(size_t) i]; }
+            }
+        }
+        if (fading) { std::swap (H[0], H[1]); curSlope = wantSlope; curPivot = wantPivot; fading = false; }
+    }
+    // one sample per channel in, one out (latency() samples later)
+    void process (double* v, int C)
+    {
+        for (int c = 0; c < C; ++c) { inCur[c][(size_t) pos] = v[c]; v[c] = outCur[c][(size_t) pos]; }
+        if (++pos == B) { pos = 0; block (C); }
+    }
 };
 
 class Engine
@@ -392,14 +513,15 @@ public:
             nMax = std::max (nMax, gfirOs[(size_t) k].N); hoMax = std::max (hoMax, 2 * gfirOs[(size_t) k].half);
         }
         limTail = std::max (TruePeak::kDelay + 2 * hf, tailOs);
-        latencySamples = hf + lookMax + limTail;
+        latencySamples = hf + lookMax + limTail + TiltEq::latency();
+        tiltEq.prepare (fs);
         for (int c = 0; c < kMaxCh; ++c)
         {
             for (auto& k : kw[(size_t) c]) k.prepare (fs);
             wetKw[(size_t) c].prepare (fs); outKw[(size_t) c].prepare (fs); inKw[(size_t) c].prepare (fs);
             limDelay[(size_t) c].reserve ((lookMax + 1) * Oversampler::kMaxF + 2 * hf + hoMax + 16);
             xDelay[(size_t) c].reserve (hf + 1); xDelay[(size_t) c].setLength (hf);
-            firMain[(size_t) c].prepare (gfir.N, 1.0); firAmbC[(size_t) c].prepare (gfir.N, 0.0);
+            firMain[(size_t) c].prepare (gfir.N, 1.0); firAmbC[(size_t) c].prepare (gfir.N, 0.0); firTr[(size_t) c].prepare (gfir.N, 0.0);
             limFir[(size_t) c].reserve (nMax); limFir[(size_t) c].prepare (gfir.N, 1.0);
             spDelay[(size_t) c].reserve (TruePeak::kDelay + 1); spDelay[(size_t) c].setLength (TruePeak::kDelay);
             hold[(size_t) c].reserve ((lookMax + 2) * Oversampler::kMaxF + 2 * hf + hoMax);
@@ -430,16 +552,16 @@ public:
             wetKw[c].reset(); outKw[c].reset(); inKw[c].reset(); spDelay[c].reset(); tpLim[c].reset(); tpMeter[c].reset(); pad[c].reset();
             os[c].reset(); limDelay[c].reset(); hold[c].reset(); box[c].reset(); limEnv[c] = 1;
             for (auto& r : rms[c]) r = 1e-10;
-            pkEnv[c] = 0;
+            pkEnv[c] = 0; pkRms = 0;
             gA[c] = gB[c] = gC1[c] = gC2[c] = gD[c] = gDen[c] = 0; relC1[c] = relC2[c] = relD[c] = false; optoMem[c] = 0;
         }
-        for (size_t c = 0; c < (size_t) kMaxCh; ++c) { xDelay[c].reset(); firMain[c].reset (1.0); firAmbC[c].reset (0.0); limFir[c].reset (1.0); }
+        for (size_t c = 0; c < (size_t) kMaxCh; ++c) { xDelay[c].reset(); firMain[c].reset (1.0); firAmbC[c].reset (0.0); firTr[c].reset (0.0); limFir[c].reset (1.0); }
         firRev.reset (0.0); ambHpA.reset(); ap1A.reset(); ap2A.reset(); std::fill (ambRingA.begin(), ambRingA.end(), 0.0); std::fill (ambRingG.begin(), ambRingG.end(), 1.0); std::fill (ambRingT.begin(), ambRingT.end(), 0.0); for (auto& v : insRing) std::fill (v.begin(), v.end(), 0.0); ambDuck = 0; ambWA = 0;
         ambHp.reset(); std::fill (ambRing.begin(), ambRing.end(), 0.0); ap1.reset(); ap2.reset(); ambKw.reset(); verb.reset(); lvlA = -100;
         ambRms = 1e-10; gAmb = 0; frameAcc = 0; frameCount = 0; frameIdx = 0; recLeft = 0; sinceOnset = 100000;
         frames.fill (-120); erMs = 20; meterEr.store ((float) erMs);
         wetLoud = lufsToPow (p.target); makeupDb = 0;
-        mixS = std::clamp (p.mix, 0.0, 1.0); outS = dbToLin (p.outGainDb); denS = p.density; ambS = p.ambiance; trS = p.transient; trFast = trSlow = 0;
+        mixS = std::clamp (p.mix, 0.0, 1.0); outS = dbToLin (p.outGainDb); denS = p.density; ambS = p.ambiance; kstS = p.kStereo; trS = p.trOn ? p.transient : 0.0; trFast = trSlow = 0;
         acc = {};
         resetLoudness();
     }
@@ -455,7 +577,7 @@ public:
     {
         p = np;
         auto co = [this] (double ms) { return std::exp (-1.0 / (std::max (ms, 0.01) * 0.001 * fs)); };
-        cWin = co (p.windowMs);
+        cWin = co (p.windowMs); cPkRms = co (300.0);
         cAa = co (p.upAtt); cAr = co (p.upRel); cBa = co (p.llAtt); cBr = co (p.llRel);
         cC1a = co (p.att1); cC1r = co (p.rel1); cC2a = co (p.att2); cC2r = co (p.rel2);
         cDa = co (p.pkAtt); cDr = co (p.pkRel); cPkDet = co (5.0);
@@ -518,7 +640,10 @@ public:
     double curveD (double peakDb) const { return p.pkOn ? -(1.0 - 1.0 / std::max (1.0, p.pkRatio)) * shape (peakDb - peakThr()) : 0; }
     double thr1Abs() const { return p.target + p.thr1; }
     double thr2Abs() const { return std::max (thr1Abs(), p.target + p.thr2); }
-    double peakThr() const { return std::min (0.0, thr1Abs() + p.crest); }   // dBFS
+    // CREST: the peak threshold follows the music, crest dB above its running RMS (300 ms, unweighted) at the
+    // input of the peak stage, so only peaks that stick out of the RMS by more than the crest are reduced.
+    double peakThr() const { return p.pkCrest ? std::min (0.0, pkRmsDb + p.crest) : p.pkThr; }   // dBFS
+    double pkRmsDb = -100;
 
     template <typename T>
     void process (T* const* io, int numCh, int n)
@@ -535,10 +660,11 @@ public:
         for (int i = i0; i < i0 + nb; ++i)
         {
             mixS = mixT + cSmooth * (mixS - mixT); outS = outT + cSmooth * (outS - outT);
-            trS = p.transient + cSmooth * (trS - p.transient);
+            { const double tt = p.trOn ? p.transient : 0.0; trS = tt + cSmooth * (trS - tt); }
             widthS = dbToLin (p.widthDb) + cSmooth * (widthS - dbToLin (p.widthDb));
             centreS = dbToLin (p.centreDb) + cSmooth * (centreS - dbToLin (p.centreDb));
             denS = p.density + cSmooth * (denS - p.density); ambS = p.ambiance + cSmooth * (ambS - p.ambiance);
+            kstS = p.kStereo + cSmooth * (kstS - p.kStereo);
             double x[kMaxCh] {}, s[kMaxCh] {}, gPre[kMaxCh] { 1, 1 }, gPost[kMaxCh] { 1, 1 }, dk[kMaxCh] {};
             bool afterAmb = false; ambUsed = false; ambK = 0;
             auto mulGain = [&] (int c, double gl) { if (afterAmb) gPost[c] *= gl; else gPre[c] *= gl; };
@@ -564,7 +690,18 @@ public:
                 trDb = tr;
                 const double g = trS * tr;
                 mT = std::abs (g) > std::abs (mT) ? g : mT;
-                if (std::abs (g) > 1e-6) { const double gl = dbToLin (g); for (int c = 0; c < C; ++c) { s[c] *= gl; mulGain (c, gl); } }
+                kT = 0.0;
+                if (std::abs (g) > 1e-6)
+                {
+                    const double gl = dbToLin (g);
+                    if (C == 2 && p.trTarget > 0)
+                    {   // on Mid or Side only: an additive term (gl - 1) * M (or S), band-limited separately
+                        const double m = 0.5 * (s[0] + s[1]), sd = 0.5 * (s[0] - s[1]);
+                        const double m2 = p.trTarget == 1 ? m * gl : m, s2 = p.trTarget == 2 ? sd * gl : sd;
+                        s[0] = m2 + s2; s[1] = m2 - s2; kT = gl - 1.0;
+                    }
+                    else for (int c = 0; c < C; ++c) { s[c] *= gl; mulGain (c, gl); }
+                }
             }
 
             // A, B, C: RMS stages in series, each detects its own input
@@ -607,6 +744,11 @@ public:
             if (p.ambStage == 3) { ambiance (s, C, mAmb); afterAmb = ambUsed; }
 
             // D: peak
+            {
+                double e2 = 0; for (int c = 0; c < C; ++c) e2 += s[c] * s[c];
+                pkRms = e2 / cs + cPkRms * (pkRms - e2 / cs);
+                pkRmsDb = linToDb (std::sqrt (pkRms) + 1e-9);
+            }
             double pk = 0, pkc[kMaxCh] {};
             for (int c = 0; c < C; ++c)
             {
@@ -665,6 +807,18 @@ public:
             }
             for (int c = 0; c < C; ++c) y[c] = xd[c] * G[c];
             if (C == 2)
+            {   // transients on Mid / Side: y += fir (rest of the gain x (g - 1)) x M (or +-S)
+                double q[kMaxCh] {};
+                for (int c = 0; c < 2; ++c)
+                {
+                    if (same && c == 1) { q[1] = q[0]; continue; }
+                    q[c] = firTr[(size_t) c].process (outS * mixS * mk * gPre[c] * gPost[c] * kT, gfir.h);
+                }
+                const double um = 0.5 * (xd[0] + xd[1]), us = 0.5 * (xd[0] - xd[1]);
+                if (p.trTarget == 1) { y[0] += q[0] * um; y[1] += q[1] * um; }
+                else if (p.trTarget == 2) { y[0] += q[0] * us; y[1] -= q[1] * us; }
+            }
+            if (C == 2)
             {
                 // decorrelated side of the (unprocessed) input, pre-delayed like the control path; the gain applied
                 // before the ambiance on the control path is delayed by the same pre-delay
@@ -690,7 +844,7 @@ public:
             }
 
             // M/S end section: width, centre level / filter, side low cut
-            if (C == 2 && (std::abs (p.widthDb) > 1e-6 || std::abs (p.centreDb) > 1e-6 || p.sideLowCut > 0))
+            if (C == 2 && p.msOn && (std::abs (p.widthDb) > 1e-6 || std::abs (p.centreDb) > 1e-6 || p.sideLowCut > 0))
             {
                 double m = 0.5 * (y[0] + y[1]), sd = 0.5 * (y[0] - y[1]);
                 sd *= widthS;
@@ -743,6 +897,9 @@ public:
         {
             double y[kMaxCh] {};
             for (int c = 0; c < C; ++c) y[c] = yBuf[(size_t) c][(size_t) (i - i0)];
+            // linear tilt, last before the limiter (always running: constant latency, crossfaded changes)
+            tiltEq.setTarget (p.tiltOn ? p.tilt : 0.0, p.tiltPivot);
+            tiltEq.process (y, C);
             // E: limiter
             double o[kMaxCh] {};
             if (F > 1)
@@ -850,10 +1007,11 @@ private:
         const double delayed = ambRing[(ambW + R - (size_t) ambD) % R];
         ambW = (ambW + 1) % R;
         const double e = ap2.process (ap1.process (delayed));
+        // K-Stereo: a constant amount of the decorrelated, pre-delayed ambience, plus the dynamic lift of the tails
         const double amt = p.ambOn ? ambS : 0.0;
-        ambUsed = true; ambK = amt * (dbToLin (gAmb) - 1.0);
-        if (amt <= 0) return;
-        const double s2 = sd + amt * (dbToLin (gAmb) - 1.0) * e;
+        ambUsed = true; ambK = p.ambOn ? kstS + amt * (dbToLin (gAmb) - 1.0) : 0.0;
+        if (ambK == 0.0) return;
+        const double s2 = sd + ambK * e;
         s[0] = m + s2; s[1] = m - s2;
     }
 
@@ -873,36 +1031,42 @@ private:
             if (--recLeft == 0) estimateEr();
             return;
         }
-        backAvg = 0.98 * backAvg + 0.02 * e;
-        if (e > backAvg + 9.0 && e > -60.0 && sinceOnset > 300) { frameIdx = 0; frames[(size_t) frameIdx++] = e; recLeft = kFrames - 1; sinceOnset = 0; }
+        const bool onset = e > backAvg + 12.0 && e > -60.0 && sinceOnset > 300;
+        backAvg = 0.995 * backAvg + 0.005 * e;   // ~200 ms background
+        if (onset) { frameIdx = 0; frames[(size_t) frameIdx++] = e; recLeft = kFrames - 1; sinceOnset = 0; }
     }
     void estimateEr()
     {
-        // 3 ms smoothed envelope in dB (1 ms frames of noise-like tails fluctuate too much)
-        std::array<double, kFrames> d {};
-        for (int i = 0; i < kFrames; ++i)
+        // pass 1: 3 ms smoothed envelope, fit within 1 dB (a clean room); pass 2, for dense music and hall echoes:
+        // 5 ms smoothing, fit within 1.5 dB
+        for (int pass = 0; pass < 2; ++pass)
         {
-            double s = 0; int c = 0;
-            for (int j = std::max (0, i - 1); j <= std::min (kFrames - 1, i + 1); ++j) { s += std::pow (10.0, frames[(size_t) j] / 10.0); ++c; }
-            d[(size_t) i] = 10.0 * std::log10 (s / c + 1e-14);
-        }
-        int pk = 0;
-        for (int i = 1; i < 10; ++i) if (d[(size_t) i] > d[(size_t) pk]) pk = i;
-        const int W = 60;
-        for (int t = pk + 3; t + W < kFrames; ++t)
-        {
-            double sx = 0, sy = 0, sxx = 0, sxy = 0;
-            for (int j = 0; j < W; ++j) { const double y = d[(size_t) (t + j)]; sx += j; sy += y; sxx += j * j; sxy += j * y; }
-            const double b = (W * sxy - sx * sy) / (W * sxx - sx * sx), a = (sy - b * sx) / W;
-            double dev = 0;
-            for (int j = 0; j < W; ++j) { const double r = d[(size_t) (t + j)] - (a + b * j); dev += r * r; }
-            if (std::sqrt (dev / W) < 1.0)
+            const int hw = pass == 0 ? 1 : 2; const double tol = pass == 0 ? 1.0 : 1.5;
+            std::array<double, kFrames> d {};
+            for (int i = 0; i < kFrames; ++i)
             {
-                if (b > -0.01) return;    // flat: no decay after this onset, not usable
-                const double ms = std::clamp ((double) (t - pk), 5.0, 80.0);
-                erMs = 0.7 * erMs + 0.3 * ms;
-                meterEr.store ((float) erMs);
-                return;
+                double s = 0; int c = 0;
+                for (int j = std::max (0, i - hw); j <= std::min (kFrames - 1, i + hw); ++j) { s += std::pow (10.0, frames[(size_t) j] / 10.0); ++c; }
+                d[(size_t) i] = 10.0 * std::log10 (s / c + 1e-14);
+            }
+            int pk = 0;
+            for (int i = 1; i < 10; ++i) if (d[(size_t) i] > d[(size_t) pk]) pk = i;
+            const int W = 60;
+            for (int t = pk + 3; t + W < kFrames; ++t)
+            {
+                double sx = 0, sy = 0, sxx = 0, sxy = 0;
+                for (int j = 0; j < W; ++j) { const double y = d[(size_t) (t + j)]; sx += j; sy += y; sxx += j * j; sxy += j * y; }
+                const double b = (W * sxy - sx * sy) / (W * sxx - sx * sx), a = (sy - b * sx) / W;
+                double dev = 0;
+                for (int j = 0; j < W; ++j) { const double r = d[(size_t) (t + j)] - (a + b * j); dev += r * r; }
+                if (std::sqrt (dev / W) < tol)
+                {
+                    if (b * W > -0.6) break;   // flat: no decay after this onset, not usable in this pass
+                    const double ms = std::clamp ((double) (t - pk), 5.0, 80.0);
+                    erMs = 0.7 * erMs + 0.3 * ms;
+                    meterEr.store ((float) erMs);
+                    return;
+                }
             }
         }
     }
@@ -995,6 +1159,7 @@ private:
     Params p;
     double fs = 48000; int nch = 2, lookMax = 240, latencySamples = 0;
     int wantOs = 1, curOs = -1, wantLook = 96, curLook = -1;
+    double pkRms = 0, cPkRms = 0;
     double cWin = 0, cAa = 0, cAr = 0, cBa = 0, cBr = 0, cC1a = 0, cC1r = 0, cC2a = 0, cC2r = 0, cDa = 0, cDr = 0, cPkDet = 0;
     double cDenA = 0, cDenR = 0, cOptoUp = 0, cOptoDn = 0, cLoud = 0, cMakeup = 0, cSmooth = 0, cLimRel = 0, ceiling = 1;
     double mixS = 1, outS = 1, denS = 0, ambS = 0, trS = 0, trFast = 0, trSlow = 0;
@@ -1014,7 +1179,7 @@ private:
     std::array<Box, kMaxCh> box;
     Biquad ambHp; Allpass ap1, ap2; KWeighting ambKw;
     // audio path (the gains computed on the control path, band-limited by the gain FIR, applied to the delayed input)
-    GainFir gfir; std::array<GainFir, 4> gfirOs; int limTail = 16; std::array<FirLine, kMaxCh> firMain, firAmbC, limFir; FirLine firRev;
+    GainFir gfir; std::array<GainFir, 4> gfirOs; int limTail = 16; std::array<FirLine, kMaxCh> firMain, firAmbC, firTr, limFir; FirLine firRev;
     std::array<Delay, kMaxCh> xDelay;
     Biquad ambHpA; Allpass ap1A, ap2A; std::vector<double> ambRingA, ambRingG, ambRingT; size_t ambWA = 0;
     double trDb = 0, ambDuck = 0, laAmb = 96, cAmbDuck = 0.9997;
@@ -1030,7 +1195,8 @@ public:
 private:
     InsertFn insertFn = nullptr; void* insertCtx = nullptr;
     std::array<std::vector<double>, 2> insRing; size_t insW = 0; std::atomic<int> insLat { 0 };
-    double ambK = 0; bool ambUsed = false;
+    double ambK = 0, kstS = 0.3, kT = 0; bool ambUsed = false;
+    TiltEq tiltEq;
     std::vector<double> ambRing; size_t ambW = 0; double ambD = 960, ambRms = 1e-10, gAmb = 0;
     double cAmbA = 0, cAmbR = 0, cAmbWin = 0;
     static constexpr int kFrames = 200;

@@ -52,7 +52,10 @@ struct Section : juce::Component
     juce::OwnedArray<Control> controls;
     std::function<juce::String()> readout;
     juce::String shown;
-    juce::Component* extra = nullptr; int extraCell = 0, extraSpan = 1;   // a free component placed on grid cells
+    juce::Component* extra = nullptr; int extraCell = 0, extraSpan = 1;
+    // one-line gain meter in the header: GR (0 at the right, reduction grows left) or bipolar expansion (0 centred)
+    std::function<float()> gain; bool bipolar = false; float range = 20.0f, shownGain = 0, holdGain = 0, holdTime = 0;
+    void tickGain (float dt);   // a free component placed on grid cells
     juce::Rectangle<int> cell (int i) const;
 };
 
@@ -85,7 +88,15 @@ struct Sand : juce::Component
     float yOf (float lufs) const;
     DeltaCompProcessor& proc;
     static constexpr int kCols = 420;
-    std::array<float, kCols> level {}, in {}, out {}, down {}, up {}, lim {}, amb {};
+    std::array<float, kCols> level {}, in {}, out {};
+    // the five gain lanes: upward (ambiance + upward), mezzo downward, double threshold, peak, limiter
+    static constexpr int kLanes = 5;
+    std::array<std::array<float, kCols>, kLanes> lane {};
+    static constexpr int kBand = 150;      // height of the bottom band (phase scope + gain lanes)
+    float corr = 0, corrShown = 0, scopeGain = 1;
+    float lastDb = -100, avgDb = -60, kick = 0;
+    void paintPhase (juce::Graphics&, juce::Rectangle<float>);
+    void paintLanes (juce::Graphics&, juce::Rectangle<float>);
     int head = 0; unsigned frame = 0;
     // 3D plate (Dune-like Chladni sand): the output spectrum picks the plate modes, its level shakes the grains,
     // which jump off the plate, fall back and gather on the nodal lines; seen in perspective

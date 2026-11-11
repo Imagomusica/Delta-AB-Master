@@ -291,9 +291,43 @@ void Section::paint (Graphics& g)
     g.setColour (kFg); g.setFont (mono (11.0f, true));
     g.drawText (title, 8, 5, getWidth() - 62, 14, Justification::centredLeft);
     g.drawHorizontalLine (24, 6.0f, (float) getWidth() - 6.0f);
-    if (shown.isNotEmpty()) { g.setColour (kGrey); g.setFont (mono (9.5f)); g.drawText (shown, 8, 26, getWidth() - 16, 12, Justification::centredLeft); }
+    if (gain)
+    {   // one-line meter: track with dB ticks, bar, peak hold, value
+        const float x0 = 30.0f, x1 = (float) getWidth() - 62.0f, y = 27.0f, h = 9.0f, w = x1 - x0;
+        g.setColour (kGrey); g.setFont (mono (8.5f, true));
+        g.drawText (bipolar ? "G" : "GR", 6, (int) y - 1, 22, 11, Justification::centredLeft);
+        g.setColour (Colour (0xff050505)); g.fillRect (x0, y, w, h);
+        g.setColour (kDim); g.drawRect (x0, y, w, h, 1.0f);
+        auto xOf = [&] (float db) {
+            return bipolar ? x0 + w * 0.5f + jlimit (-1.0f, 1.0f, db / range) * w * 0.5f
+                           : x1 - jlimit (0.0f, 1.0f, -db / range) * w;
+        };
+        const float step = range > 12 ? 5.0f : 3.0f;
+        for (float d = bipolar ? -range : -range; d <= (bipolar ? range : 0.0f) + 0.01f; d += step)
+        { g.setColour (std::abs (d) < 0.01f ? kGrey : kDim); g.drawVerticalLine ((int) xOf (d), y + (std::abs (d) < 0.01f ? 0.0f : h - 3.0f), y + h); }
+        const float z = xOf (0.0f), v = xOf (shownGain);
+        g.setColour (shownGain >= 0 ? Colour (0xffbdbdbd) : kFg);
+        g.fillRect (Rectangle<float>::leftTopRightBottom (jmin (z, v), y + 2.0f, jmax (z, v), y + h - 2.0f));
+        g.setColour (kFg); g.fillRect (xOf (holdGain) - 0.75f, y + 1.0f, 1.5f, h - 2.0f);
+        g.setFont (mono (9.5f, true));
+        g.drawText ((shownGain > 0.05f ? "+" : "") + String (shownGain, 1), (int) x1 + 4, (int) y - 2, 52, 12, Justification::centredRight);
+        if (shown.contains ("@")) { g.setColour (kGrey); g.setFont (mono (8.5f)); g.drawText (shown.fromFirstOccurrenceOf ("@", true, false), (int) x1 - 70, (int) y - 13, 70, 11, Justification::centredRight); }
+    }
+    else if (shown.isNotEmpty()) { g.setColour (kGrey); g.setFont (mono (9.5f)); g.drawText (shown, 8, 26, getWidth() - 16, 12, Justification::centredLeft); }
     const bool off = on != nullptr && ! on->button.getToggleState();
     if (off) { g.setColour (kBg.withAlpha (0.55f)); g.fillRect (r.withTrimmedTop (25).reduced (1)); }
+}
+
+void Section::tickGain (float dt)
+{
+    if (! gain) return;
+    const float v = gain();
+    // meter ballistics: instant attack, 300 ms return; peak hold 1.5 s
+    const bool more = std::abs (v) > std::abs (shownGain);
+    shownGain = more ? v : v + (shownGain - v) * std::exp (-dt / 0.3f);
+    if (std::abs (v) >= std::abs (holdGain)) { holdGain = v; holdTime = 0; }
+    else if ((holdTime += dt) > 1.5f) holdGain = v;
+    repaint (0, 24, getWidth(), 16);
 }
 
 Rectangle<int> Section::cell (int i) const
@@ -337,7 +371,7 @@ Sand::Sand (DeltaCompProcessor& p) : proc (p)
 void Sand::resized()
 {
     const float W = (float) getWidth(), H = (float) getHeight();
-    plateArea = { 8.0f, 24.0f, W - 150.0f - 8.0f, H - 24.0f - 50.0f };
+    plateArea = { 8.0f, 24.0f, W - 150.0f - 8.0f, H - 24.0f - (float) kBand - 4.0f };
     plate = Image (Image::ARGB, jmax (1, (int) plateArea.getWidth()), jmax (1, (int) plateArea.getHeight()), true);
 }
 
@@ -380,16 +414,33 @@ void Sand::analyse()
         const double m = std::norm (spec[(size_t) k]);
         e[(size_t) band] += m; tot += m;
     }
-    for (int bnd = 0; bnd < kModes; ++bnd) target[(size_t) bnd] = (float) std::sqrt (e[(size_t) bnd] / tot);
-    const double db = 20 * std::log10 (rms + 1e-12);
-    shakeTarget = (float) jlimit (0.0, 1.0, (db + 60.0) / 60.0);
+    // the strongest registers dominate the figure, so the pattern changes with what is playing
+    double mx = 1e-30; for (auto v : e) mx = std::max (mx, v);
+    for (int bnd = 0; bnd < kModes; ++bnd) { const double r = e[(size_t) bnd] / mx; target[(size_t) bnd] = (float) (r * r); }
+    (void) tot;
+    // the shake follows the level of the last 85 ms against the level of the last seconds (the dynamics),
+    // and an attack (level jumping up) throws the sand up at once
+    const int nShort = (int) std::min<double> (kFFT, 0.085 * fs);
+    double rs = 0;
+    for (int i = kFFT - nShort; i < kFFT; ++i)
+    {
+        const float v = proc.scope[(size_t) ((w - kFFT + i) & (DeltaCompProcessor::kScopeSize - 1))];
+        rs += (double) v * v;
+    }
+    const float db = (float) (10 * std::log10 (rs / nShort + 1e-24));
+    if (db > lastDb + 3.0f && db > -60.0f) kick = jmin (1.0f, kick + (db - lastDb) / 12.0f);
+    lastDb = db;
+    avgDb += 0.02f * (db - avgDb);
+    shakeTarget = jlimit (0.0f, 1.0f, (db - (avgDb - 18.0f)) / 30.0f) * jlimit (0.0f, 1.0f, (db + 70.0f) / 20.0f);
+    (void) rms;
 }
 
 void Sand::stepPlate()
 {
     analyse();
     for (int k = 0; k < kModes; ++k) energy[(size_t) k] += 0.15f * (target[(size_t) k] - energy[(size_t) k]);
-    shakeLevel += (shakeTarget > shakeLevel ? 0.4f : 0.06f) * (shakeTarget - shakeLevel);
+    shakeLevel += (shakeTarget > shakeLevel ? 0.6f : 0.12f) * (shakeTarget - shakeLevel);
+    const float kNow = kick; kick *= 0.5f;
     static const int modes[kModes][2] = { { 1, 2 }, { 1, 3 }, { 2, 3 }, { 1, 4 }, { 3, 4 }, { 2, 5 }, { 3, 5 }, { 4, 7 } };
     static float cx[8][kGW], cy[8][kGH]; static bool init = false;
     if (! init)
@@ -421,7 +472,7 @@ void Sand::stepPlate()
         if (z <= 0.0f)
         {   // on the plate: kicked up where it vibrates
             z = 0.0f;
-            if (U (rng) < f * shakeLevel * 0.9f) v = (0.004f + 0.05f * f * shakeLevel * U (rng)) * damp;
+            if (U (rng) < f * (shakeLevel * 0.9f + kNow)) v = (0.004f + 0.05f * f * (shakeLevel + 1.5f * kNow) * U (rng)) * damp;
         }
         if (z > 0.0f || v > 0.0f) { z += v; v -= 0.0045f; if (z < 0.0f) { z = 0.0f; v = 0.0f; } }
         x += amp * N (rng); y += amp * N (rng) * 1.5f;
@@ -461,11 +512,24 @@ void Sand::push()
     level[(size_t) head] = e.meterLevel.load();
     in[(size_t) head] = e.meterIn.load();
     out[(size_t) head] = e.meterOut.load();
-    down[(size_t) head] = e.meterB.load() + e.meterC.load() + e.meterD.load();
-    up[(size_t) head] = e.meterA.load();
-    lim[(size_t) head] = e.meterLim.load();
-    amb[(size_t) head] = e.meterAmb.load();
-    grNow = -down[(size_t) head] - lim[(size_t) head];
+    const float v[kLanes] = { jmax (e.meterA.load(), e.meterAmb.load()), e.meterB.load(), e.meterC.load(), e.meterD.load(), e.meterLim.load() };
+    for (int k = 0; k < kLanes; ++k) lane[(size_t) k][(size_t) head] = v[k];
+    grNow = -(v[1] + v[2] + v[3] + v[4]);
+    // phase: correlation of L and R over the last 2048 samples, and a slow auto scale for the scope
+    {
+        const int w = proc.scopeWrite.load (std::memory_order_acquire);
+        double lr = 0, ll = 0, rr = 0, pk = 1e-9;
+        for (int i = 0; i < 2048; ++i)
+        {
+            const size_t q = (size_t) ((w - 2048 + i) & (DeltaCompProcessor::kScopeSize - 1));
+            const double m = proc.scope[q], sd = proc.scopeS[q], L = m + sd, R = m - sd;
+            lr += L * R; ll += L * L; rr += R * R; pk = std::max ({ pk, std::abs (m), std::abs (sd) });
+        }
+        corr = ll * rr > 1e-18 ? (float) (lr / std::sqrt (ll * rr)) : 0.0f;
+        corrShown += 0.25f * (corr - corrShown);
+        const float want = (float) jlimit (1.0, 1000.0, 0.8 / pk);
+        scopeGain += (want < scopeGain ? 0.5f : 0.05f) * (want - scopeGain);
+    }
     head = (head + 1) % kCols; ++frame;
     stepPlate(); renderPlate();
 }
@@ -502,22 +566,13 @@ void Sand::paint (Graphics& g)
     g.setColour (kFg); g.setFont (mono (12.0f, true));
     g.drawText ("DELTA COMP", 12, 5, 200, 16, Justification::centredLeft);
 
-    // gain strip: downward (B + C + D) under the line, upward (A) above, limiter as a bottom band
-    const float mid = H - 30.0f, colW = (xr - x0) / kCols;
-    g.setColour (kFg.withAlpha (0.25f)); g.drawHorizontalLine ((int) mid, x0, xr);
-    for (int i = 0; i < kCols; ++i)
+    // bottom band: the phase scope under the sand, the five gain lanes beside it
     {
-        const int idx = (head + i) % kCols;
-        const float dn = jmin (12.0f, -down[(size_t) idx]) * 1.6f, u = jmin (12.0f, up[(size_t) idx]) * 1.6f;
-        const float x = x0 + i * colW, w = jmax (1.0f, colW);
-        if (dn > 0.05f) { g.setColour (kFg); g.fillRect (x, mid, w, dn); }
-        if (u > 0.05f) { g.setColour (kGrey); g.fillRect (x, mid - u, w, u); }
-        const float l = jmin (6.0f, -lim[(size_t) idx]) * 1.2f;
-        if (l > 0.05f) { g.setColour (kFg); g.fillRect (x, H - 3.0f - l, w, l); }
+        const float by = H - (float) kBand, side = (float) kBand - 8.0f;
+        paintPhase (g, { 8.0f, by, side, side });
+        paintLanes (g, { 8.0f + side + 10.0f, by, xr - 8.0f - side - 10.0f, (float) kBand - 6.0f });
     }
-    g.setColour (kGrey); g.setFont (mono (9.0f));
-    g.drawText ("GR", 4, (int) mid - 6, 30, 12, Justification::centredRight);
-    g.drawText ("LIM", 4, (int) H - 13, 30, 12, Justification::centredRight);
+    (void) x0;
 
     // dynamic range spread: two brackets, input and output, from the 10th to the 95th percentile
     g.setColour (kDim); g.drawVerticalLine ((int) xr + 6, 4.0f, H - 4.0f);
@@ -540,6 +595,82 @@ void Sand::paint (Graphics& g)
     bracket (xr + 108, outLo, outHi, "SORTIE", true);
     g.setColour (kGrey); g.setFont (mono (8.5f));
     g.drawText ("DYNAMIC RANGE", (int) xr + 10, (int) H - 16, 140, 12, Justification::centred);
+}
+
+// Phase scope (goniometer): mid up, side across, L and R on the diagonals; correlation bar underneath.
+void Sand::paintPhase (Graphics& g, Rectangle<float> r)
+{
+    const float barH = 14.0f;
+    auto sq = r.withTrimmedBottom (barH + 4.0f);
+    sq = sq.withSizeKeepingCentre (sq.getHeight(), sq.getHeight());
+    g.setColour (Colour (0xff070707)); g.fillRect (sq);
+    g.setColour (kFg.withAlpha (0.12f));
+    g.drawLine (sq.getCentreX(), sq.getY(), sq.getCentreX(), sq.getBottom(), 0.6f);
+    g.drawLine (sq.getX(), sq.getCentreY(), sq.getRight(), sq.getCentreY(), 0.6f);
+    g.drawLine (sq.getX(), sq.getY(), sq.getRight(), sq.getBottom(), 0.6f);
+    g.drawLine (sq.getRight(), sq.getY(), sq.getX(), sq.getBottom(), 0.6f);
+    g.setColour (kDim); g.drawRect (sq, 1.0f);
+    g.setFont (mono (8.0f)); g.setColour (kGrey);
+    g.drawText ("L", sq.withSize (12, 12).translated (2, 1), Justification::centred);
+    g.drawText ("R", sq.withSize (12, 12).translated (sq.getWidth() - 14, 1), Justification::centred);
+    g.drawText ("M", sq.withSize (12, 12).translated (sq.getWidth() * 0.5f + 2, 1), Justification::centred);
+    const int w = proc.scopeWrite.load (std::memory_order_acquire);
+    const float cx = sq.getCentreX(), cy = sq.getCentreY(), half = sq.getWidth() * 0.5f - 2.0f;
+    for (int i = 0; i < 2048; ++i)
+    {
+        const size_t q = (size_t) ((w - 2048 + i) & (DeltaCompProcessor::kScopeSize - 1));
+        const float m = jlimit (-1.0f, 1.0f, proc.scope[q] * scopeGain), sd = jlimit (-1.0f, 1.0f, proc.scopeS[q] * scopeGain);
+        g.setColour (kFg.withAlpha (0.12f + 0.5f * (float) i / 2048.0f));
+        g.fillRect (cx - sd * half, cy - m * half, 1.2f, 1.2f);
+    }
+    // correlation: -1 (out of phase) .. +1 (mono)
+    auto bar = Rectangle<float> (sq.getX(), r.getBottom() - barH, sq.getWidth(), barH);
+    g.setColour (kDim); g.drawRect (bar, 1.0f);
+    const float zx = bar.getCentreX(), px = zx + corrShown * (bar.getWidth() * 0.5f - 2.0f);
+    g.setColour (corrShown < 0 ? kFg : kGrey);
+    g.fillRect (Rectangle<float>::leftTopRightBottom (jmin (zx, px), bar.getY() + 3, jmax (zx, px), bar.getBottom() - 3));
+    g.setColour (kFg.withAlpha (0.4f)); g.drawVerticalLine ((int) zx, bar.getY(), bar.getBottom());
+    g.setFont (mono (8.0f)); g.setColour (kGrey);
+    g.drawText ("-1", bar.translated (-18, 0).withWidth (16), Justification::centredRight);
+    g.drawText ("+1", bar.translated (bar.getWidth() + 2, 0).withWidth (16), Justification::centredLeft);
+    g.setColour (kFg); g.setFont (mono (9.0f, true));
+    g.drawText ("PHASE " + String (corrShown, 2), sq.reduced (4, 3).toNearestInt(), Justification::bottomLeft);
+}
+
+// Five lanes scrolling in time: the classical zones from the bottom of the dynamics to the top.
+void Sand::paintLanes (Graphics& g, Rectangle<float> r)
+{
+    static const char* names[kLanes] = { "UPWARD", "BAS NIV.", "DOUBLE", "PEAK", "LIMITEUR" };
+    static const float range[kLanes] = { 12, 6, 12, 12, 6 };
+    const float lh = r.getHeight() / kLanes, labelW = 64.0f, valW = 48.0f;
+    const float x0 = r.getX() + labelW, x1 = r.getRight() - valW, colW = (x1 - x0) / kCols;
+    for (int k = 0; k < kLanes; ++k)
+    {
+        const float top = r.getY() + k * lh, h = lh - 4.0f;
+        const bool upLane = k == 0;
+        const float base = upLane ? top + h : top;     // upward grows up from the bottom, reductions hang from the top
+        g.setColour (Colour (0xff070707)); g.fillRect (x0, top, x1 - x0, h);
+        g.setColour (kFg.withAlpha (0.2f)); g.drawHorizontalLine ((int) base, x0, x1);
+        float now = 0;
+        for (int i = 0; i < kCols; ++i)
+        {
+            const int idx = (head + i) % kCols;
+            const float v = lane[(size_t) k][(size_t) idx];
+            const float a = jlimit (0.0f, 1.0f, (upLane ? v : -v) / range[k]) * h;
+            if (a > 0.3f)
+            {
+                g.setColour (upLane ? kGrey : kFg);
+                g.fillRect (x0 + i * colW, upLane ? base - a : base, jmax (1.0f, colW), a);
+            }
+            now = v;
+        }
+        g.setFont (mono (9.0f, true)); g.setColour (kFg);
+        g.drawText (names[k], (int) r.getX(), (int) top, (int) labelW - 4, (int) h, Justification::centredRight);
+        g.setFont (mono (10.0f, true));
+        g.drawText ((now > 0.05f ? "+" : "") + String (now, 1), (int) x1 + 4, (int) top, (int) valW - 4, (int) h, Justification::centredLeft);
+        g.setFont (mono (7.5f)); g.setColour (kGrey);
+        g.drawText (String ((int) range[k]), (int) x1 - 22, (int) (upLane ? top : top + h - 10), 20, 10, Justification::centredRight);
+    }
 }
 
 // ------------------------------------------------------------------ meter
@@ -862,9 +993,9 @@ void InsertSlot::showMenu()
 void InsertSlot::resized()
 {
     auto r = getLocalBounds();
-    pick.setBounds (r.removeFromTop (24));
-    r.removeFromTop (6);
-    edit.setBounds (r.removeFromTop (22).withSizeKeepingCentre (jmin (110, r.getWidth()), 22));
+    pick.setBounds (r.removeFromTop (22));
+    r.removeFromTop (3);
+    edit.setBounds (r.removeFromTop (20).withSizeKeepingCentre (jmin (110, r.getWidth()), 20));
 }
 
 void InsertSlot::paint (Graphics& g)
@@ -889,41 +1020,51 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
     auto db = [] (float v) { return (v > 0.05f ? "+" : "") + String (v, 1) + " dB"; };
     auto& e = p.engine;
 
-    add (row1, new ui::Section (s, "TRANSITOIRES", nullptr, 2, { { K::knob, "transient", "ROND / ATT." }, { K::knob, "trDur", "DURÉE" } }),
+    add (row1, new ui::Section (s, "TRANSITOIRES", "trOn", 2, { { K::knob, "transient", "ROND / ATT." }, { K::knob, "trDur", "DURÉE" }, { K::choice, "trTarget", "SUR" } }),
          [&e, db] { return db (e.meterT.load()); });
     add (row1, new ui::Section (s, "UPWARD BAS NIV.", "upOn", 2, { { K::knob, "upThr", "SEUIL" }, { K::knob, "upRatio", "RATIO" }, { K::knob, "upRange", "PLAGE" },
                                                                   { K::knob, "upAtt", "ATTAQUE" }, { K::knob, "upRel", "RELEASE" } }),
          [&e, db] { return db (e.meterA.load()); });
+    row1.getLast()->gain = [&e] { return e.meterA.load(); }; row1.getLast()->bipolar = true; row1.getLast()->range = 12;
     add (row1, new ui::Section (s, "DOWNWARD BAS NIV.", "llOn", 2, { { K::knob, "llThr", "SEUIL" }, { K::knob, "llRatio", "RATIO" }, { K::knob, "llRange", "PLAGE" },
                                                                     { K::knob, "llAtt", "ATTAQUE" }, { K::knob, "llRel", "RELEASE" } }),
          [&e, db] { return db (e.meterB.load()); });
+    row1.getLast()->gain = [&e] { return e.meterB.load(); }; row1.getLast()->bipolar = true; row1.getLast()->range = 12;
     add (row1, new ui::Section (s, "DOWNWARD DOUBLE SEUIL", "dnOn", 4,
                                 { { K::knob, "thr1", "SEUIL 1" }, { K::knob, "ratio1", "RATIO 1" }, { K::knob, "att1", "ATTAQUE 1" }, { K::knob, "rel1", "RELEASE 1" },
                                   { K::knob, "thr2", "SEUIL 2" }, { K::knob, "ratio2", "RATIO 2" }, { K::knob, "att2", "ATTAQUE 2" }, { K::knob, "rel2", "RELEASE 2" },
                                   { K::knob, "hyst", "HYSTÉRÉSIS" }, { K::knob, "knee", "GENOU" }, { K::knob, "window", "FENÊTRE" }, { K::choice, "opto", "DÉTECTION" } }),
          [&e, db] { return db (e.meterC.load()); });
-    add (row1, new ui::Section (s, "PEAK", "pkOn", 2, { { K::knob, "crest", "CREST" }, { K::knob, "pkRatio", "RATIO" },
-                                                       { K::knob, "pkAtt", "ATTAQUE" }, { K::knob, "pkRel", "RELEASE" } }),
+    row1.getLast()->gain = [&e] { return e.meterC.load(); }; row1.getLast()->range = 20;
+    add (row1, new ui::Section (s, "PEAK", "pkOn", 2, { { K::knob, "pkThr", "SEUIL" }, { K::knob, "pkRatio", "RATIO" },
+                                                       { K::knob, "pkAtt", "ATTAQUE" }, { K::knob, "pkRel", "RELEASE" },
+                                                       { K::choice, "pkMode", "MODE" }, { K::knob, "crest", "CREST" } }),
          [&e, &p, db] { return db (e.meterD.load()) + "  @ " + String (p.engine.peakThr(), 1); });
+    row1.getLast()->gain = [&e] { return e.meterD.load(); }; row1.getLast()->range = 12;
 
-    add (row2, new ui::Section (s, "AMBIANCE · K-STEREO", "ambOn", 3, { { K::knob, "ambiance", "QUANTITÉ" }, { K::knob, "ambThr", "SEUIL" }, { K::knob, "ambRatio", "RATIO" },
+    add (row2, new ui::Section (s, "AMBIANCE · K-STEREO", "ambOn", 5, { { K::knob, "kStereo", "K-STEREO" }, { K::knob, "ambiance", "QUEUES" }, { K::knob, "ambThr", "SEUIL" }, { K::knob, "ambRatio", "RATIO" },
                                                             { K::knob, "ambAtt", "ATTAQUE" }, { K::knob, "ambRel", "RELEASE" }, { K::knob, "ambPre", "PRÉ-DÉLAI" },
-                                                            { K::knob, "ambTr", "TRANSITOIRES" }, { K::choice, "ambAuto", "AUTO RÉFL." }, { K::choice, "ambStage", "APRÈS" } }),
-         [&e, db] { return db (e.meterAmb.load()) + ui::u8 ("  réfl. ") + String (roundToInt (e.meterEr.load())) + " ms"; });
-    add (row2, new ui::Section (s, "M/S", nullptr, 5, { { K::knob, "centre", "CENTRE" }, { K::knob, "centreFreq", "FRÉQ." }, { K::choice, "centreFilter", "FILTRE" },
-                                                       { K::knob, "width", "LARGEUR" }, { K::knob, "sideLowCut", "LOW CUT S" },
-                                                       { K::choice, "sideSlope", "PENTE dB/oct" }, { K::toggle, "revOn", "INSERT" }, { K::choice, "revTarget", "SUR" } }),
-         [this] { auto n = proc.insertName(); return String ("INSERT ") + (n.isEmpty() ? String ("--") : n.toUpperCase()); });
-    {
-        auto* ms = row2[1];
-        ms->extra = &insertSlot; ms->extraCell = 8; ms->extraSpan = 2;
-        ms->addAndMakeVisible (insertSlot);
+                                                            { K::knob, "ambTr", "TRANSITOIRES" }, { K::choice, "ambAuto", "AUTO RÉFL." }, { K::choice, "ambStage", "APRÈS" },
+                                                            { K::toggle, "revOn", "REVERB" }, { K::choice, "revTarget", "SUR" } }),
+         [this, &e, db] { auto n = proc.insertName();
+                          return db (e.meterAmb.load()) + ui::u8 ("  réfl. ") + String (roundToInt (e.meterEr.load())) + " ms   "
+                                 + (n.isEmpty() ? String ("REVERB --") : n.toUpperCase()); });
+    {   // the reverb insert (Altiverb or any plugin) lives with the ambiance, on Mid, Side or both
+        auto* amb = row2[0];
+        amb->extra = &insertSlot; amb->extraCell = 12; amb->extraSpan = 3;
+        amb->addAndMakeVisible (insertSlot);
     }
+    add (row2, new ui::Section (s, "M/S", "msOn", 3, { { K::knob, "centre", "CENTRE" }, { K::knob, "centreFreq", "FRÉQ." }, { K::choice, "centreFilter", "FILTRE" },
+                                                       { K::knob, "width", "LARGEUR" }, { K::knob, "sideLowCut", "LOW CUT S" },
+                                                       { K::choice, "sideSlope", "PENTE dB/oct" } }),
+         [] { return String ("CENTRE / LARGEUR"); });
     add (row2, new ui::Section (s, "LIMITEUR", "limOn", 3, { { K::knob, "ceiling", "PLAFOND" }, { K::knob, "limRel", "RELEASE" }, { K::knob, "look", "LOOKAHEAD" },
                                                             { K::knob, "linkT", "LIEN TRANS." }, { K::knob, "linkR", "LIEN REL." }, { K::choice, "os", "OVERSAMPLING" },
                                                             { K::choice, "truePeak", "TRUE PEAK" } }),
          [&e, db] { return db (e.meterLim.load()); });
-    add (row2, new ui::Section (s, "GLOBAL", nullptr, 4, { { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
+    add (row1, new ui::Section (s, "TILT", "tiltOn", 1, { { K::knob, "tilt", "PENTE" }, { K::knob, "tiltPivot", "PIVOT" } }),
+         [] { return ui::u8 ("LINÉAIRE"); });
+    add (row2, new ui::Section (s, "GLOBAL", "active", 4, { { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
                                                           { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::choice, "autoGain", "GAIN AUTO" } }),
          [&e, db] { return "GAIN AUTO " + db (e.meterMakeup.load()) + "  DENSITY " + db (e.meterDensity.load()); });
 
@@ -968,5 +1109,8 @@ void DeltaCompEditor::timerCallback()
     meter.tick (dt);
     for (auto* row : { &row1, &row2 })
         for (auto* s : *row)
-            if (s->readout) { auto t = s->readout(); if (t != s->shown) { s->shown = t; s->repaint(); } }
+        {
+            if (s->readout) { auto t = s->readout(); if (t != s->shown) { s->shown = t; if (! s->gain) s->repaint(); } }
+            s->tickGain (dt);
+        }
 }

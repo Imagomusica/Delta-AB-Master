@@ -36,7 +36,7 @@ public:
     dcomp::Engine engine;
     // output (mid) for the sand view's spectrum, written by the audio thread
     static constexpr int kScopeSize = 8192;
-    std::array<float, kScopeSize> scope {};
+    std::array<float, kScopeSize> scope {}, scopeS {};   // output mid and side, for the sand and the phase scope
     std::atomic<int> scopeWrite { 0 };
     dcomp::Params currentParams() const;
 
@@ -60,6 +60,7 @@ private:
     juce::AudioBuffer<float> insertBuf;
     juce::MidiBuffer insertMidi;
     double sr = 48000; int blockSize = 512; int insertLatency = 0;
+    std::array<std::vector<double>, 2> dryRing; int dryW = 0; double bypassMix = 0, bypassK = 0.999;
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     template <typename T> void processAny (juce::AudioBuffer<T>&);
