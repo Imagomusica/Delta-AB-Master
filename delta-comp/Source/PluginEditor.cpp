@@ -10,6 +10,7 @@ Font mono (float h, bool bold)
     return Font (FontOptions (Font::getDefaultMonospacedFontName(), h, bold ? Font::bold : Font::plain));
 }
 String u8 (const char* s) { return String::fromUTF8 (s); }
+void drawNagraCup (Graphics&, Point<float> c, float R, float a, bool hot);
 
 // ------------------------------------------------------------------ look
 Look::Look()
@@ -56,27 +57,63 @@ void Look::drawRotarySlider (Graphics& g, int x, int y, int w, int h, float pos,
         g.setColour (major ? kFg : kGrey);
         g.drawLine ({ c.getPointOnCircumference (R + 1.5f, a), c.getPointOnCircumference (major ? Rt : Rt - 2.5f, a) }, major ? 1.4f : 1.0f);
     }
-    // cup: bevelled rim, dark well
-    g.setColour (kGrey); g.fillEllipse (c.x - R, c.y - R, 2 * R, 2 * R);
-    g.setColour (kDim);  g.fillEllipse (c.x - R + 1.5f, c.y - R + 1.5f, 2 * R - 3, 2 * R - 3);
-    g.setColour (Colour (0xff101010)); g.fillEllipse (c.x - R * 0.86f, c.y - R * 0.86f, R * 1.72f, R * 1.72f);
-    // bar knob across the cup, pointed at the value
-    const float a = a0 + pos * (a1 - a0), L = R * 0.84f, Wd = R * 0.30f;
-    Path bar;
-    bar.startNewSubPath (0, -L);
-    bar.lineTo (Wd, -L + Wd * 1.3f);
-    bar.lineTo (Wd, L - Wd * 0.4f);
-    bar.quadraticTo (Wd, L, 0, L);
-    bar.quadraticTo (-Wd, L, -Wd, L - Wd * 0.4f);
-    bar.lineTo (-Wd, -L + Wd * 1.3f);
-    bar.closeSubPath();
-    bar.applyTransform (AffineTransform::rotation (a).translated (c));
-    g.setColour (s.isMouseOverOrDragging() ? Colour (0xffeeeeee) : Colour (0xffd0d0d0)); g.fillPath (bar);
-    g.setColour (kFg); g.strokePath (bar, PathStrokeType (1.0f));
-    g.setColour (kGrey);
-    g.drawLine (c.x - std::sin (a) * L * 0.8f, c.y + std::cos (a) * L * 0.8f, c.x + std::sin (a) * L * 0.5f, c.y - std::cos (a) * L * 0.5f, 1.0f);
-    g.setColour (kBg);
-    g.drawLine (c.x + std::sin (a) * L * 0.55f, c.y - std::cos (a) * L * 0.55f, c.x + std::sin (a) * (L - 2), c.y - std::cos (a) * (L - 2), 2.0f);
+    drawNagraCup (g, c, R, a0 + pos * (a1 - a0), s.isMouseOverOrDragging());
+}
+
+// grey level lit from the top left, for a face whose outward normal points at angle 'na' (screen radians, 0 = up)
+static Colour lit (float na, float base, float amount)
+{
+    const float lx = -0.55f, ly = -0.83f;                          // light direction (towards top left)
+    const float d = std::sin (na) * lx + (-std::cos (na)) * ly;     // normal (sin, -cos) . light
+    return Colour::greyLevel (jlimit (0.0f, 1.0f, base + amount * d));
+}
+
+// Nagra recessed control: polished lip, deep well with a shaded wall, brushed floor, and a faceted chrome
+// bar lever across the well with a wedge-pointed nose, casting its shadow on the floor.
+void drawNagraCup (Graphics& g, Point<float> c, float R, float a, bool hot)
+{
+    auto disc = [&] (float rad, Point<float> at) { return Rectangle<float> (2 * rad, 2 * rad).withCentre (at); };
+    // lip of the plate around the hole: bright towards the light, dark away from it
+    g.setGradientFill (ColourGradient (Colour (0xffe6e6e6), c.x - R * 0.7f, c.y - R * 0.7f, Colour (0xff2c2c2c), c.x + R * 0.7f, c.y + R * 0.7f, false));
+    g.fillEllipse (disc (R, c));
+    // inner wall of the well: in shadow on the lit side, catching light opposite
+    const float Rw = R * 0.92f;
+    g.setGradientFill (ColourGradient (Colour (0xff141414), c.x - R * 0.5f, c.y - R * 0.6f, Colour (0xffb4b4b4), c.x + R * 0.5f, c.y + R * 0.7f, false));
+    g.fillEllipse (disc (Rw, c));
+    // floor, seen a little from above: shifted towards the light, brushed with fine concentric rings
+    const float Rf = R * 0.80f; const auto cf = c.translated (R * 0.03f, R * 0.05f);
+    g.setGradientFill (ColourGradient (Colour (0xffa8a8a8), cf.x - Rf * 0.3f, cf.y - Rf * 0.4f, Colour (0xff4a4a4a), cf.x + Rf, cf.y + Rf, true));
+    g.fillEllipse (disc (Rf, cf));
+    for (float k = 0.25f; k < 1.0f; k += 0.09f) { g.setColour (Colours::white.withAlpha (0.05f)); g.drawEllipse (disc (Rf * k, cf), 0.6f); }
+    // lever, in its own frame: nose towards -y, rounded tail towards +y
+    const float L = R * 0.86f, W = R * 0.36f, nose = W * 1.25f;
+    auto xf = AffineTransform::rotation (a).translated (c);
+    Path body;   // outline
+    body.startNewSubPath (0, -L);
+    body.lineTo (W, -L + nose); body.lineTo (W, L * 0.62f);
+    body.quadraticTo (W, L * 0.86f, 0, L * 0.86f); body.quadraticTo (-W, L * 0.86f, -W, L * 0.62f);
+    body.lineTo (-W, -L + nose); body.closeSubPath();
+    // shadow on the floor, away from the light
+    g.setColour (Colours::black.withAlpha (0.55f));
+    g.fillPath (body, xf.translated (R * 0.07f, R * 0.11f));
+    // two long facets meeting on a ridge, and two small facets forming the nose
+    const float ridge = W * 0.18f;
+    Path leftF, rightF, noseL, noseR;
+    leftF.startNewSubPath (-ridge, -L + nose * 0.85f); leftF.lineTo (-ridge, L * 0.70f); leftF.quadraticTo (-W * 0.6f, L * 0.86f, -W, L * 0.62f); leftF.lineTo (-W, -L + nose); leftF.closeSubPath();
+    rightF.startNewSubPath (ridge, -L + nose * 0.85f); rightF.lineTo (ridge, L * 0.70f); rightF.quadraticTo (W * 0.6f, L * 0.86f, W, L * 0.62f); rightF.lineTo (W, -L + nose); rightF.closeSubPath();
+    Path top; top.addRectangle (-ridge, -L + nose * 0.85f, 2 * ridge, L * 0.70f + L - nose * 0.85f);
+    noseL.startNewSubPath (0, -L); noseL.lineTo (-ridge, -L + nose * 0.85f); noseL.lineTo (-W, -L + nose); noseL.closeSubPath();
+    noseR.startNewSubPath (0, -L); noseR.lineTo (W, -L + nose); noseR.lineTo (ridge, -L + nose * 0.85f); noseR.closeSubPath();
+    const float hb = hot ? 0.08f : 0.0f;
+    g.setColour (lit (a - MathConstants<float>::halfPi, 0.62f + hb, 0.30f)); g.fillPath (leftF, xf);
+    g.setColour (lit (a + MathConstants<float>::halfPi, 0.62f + hb, 0.30f)); g.fillPath (rightF, xf);
+    g.setColour (Colour::greyLevel (0.86f + hb)); g.fillPath (top, xf);
+    g.setColour (lit (a - 0.6f, 0.70f + hb, 0.30f)); g.fillPath (noseL, xf);
+    g.setColour (lit (a + 0.6f, 0.70f + hb, 0.30f)); g.fillPath (noseR, xf);
+    // index groove along the nose, and a crisp edge
+    Path groove; groove.startNewSubPath (0, -L + nose * 0.5f); groove.lineTo (0, -L * 0.15f);
+    g.setColour (Colour (0xff111111)); g.strokePath (groove, PathStrokeType (jmax (1.0f, W * 0.16f)), xf);
+    g.setColour (Colours::white.withAlpha (0.55f)); g.strokePath (body, PathStrokeType (0.7f), xf);
 }
 
 // Toggle switch: chrome nut with a bat lever, thrown towards ON or OFF (engraved beside it).
@@ -98,20 +135,24 @@ static void drawLever (Graphics& g, Rectangle<float> r, bool on, bool over, bool
         c = r.getCentre(); const float L = r.getWidth() * 0.42f;
         tip = c.translated (on ? L : -L, 0);
     }
-    const float nut = jmin (r.getWidth(), r.getHeight()) * 0.30f;
-    // hex nut and threaded bush
-    Path hex; for (int i = 0; i < 6; ++i) { const auto pt = c.getPointOnCircumference (nut * 1.15f, MathConstants<float>::pi / 6.0f + i * MathConstants<float>::pi / 3.0f); if (i == 0) hex.startNewSubPath (pt); else hex.lineTo (pt); }
-    hex.closeSubPath();
-    g.setColour (kDim); g.fillPath (hex); g.setColour (kGrey); g.strokePath (hex, PathStrokeType (1.0f));
-    g.setColour (Colour (0xff1a1a1a)); g.fillEllipse (Rectangle<float> (nut * 1.3f, nut * 1.3f).withCentre (c));
-    // bat lever: tapered shaft, rounded tip
-    const float w0 = jmax (2.0f, nut * 0.55f), w1 = jmax (3.0f, nut * 0.85f);
+    const float nut = jmin (r.getWidth(), r.getHeight()) * 0.34f;
+    auto disc = [&] (float rad, Point<float> at) { return Rectangle<float> (2 * rad, 2 * rad).withCentre (at); };
+    // round bezel sunk in the plate (Nagra recorder style), dark hole with the bushing
+    g.setGradientFill (ColourGradient (Colour (0xffe0e0e0), c.x - nut, c.y - nut, Colour (0xff303030), c.x + nut, c.y + nut, false));
+    g.fillEllipse (disc (nut * 1.25f, c));
+    g.setGradientFill (ColourGradient (Colour (0xff101010), c.x - nut, c.y - nut, Colour (0xff9a9a9a), c.x + nut, c.y + nut, false));
+    g.fillEllipse (disc (nut * 1.05f, c));
+    g.setColour (Colour (0xff1c1c1c)); g.fillEllipse (disc (nut * 0.62f, c));
+    // bat lever: tapered chrome shaft with a ball end, shadow first
+    const float w0 = jmax (2.0f, nut * 0.50f), w1 = jmax (3.0f, nut * 0.80f);
     const auto d = (tip - c) / jmax (1.0f, c.getDistanceFrom (tip)); const Point<float> n (-d.y, d.x);
     Path bat; bat.startNewSubPath (c + n * (w0 * 0.5f)); bat.lineTo (tip + n * (w1 * 0.5f)); bat.lineTo (tip - n * (w1 * 0.5f)); bat.lineTo (c - n * (w0 * 0.5f)); bat.closeSubPath();
-    g.setColour (over ? Colour (0xffeeeeee) : Colour (0xffcfcfcf)); g.fillPath (bat);
-    g.fillEllipse (Rectangle<float> (w1 * 1.25f, w1 * 1.25f).withCentre (tip));
-    g.setColour (kFg); g.strokePath (bat, PathStrokeType (0.8f));
-    g.setColour (Colour (0xff1a1a1a)); g.fillEllipse (Rectangle<float> (w0, w0).withCentre (c));
+    bat.addEllipse (disc (w1 * 0.68f, tip));
+    g.setColour (Colours::black.withAlpha (0.5f)); g.fillPath (bat, AffineTransform::translation (1.2f, 1.8f));
+    g.setGradientFill (ColourGradient (Colour (over ? 0xffffffff : 0xfff2f2f2), c.x - n.x * w1, c.y - n.y * w1, Colour (0xff6a6a6a), c.x + n.x * w1, c.y + n.y * w1, false));
+    g.fillPath (bat);
+    g.setColour (Colours::white); g.fillEllipse (disc (w1 * 0.18f, tip.translated (-w1 * 0.2f, -w1 * 0.2f)));
+    g.setColour (Colour (0xff2a2a2a)); g.strokePath (bat, PathStrokeType (0.6f));
 }
 
 void Look::drawButtonBackground (Graphics& g, Button& b, const Colour&, bool over, bool)
@@ -255,8 +296,18 @@ void Section::paint (Graphics& g)
     if (off) { g.setColour (kBg.withAlpha (0.55f)); g.fillRect (r.withTrimmedTop (25).reduced (1)); }
 }
 
+Rectangle<int> Section::cell (int i) const
+{
+    auto r = getLocalBounds().reduced (4, 0).withTrimmedTop (38).withTrimmedBottom (4);
+    const int rows = jmax ((int) controls.size(), extra != nullptr ? extraCell + extraSpan : 0);
+    const int nr = (rows + cols - 1) / cols;
+    const int cw = r.getWidth() / cols, rh = jmin (84, r.getHeight() / jmax (1, nr));
+    return { r.getX() + (i % cols) * cw, r.getY() + (i / cols) * rh, cw, rh };
+}
+
 void Section::resized()
 {
+    if (extra != nullptr) extra->setBounds (cell (extraCell).getUnion (cell (extraCell + extraSpan - 1)).reduced (4, 6));
     if (on) on->setBounds (getWidth() - 54, 2, 50, 20);
     auto r = getLocalBounds().reduced (4, 0).withTrimmedTop (38).withTrimmedBottom (4);
     const int rows = ((int) controls.size() + cols - 1) / cols;
@@ -274,6 +325,136 @@ float Sand::yOf (float lufs) const
     return 26.0f + jlimit (0.0f, 1.0f, (kTop - lufs) / (kTop - kBottom)) * (h - 26.0f);
 }
 
+Sand::Sand (DeltaCompProcessor& p) : proc (p)
+{
+    std::uniform_real_distribution<float> U (0, 1);
+    gx.resize (kGrains); gy.resize (kGrains); gz.assign (kGrains, 0.0f); gv.assign (kGrains, 0.0f);
+    for (int i = 0; i < kGrains; ++i) { gx[(size_t) i] = U (rng); gy[(size_t) i] = U (rng); }
+    spec.resize (kFFT);
+    setOpaque (true);
+}
+
+void Sand::resized()
+{
+    const float W = (float) getWidth(), H = (float) getHeight();
+    plateArea = { 8.0f, 24.0f, W - 150.0f - 8.0f, H - 24.0f - 50.0f };
+    plate = Image (Image::ARGB, jmax (1, (int) plateArea.getWidth()), jmax (1, (int) plateArea.getHeight()), true);
+}
+
+// plate coordinates: x 0..1 across, y 0 (far) .. 1 (near), z height above the plate (plate widths)
+Point<float> Sand::project (float x, float y, float z) const
+{
+    const float W = plateArea.getWidth(), H = plateArea.getHeight();
+    const float Z = 1.55f + (1.0f - y) * 2.1f;              // depth from the eye
+    const float camH = 1.0f, near = 1.55f;
+    const float fx = 0.47f * W * near, horizon = -0.30f * H, fy = (H - 6.0f - horizon) * near / camH;
+    return { W * 0.5f + fx * (x - 0.5f) * 2.0f / Z, horizon + fy * (camH - z) / Z };
+}
+
+void Sand::analyse()
+{
+    const int w = proc.scopeWrite.load (std::memory_order_acquire);
+    double rms = 0;
+    for (int i = 0; i < kFFT; ++i)
+    {
+        const float v = proc.scope[(size_t) ((w - kFFT + i) & (DeltaCompProcessor::kScopeSize - 1))];
+        rms += (double) v * v;
+        spec[(size_t) i] = v * (0.5 - 0.5 * std::cos (2 * MathConstants<double>::pi * i / kFFT));
+    }
+    // radix-2 FFT
+    const size_t n = (size_t) kFFT;
+    for (size_t i = 1, j = 0; i < n; ++i) { size_t bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) std::swap (spec[i], spec[j]); }
+    for (size_t len = 2; len <= n; len <<= 1)
+    {
+        const std::complex<double> wl (std::cos (-2 * MathConstants<double>::pi / (double) len), std::sin (-2 * MathConstants<double>::pi / (double) len));
+        for (size_t i = 0; i < n; i += len) { std::complex<double> wv (1); for (size_t j = 0; j < len / 2; ++j) { auto u = spec[i + j], v = spec[i + j + len / 2] * wv; spec[i + j] = u + v; spec[i + j + len / 2] = u - v; wv *= wl; } }
+    }
+    rms = std::sqrt (rms / kFFT);
+    const double fs = proc.getSampleRate() > 0 ? proc.getSampleRate() : 48000.0;
+    double tot = 1e-20; std::array<double, kModes> e {};
+    for (int k = 1; k < kFFT / 2; ++k)
+    {
+        const double f = k * fs / kFFT;
+        if (f < 30) continue;
+        const int band = jlimit (0, kModes - 1, (int) (std::log2 (f / 40.0) * kModes / 9.0));
+        const double m = std::norm (spec[(size_t) k]);
+        e[(size_t) band] += m; tot += m;
+    }
+    for (int bnd = 0; bnd < kModes; ++bnd) target[(size_t) bnd] = (float) std::sqrt (e[(size_t) bnd] / tot);
+    const double db = 20 * std::log10 (rms + 1e-12);
+    shakeTarget = (float) jlimit (0.0, 1.0, (db + 60.0) / 60.0);
+}
+
+void Sand::stepPlate()
+{
+    analyse();
+    for (int k = 0; k < kModes; ++k) energy[(size_t) k] += 0.15f * (target[(size_t) k] - energy[(size_t) k]);
+    shakeLevel += (shakeTarget > shakeLevel ? 0.4f : 0.06f) * (shakeTarget - shakeLevel);
+    static const int modes[kModes][2] = { { 1, 2 }, { 1, 3 }, { 2, 3 }, { 1, 4 }, { 3, 4 }, { 2, 5 }, { 3, 5 }, { 4, 7 } };
+    static float cx[8][kGW], cy[8][kGH]; static bool init = false;
+    if (! init)
+    {
+        for (int m = 1; m < 8; ++m)
+        {
+            for (int i = 0; i < kGW; ++i) cx[m][i] = std::cos (m * MathConstants<float>::pi * (i + 0.5f) / kGW);
+            for (int j = 0; j < kGH; ++j) cy[m][j] = std::cos (m * MathConstants<float>::pi * (j + 0.5f) / kGH);
+        }
+        init = true;
+    }
+    for (int j = 0; j < kGH; ++j)
+        for (int i = 0; i < kGW; ++i)
+        {
+            float a = 0;
+            for (int k = 0; k < kModes; ++k) { const int m1 = modes[k][0], m2 = modes[k][1]; a += energy[(size_t) k] * (cx[m1][i] * cy[m2][j] - cx[m2][i] * cy[m1][j]); }
+            field[(size_t) (j * kGW + i)] = std::abs (a);
+        }
+    // gain reduction presses the plate: compression damps the jumps (the sand stays lower and denser)
+    const float damp = 1.0f / (1.0f + 0.08f * grNow);
+    std::normal_distribution<float> N (0, 1); std::uniform_real_distribution<float> U (0, 1);
+    const float shake = 0.0006f + 0.02f * shakeLevel * shakeLevel;
+    for (int i = 0; i < kGrains; ++i)
+    {
+        float& x = gx[(size_t) i]; float& y = gy[(size_t) i]; float& z = gz[(size_t) i]; float& v = gv[(size_t) i];
+        const int ci = jlimit (0, kGW - 1, (int) (x * kGW)), cj = jlimit (0, kGH - 1, (int) (y * kGH));
+        const float f = field[(size_t) (cj * kGW + ci)];
+        const float amp = f * shake + 0.00015f;
+        if (z <= 0.0f)
+        {   // on the plate: kicked up where it vibrates
+            z = 0.0f;
+            if (U (rng) < f * shakeLevel * 0.9f) v = (0.004f + 0.05f * f * shakeLevel * U (rng)) * damp;
+        }
+        if (z > 0.0f || v > 0.0f) { z += v; v -= 0.0045f; if (z < 0.0f) { z = 0.0f; v = 0.0f; } }
+        x += amp * N (rng); y += amp * N (rng) * 1.5f;
+        if (x < 0) x = -x;
+        if (x > 1) x = 2 - x;
+        if (y < 0) y = -y;
+        if (y > 1) y = 2 - y;
+        x = jlimit (0.0f, 1.0f, x); y = jlimit (0.0f, 1.0f, y);
+    }
+}
+
+void Sand::renderPlate()
+{
+    const int W = plate.getWidth(), H = plate.getHeight();
+    Image::BitmapData bd (plate, Image::BitmapData::readWrite);
+    for (int y = 0; y < H; ++y) { auto* row = bd.getLinePointer (y); for (int x = 0; x < W * bd.pixelStride; ++x) row[x] = (uint8) ((row[x] * 140) >> 8); }
+    auto put = [&] (int px, int py, uint8 v) {
+        if (px < 0 || py < 0 || px >= W || py >= H) return;
+        auto* q = bd.getPixelPointer (px, py); for (int c = 0; c < bd.pixelStride; ++c) q[c] = jmax (q[c], v);
+    };
+    for (int i = 0; i < kGrains; ++i)
+    {
+        const float x = gx[(size_t) i], y = gy[(size_t) i], z = gz[(size_t) i];
+        const float depth = 0.35f + 0.65f * y;                       // far grains dimmer and smaller
+        const auto p = project (x, y, z);
+        const int px = (int) p.x, py = (int) p.y;
+        if (z > 0.0f) { const auto s = project (x, y, 0.0f); put ((int) s.x, (int) s.y, (uint8) (40 * depth)); }   // shadow on the plate
+        const uint8 v = (uint8) jlimit (0.0f, 255.0f, (150.0f + (float) (i % 90)) * depth + 60.0f * jmin (1.0f, z * 12.0f));
+        put (px, py, v);
+        if (y > 0.55f) { put (px + 1, py, v); if (y > 0.8f) { put (px, py + 1, v); put (px + 1, py + 1, v); } }
+    }
+}
+
 void Sand::push()
 {
     auto& e = proc.engine;
@@ -284,99 +465,64 @@ void Sand::push()
     up[(size_t) head] = e.meterA.load();
     lim[(size_t) head] = e.meterLim.load();
     amb[(size_t) head] = e.meterAmb.load();
+    grNow = -down[(size_t) head] - lim[(size_t) head];
     head = (head + 1) % kCols; ++frame;
+    stepPlate(); renderPlate();
 }
 
 void Sand::paint (Graphics& g)
 {
     g.fillAll (kBg);
-    const auto p = proc.currentParams();
     const float W = (float) getWidth(), H = (float) getHeight();
     g.setColour (kDim); g.drawRect (getLocalBounds().toFloat(), 1.0f);
-    const float x0 = 38.0f, xr = W - 150.0f;      // right part: dynamic range spread
+    const float x0 = 38.0f, xr = W - 150.0f;
 
-    // scale
-    g.setFont (mono (9.5f));
-    for (int db = 0; db >= (int) kBottom; db -= 6)
+    // the plate in perspective: edge, a faint grid, then the sand
     {
-        const float y = yOf ((float) db);
-        g.setColour (kFg.withAlpha (0.06f)); g.drawHorizontalLine ((int) y, x0, xr);
-        g.setColour (kFg.withAlpha (0.35f)); g.drawText (String (db), 2, (int) y - 6, 30, 12, Justification::centredRight);
-    }
-    // thresholds
-    struct Th { float lufs; const char* name; bool on; };
-    const float dash[] = { 3.f, 5.f };
-    const Th th[] = { { (float) (p.target + p.upThr), "UPWARD", p.upOn }, { (float) (p.target + p.llThr), "BAS NIV.", p.llOn },
-                      { (float) (p.target + p.thr1), "SEUIL 1", p.dnOn }, { (float) std::max (p.target + p.thr1, p.target + p.thr2), "SEUIL 2", p.dnOn },
-                      { (float) (p.target + p.ambThr), "AMBIANCE", p.ambOn } };
-    for (auto& t : th)
-    {
-        if (! t.on) continue;
-        const float y = yOf (t.lufs);
-        g.setColour (kFg.withAlpha (0.35f)); g.drawDashedLine ({ x0, y, xr, y }, dash, 2, 1.0f);
-        g.setColour (kFg.withAlpha (0.55f)); g.setFont (mono (9.0f)); g.drawText (u8 (t.name), (int) xr - 84, (int) y - 12, 80, 11, Justification::centredRight);
-    }
-    const float yt = yOf ((float) p.target);
-    g.setColour (kFg); g.drawHorizontalLine ((int) yt, x0, xr);
-    g.setFont (mono (9.5f, true)); g.drawText ("CIBLE " + String (p.target, 1), (int) x0 + 4, (int) yt - 13, 110, 12, Justification::centredLeft);
-
-    // sand: input grains (grey, sparse) and output grains (white, dense), shivering every frame.
-    // More grains where it compresses, grains blown upward where the low level and the tails are lifted.
-    const float colW = (xr - x0) / kCols;
-    Random rnd ((int64) frame * 2654435761u);
-    for (int i = 0; i < kCols; ++i)
-    {
-        const int idx = (head + i) % kCols;
-        const float age = 0.25f + 0.75f * (float) i / kCols, x = x0 + i * colW;
-        const float li = in[(size_t) idx], lo = out[(size_t) idx];
-        if (li > kBottom - 6)
+        Graphics::ScopedSaveState ss (g);
+        g.addTransform (AffineTransform::translation (plateArea.getX(), plateArea.getY()));
+        Path edge;
+        const auto c0 = project (0, 0, 0), c1 = project (1, 0, 0), c2 = project (1, 1, 0), c3 = project (0, 1, 0);
+        edge.startNewSubPath (c0); edge.lineTo (c1); edge.lineTo (c2); edge.lineTo (c3); edge.closeSubPath();
+        g.setColour (Colour (0xff070707)); g.fillPath (edge);
+        g.setColour (kFg.withAlpha (0.05f));
+        for (int k = 1; k < 8; ++k)
         {
-            const float y = yOf (li);
-            for (int k = 0; k < 7; ++k)
-            {
-                g.setColour (kGrey.withAlpha (0.3f + 0.5f * age * rnd.nextFloat()));
-                g.fillRect (x + rnd.nextFloat() * colW, y + (rnd.nextFloat() + rnd.nextFloat() - 1.0f) * 5.0f, 1.3f, 1.3f);
-            }
+            const float t = (float) k / 8.0f;
+            g.drawLine (Line<float> (project (t, 0, 0), project (t, 1, 0)), 0.6f);
+            g.drawLine (Line<float> (project (0, t, 0), project (1, t, 0)), 0.6f);
         }
-        if (lo > kBottom - 6)
-        {
-            const float y = yOf (lo);
-            const float gr = -down[(size_t) idx], lift = up[(size_t) idx] + amb[(size_t) idx];
-            const int n = 10 + (int) (jmin (12.0f, gr) * 1.5f) + (int) (jmin (8.0f, lift) * 1.5f);
-            for (int k = 0; k < n; ++k)
-            {
-                float jy = (rnd.nextFloat() + rnd.nextFloat() - 1.0f) * (2.5f + 7.0f * (float) k / (float) n);
-                if (k % 3 == 0 && lift > 0.2f) jy -= rnd.nextFloat() * lift * 3.5f;
-                if (k % 4 == 1 && gr > 0.2f) jy += rnd.nextFloat() * gr * 1.5f;     // pressed down by compression
-                g.setColour (kFg.withAlpha (0.15f + 0.85f * age * rnd.nextFloat()));
-                g.fillRect (x + rnd.nextFloat() * colW, y + jy, 1.5f, 1.5f);
-            }
-        }
+        g.setColour (kFg.withAlpha (0.25f)); g.strokePath (edge, PathStrokeType (1.0f));
+        // front edge thickness: the plate is a slab
+        Path slab; slab.startNewSubPath (c3); slab.lineTo (c2); slab.lineTo (c2.translated (0, 6)); slab.lineTo (c3.translated (0, 6)); slab.closeSubPath();
+        g.setColour (Colour (0xff2a2a2a)); g.fillPath (slab);
+        g.setColour (kFg);
+        g.drawImageAt (plate, 0, 0, true);
     }
+    g.setColour (kFg); g.setFont (mono (12.0f, true));
+    g.drawText ("DELTA COMP", 12, 5, 200, 16, Justification::centredLeft);
 
     // gain strip: downward (B + C + D) under the line, upward (A) above, limiter as a bottom band
-    const float mid = H - 44.0f;
+    const float mid = H - 30.0f, colW = (xr - x0) / kCols;
     g.setColour (kFg.withAlpha (0.25f)); g.drawHorizontalLine ((int) mid, x0, xr);
     for (int i = 0; i < kCols; ++i)
     {
         const int idx = (head + i) % kCols;
-        const float dn = jmin (12.0f, -down[(size_t) idx]) * 2.4f, u = jmin (12.0f, up[(size_t) idx]) * 2.4f;
+        const float dn = jmin (12.0f, -down[(size_t) idx]) * 1.6f, u = jmin (12.0f, up[(size_t) idx]) * 1.6f;
         const float x = x0 + i * colW, w = jmax (1.0f, colW);
         if (dn > 0.05f) { g.setColour (kFg); g.fillRect (x, mid, w, dn); }
         if (u > 0.05f) { g.setColour (kGrey); g.fillRect (x, mid - u, w, u); }
-        const float l = jmin (6.0f, -lim[(size_t) idx]) * 1.5f;
+        const float l = jmin (6.0f, -lim[(size_t) idx]) * 1.2f;
         if (l > 0.05f) { g.setColour (kFg); g.fillRect (x, H - 3.0f - l, w, l); }
     }
     g.setColour (kGrey); g.setFont (mono (9.0f));
     g.drawText ("GR", 4, (int) mid - 6, 30, 12, Justification::centredRight);
-    g.drawText ("LIM", 4, (int) H - 15, 30, 12, Justification::centredRight);
-    g.setColour (kFg); g.setFont (mono (12.0f, true));
-    g.drawText ("DELTA COMP", (int) x0 + 4, 5, 200, 16, Justification::centredLeft);
-    g.setColour (kGrey); g.setFont (mono (9.5f));
-    g.drawText (u8 ("GRIS = ENTRÉE   BLANC = SORTIE"), (int) x0 + 140, 5, 300, 16, Justification::centredLeft);
+    g.drawText ("LIM", 4, (int) H - 13, 30, 12, Justification::centredRight);
 
     // dynamic range spread: two brackets, input and output, from the 10th to the 95th percentile
     g.setColour (kDim); g.drawVerticalLine ((int) xr + 6, 4.0f, H - 4.0f);
+    g.setFont (mono (8.5f)); g.setColour (kFg.withAlpha (0.35f));
+    for (int db = 0; db >= (int) kBottom; db -= 12) g.drawText (String (db), (int) xr + 8, (int) yOf ((float) db) - 6, 22, 12, Justification::centredLeft);
     auto bracket = [&] (float cx, float lo, float hi, const String& name, bool bright)
     {
         g.setColour (bright ? kFg : kGrey); g.setFont (mono (9.5f, true));
@@ -604,7 +750,134 @@ void Meter::paint (Graphics& g)
 // ------------------------------------------------------------------ editor
 using K = ui::Control::Kind;
 
-DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor (p), sand (p), meter (p), proc (p)
+// ------------------------------------------------------------------ insert slot
+namespace
+{
+struct InsertWindow : DocumentWindow
+{
+    InsertWindow (const String& name, AudioProcessorEditor* ed, std::function<void()> onClose)
+        : DocumentWindow (name, Colours::black, DocumentWindow::closeButton), closed (std::move (onClose))
+    {
+        setUsingNativeTitleBar (true);
+        setContentOwned (ed, true);
+        setResizable (ed->isResizable(), false);
+        centreWithSize (getWidth(), getHeight());
+        setVisible (true);
+    }
+    void closeButtonPressed() override { if (closed) MessageManager::callAsync (closed); }
+    std::function<void()> closed;
+};
+
+Array<File> installedPlugins()
+{
+    Array<File> dirs, out;
+   #if JUCE_MAC
+    dirs.add (File ("/Library/Audio/Plug-Ins/VST3")); dirs.add (File ("~/Library/Audio/Plug-Ins/VST3"));
+    dirs.add (File ("/Library/Audio/Plug-Ins/Components")); dirs.add (File ("~/Library/Audio/Plug-Ins/Components"));
+   #elif JUCE_WINDOWS
+    dirs.add (File::getSpecialLocation (File::globalApplicationsDirectory).getChildFile ("Common Files/VST3"));
+   #else
+    dirs.add (File ("~/.vst3")); dirs.add (File ("/usr/lib/vst3")); dirs.add (File ("/usr/local/lib/vst3"));
+   #endif
+    for (auto& d : dirs)
+        if (d.isDirectory())
+            for (auto& f : d.findChildFiles (File::findFilesAndDirectories, true, "*.vst3;*.component"))
+                if (! f.getFileNameWithoutExtension().containsIgnoreCase ("Delta Comp") && ! f.getParentDirectory().hasFileExtension ("vst3"))
+                    out.addIfNotAlreadyThere (f);
+    struct ByName { static int compareElements (const File& a, const File& b) { return a.getFileName().compareIgnoreCase (b.getFileName()); } } cmp;
+    out.sort (cmp);
+    return out;
+}
+}
+
+namespace ui
+{
+InsertSlot::InsertSlot (DeltaCompProcessor& p) : proc (p)
+{
+    addAndMakeVisible (pick); addAndMakeVisible (edit);
+    edit.setButtonText (u8 ("ÉDITEUR"));
+    pick.onClick = [this] { showMenu(); };
+    edit.onClick = [this] { openEditor(); };
+    proc.onInsertAboutToChange = [this] { closeWindow(); };
+    proc.onInsertChanged = [this] { refresh(); };
+    refresh();
+}
+
+InsertSlot::~InsertSlot()
+{
+    closeWindow();
+    proc.onInsertAboutToChange = nullptr; proc.onInsertChanged = nullptr;
+}
+
+void InsertSlot::refresh()
+{
+    const auto n = proc.insertName();
+    pick.setButtonText (n.isEmpty() ? u8 ("CHOISIR UN PLUGIN…") : n.toUpperCase());
+    edit.setEnabled (proc.getInsert() != nullptr && proc.getInsert()->hasEditor());
+    repaint();
+}
+
+void InsertSlot::closeWindow() { window.reset(); }
+
+void InsertSlot::openEditor()
+{
+    auto* ins = proc.getInsert();
+    if (ins == nullptr) return;
+    if (window != nullptr) { window->toFront (true); return; }
+    if (auto* ed = ins->createEditorIfNeeded())
+        window = std::make_unique<InsertWindow> (ins->getName(), ed, [this] { closeWindow(); });
+}
+
+void InsertSlot::showMenu()
+{
+    found = installedPlugins();
+    PopupMenu m;
+    for (int i = 0; i < found.size(); ++i)
+        m.addItem (i + 1, found[i].getFileNameWithoutExtension() + (found[i].hasFileExtension ("component") ? "  (AU)" : ""));
+    if (found.isEmpty()) m.addItem (-100, u8 ("aucun plugin trouvé"), false);
+    m.addSeparator();
+    m.addItem (1000, u8 ("Autre fichier…"));
+    m.addItem (1001, "Retirer", proc.getInsert() != nullptr);
+    m.showMenuAsync (PopupMenu::Options().withTargetComponent (&pick), [this] (int r)
+    {
+        String err;
+        if (r >= 1 && r <= found.size()) { if (! proc.loadInsertFile (found[r - 1], err)) error = err; else error.clear(); }
+        else if (r == 1001) { proc.clearInsert(); error.clear(); }
+        else if (r == 1000)
+        {
+            chooser = std::make_unique<FileChooser> ("Plugin (VST3 / AU)", File(), "*.vst3;*.component");
+            chooser->launchAsync (FileBrowserComponent::openMode | FileBrowserComponent::canSelectFiles | FileBrowserComponent::canSelectDirectories,
+                                  [this] (const FileChooser& fc)
+                                  {
+                                      const auto f = fc.getResult();
+                                      if (f == File()) return;
+                                      String e2; if (! proc.loadInsertFile (f, e2)) error = e2; else error.clear();
+                                      refresh();
+                                  });
+        }
+        refresh();
+    });
+}
+
+void InsertSlot::resized()
+{
+    auto r = getLocalBounds();
+    pick.setBounds (r.removeFromTop (24));
+    r.removeFromTop (6);
+    edit.setBounds (r.removeFromTop (22).withSizeKeepingCentre (jmin (110, r.getWidth()), 22));
+}
+
+void InsertSlot::paint (Graphics& g)
+{
+    g.setFont (mono (8.5f));
+    g.setColour (error.isNotEmpty() ? kFg : kGrey);
+    const auto lat = proc.getInsert() != nullptr ? proc.getInsert()->getLatencySamples() : 0;
+    const String t = error.isNotEmpty() ? error : proc.getInsert() != nullptr ? u8 ("latence compensée : ") + String (lat) + u8 (" éch.") : u8 ("VST3 ou AU, ex. Altiverb");
+    g.drawFittedText (t, getLocalBounds().removeFromBottom (14), Justification::centred, 1);
+}
+}
+
+DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor (p), sand (p), meter (p), insertSlot (p), proc (p)
 {
     setLookAndFeel (&look);
     addAndMakeVisible (content);
@@ -633,16 +906,19 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
                                                        { K::knob, "pkAtt", "ATTAQUE" }, { K::knob, "pkRel", "RELEASE" } }),
          [&e, &p, db] { return db (e.meterD.load()) + "  @ " + String (p.engine.peakThr(), 1); });
 
-    add (row2, new ui::Section (s, "AMBIANCE", "ambOn", 3, { { K::knob, "ambiance", "QUANTITÉ" }, { K::knob, "ambThr", "SEUIL" }, { K::knob, "ambRatio", "RATIO" },
+    add (row2, new ui::Section (s, "AMBIANCE · K-STEREO", "ambOn", 3, { { K::knob, "ambiance", "QUANTITÉ" }, { K::knob, "ambThr", "SEUIL" }, { K::knob, "ambRatio", "RATIO" },
                                                             { K::knob, "ambAtt", "ATTAQUE" }, { K::knob, "ambRel", "RELEASE" }, { K::knob, "ambPre", "PRÉ-DÉLAI" },
-                                                            { K::choice, "ambAuto", "AUTO RÉFL." }, { K::choice, "ambStage", "APRÈS" } }),
+                                                            { K::knob, "ambTr", "TRANSITOIRES" }, { K::choice, "ambAuto", "AUTO RÉFL." }, { K::choice, "ambStage", "APRÈS" } }),
          [&e, db] { return db (e.meterAmb.load()) + ui::u8 ("  réfl. ") + String (roundToInt (e.meterEr.load())) + " ms"; });
     add (row2, new ui::Section (s, "M/S", nullptr, 5, { { K::knob, "centre", "CENTRE" }, { K::knob, "centreFreq", "FRÉQ." }, { K::choice, "centreFilter", "FILTRE" },
                                                        { K::knob, "width", "LARGEUR" }, { K::knob, "sideLowCut", "LOW CUT S" },
-                                                       { K::choice, "sideSlope", "PENTE dB/oct" }, { K::toggle, "revOn", "REVERBE" }, { K::choice, "revTarget", "SUR" },
-                                                       { K::knob, "revSend", "ENVOI" }, { K::knob, "revDecay", "DURÉE" },
-                                                       { K::knob, "revPre", "PRÉ-DÉLAI" }, { K::choice, "revPreAuto", "PRE AUTO" }, { K::knob, "revDyn", "DYNAMIQUE" } }),
-         [&e] { return String ("REVERBE ") + (e.meterRev.load() < -90 ? String ("--") : String (e.meterRev.load(), 1) + " dB"); });
+                                                       { K::choice, "sideSlope", "PENTE dB/oct" }, { K::toggle, "revOn", "INSERT" }, { K::choice, "revTarget", "SUR" } }),
+         [this] { auto n = proc.insertName(); return String ("INSERT ") + (n.isEmpty() ? String ("--") : n.toUpperCase()); });
+    {
+        auto* ms = row2[1];
+        ms->extra = &insertSlot; ms->extraCell = 8; ms->extraSpan = 2;
+        ms->addAndMakeVisible (insertSlot);
+    }
     add (row2, new ui::Section (s, "LIMITEUR", "limOn", 3, { { K::knob, "ceiling", "PLAFOND" }, { K::knob, "limRel", "RELEASE" }, { K::knob, "look", "LOOKAHEAD" },
                                                             { K::knob, "linkT", "LIEN TRANS." }, { K::knob, "linkR", "LIEN REL." }, { K::choice, "os", "OVERSAMPLING" },
                                                             { K::choice, "truePeak", "TRUE PEAK" } }),

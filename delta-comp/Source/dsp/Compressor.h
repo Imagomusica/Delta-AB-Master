@@ -330,7 +330,7 @@ struct Params
     // Ambiance (ambient retrieval), placed after stage 1 = A, 2 = B, 3 = C, 4 = D
     bool ambOn = false; double ambiance = 0.5;   // amount 0..1
     double ambThr = -20, ambRatio = 2, ambAtt = 20, ambRel = 400, ambPreMs = 20;
-    bool ambAuto = true; int ambStage = 3;
+    bool ambAuto = true; int ambStage = 3; double ambTr = 0.5;   // ambTr: transients removed from the lifted ambiance, 0..1
 
     // T transient shaper (Bittersweet spirit): -1 rounds the attacks off, +1 accentuates them
     double transient = 0.0; double trDurMs = 30.0;
@@ -408,7 +408,9 @@ public:
         }
         firRev.prepare (gfir.N, 0.0);
         ambHp.highpass (fs, 150.0); ambHpA.highpass (fs, 150.0);
-        ambRingA.assign ((size_t) (0.1 * fs) + 4, 0.0); ambRingG.assign (ambRingA.size(), 1.0);
+        ambRingA.assign ((size_t) (0.1 * fs) + 4, 0.0); ambRingG.assign (ambRingA.size(), 1.0); ambRingT.assign (ambRingA.size(), 0.0);
+        insRing[0].assign ((size_t) (2 * fs) + 8, 0.0); insRing[1].assign (insRing[0].size(), 0.0); insW = 0;
+        laAmb = std::round (0.002 * fs); cAmbDuck = std::exp (-1.0 / (0.06 * fs));
         ap1A.prepare ((int) std::lround (0.0053 * fs), 0.6); ap2A.prepare ((int) std::lround (0.0079 * fs), 0.55);
         ambRing.assign ((size_t) (0.1 * fs) + 4, 0.0); ambW = 0; ambD = (double) std::lround (0.02 * fs);
         ambKw.prepare (fs); verb.prepare (fs);
@@ -432,7 +434,7 @@ public:
             gA[c] = gB[c] = gC1[c] = gC2[c] = gD[c] = gDen[c] = 0; relC1[c] = relC2[c] = relD[c] = false; optoMem[c] = 0;
         }
         for (size_t c = 0; c < (size_t) kMaxCh; ++c) { xDelay[c].reset(); firMain[c].reset (1.0); firAmbC[c].reset (0.0); limFir[c].reset (1.0); }
-        firRev.reset (0.0); ambHpA.reset(); ap1A.reset(); ap2A.reset(); std::fill (ambRingA.begin(), ambRingA.end(), 0.0); std::fill (ambRingG.begin(), ambRingG.end(), 1.0); ambWA = 0;
+        firRev.reset (0.0); ambHpA.reset(); ap1A.reset(); ap2A.reset(); std::fill (ambRingA.begin(), ambRingA.end(), 0.0); std::fill (ambRingG.begin(), ambRingG.end(), 1.0); std::fill (ambRingT.begin(), ambRingT.end(), 0.0); for (auto& v : insRing) std::fill (v.begin(), v.end(), 0.0); ambDuck = 0; ambWA = 0;
         ambHp.reset(); std::fill (ambRing.begin(), ambRing.end(), 0.0); ap1.reset(); ap2.reset(); ambKw.reset(); verb.reset(); lvlA = -100;
         ambRms = 1e-10; gAmb = 0; frameAcc = 0; frameCount = 0; frameIdx = 0; recLeft = 0; sinceOnset = 100000;
         frames.fill (-120); erMs = 20; meterEr.store ((float) erMs);
@@ -527,7 +529,10 @@ public:
         const double mixT = std::clamp (p.mix, 0.0, 1.0), outT = dbToLin (p.outGainDb);
         double mRev = 0, mT = 0, mA = 0, mB = 0, mC = 0, mD = 0, mL = 1, mDen = 0, mAmb = 0, lvlC = -100;
         const int F = curOs;
-        for (int i = 0; i < n; ++i)
+        for (int i0 = 0; i0 < n; i0 += kChunk)
+        {
+        const int nb = std::min (kChunk, n - i0);
+        for (int i = i0; i < i0 + nb; ++i)
         {
             mixS = mixT + cSmooth * (mixS - mixT); outS = outT + cSmooth * (outS - outT);
             trS = p.transient + cSmooth * (trS - p.transient);
@@ -556,6 +561,7 @@ public:
                 trFast = a > trFast ? a + cTrFa * (trFast - a) : a + cTrFr * (trFast - a);
                 trSlow = trFast + cTrSa * (trSlow - trFast);   // slow = fast envelope smoothed: equal on steady tones
                 const double tr = std::clamp (linToDb (trFast + 1e-9) - linToDb (trSlow + 1e-9), 0.0, 12.0);
+                trDb = tr;
                 const double g = trS * tr;
                 mT = std::abs (g) > std::abs (mT) ? g : mT;
                 if (std::abs (g) > 1e-6) { const double gl = dbToLin (g); for (int c = 0; c < C; ++c) { s[c] *= gl; mulGain (c, gl); } }
@@ -665,39 +671,78 @@ public:
                 const size_t R = ambRingA.size(), rd = (ambWA + R - (size_t) ambD) % R;
                 ambRingA[ambWA] = ambHpA.process (0.5 * (xd[0] - xd[1]));
                 ambRingG[ambWA] = 0.5 * (gPre[0] + gPre[1]);
+                ambRingT[ambWA] = trDb;
                 const double del = ambRingA[rd], gDel = ambRingG[rd];
+                // transients out of the lifted ambiance: the transient measure, read 2 ms ahead of the pre-delayed
+                // ambiance, holds a fast-attack / 60 ms release duck (smeared attacks of the decorrelator included)
+                const double tAhead = ambRingT[(ambWA + R - (size_t) std::max (0.0, ambD - laAmb)) % R];
+                ambDuck = tAhead > ambDuck ? tAhead : tAhead + cAmbDuck * (ambDuck - tAhead);
+                const double kDuck = dbToLin (-p.ambTr * 2.5 * ambDuck);
                 ambWA = (ambWA + 1) % R;
                 const double e = ap2A.process (ap1A.process (del));
                 double ka[kMaxCh] {};
                 for (int c = 0; c < 2; ++c)
                 {
                     if (same && c == 1) { ka[1] = ka[0]; continue; }
-                    ka[c] = firAmbC[(size_t) c].process (outS * mixS * mk * gDel * ambK * gPost[c], gfir.h);
+                    ka[c] = firAmbC[(size_t) c].process (outS * mixS * mk * gDel * ambK * kDuck * gPost[c], gfir.h);
                 }
                 y[0] += ka[0] * e; y[1] -= ka[1] * e;
             }
 
-            // M/S end section: width, discreet tail reverb on Mid / Side, sent mostly at low level
-            if (C == 2 && (p.revOn || std::abs (p.widthDb) > 1e-6 || std::abs (p.centreDb) > 1e-6 || p.sideLowCut > 0))
+            // M/S end section: width, centre level / filter, side low cut
+            if (C == 2 && (std::abs (p.widthDb) > 1e-6 || std::abs (p.centreDb) > 1e-6 || p.sideLowCut > 0))
             {
                 double m = 0.5 * (y[0] + y[1]), sd = 0.5 * (y[0] - y[1]);
                 sd *= widthS;
                 if (p.centreFilter == 0) m *= centreS; else m = centreEq.process (m);
                 if (p.sideLowCut > 0) sd = sideHp2.process (sideHp1.process (sd));
-                if (p.revOn)
-                {
-                    const double low = std::clamp ((p.target + p.upThr - lvlA) / 12.0, 0.0, 1.0) * std::clamp ((lvlA - kSilenceLufs) / 10.0, 0.0, 1.0);
-                    revSendS = (1.0 - p.revDyn + p.revDyn * low) * dbToLin (p.revSendDb) + cRevSend * (revSendS - (1.0 - p.revDyn + p.revDyn * low) * dbToLin (p.revSendDb));
-                    mRev = std::max (mRev, revSendS);
-                    verb.setPreDelay (p.revPreAuto ? erMs : p.revPreMs);
-                    const double in = p.revTarget == 0 ? m : p.revTarget == 1 ? sd : m + sd;
-                    double ra = 0, rb = 0;
-                    verb.process (in * firRev.process (revSendS, gfir.h), ra, rb);
-                    if (p.revTarget == 0) m += ra; else if (p.revTarget == 1) sd += ra; else { m += ra; sd += rb; }
-                }
                 y[0] = m + sd; y[1] = m - sd;
             }
 
+            for (int c = 0; c < C; ++c) yBuf[(size_t) c][(size_t) (i - i0)] = y[c];
+        }
+
+        // insert (external plugin, e.g. a reverb) on Mid, Side or L/R, before the limiter. The part of M/S that does
+        // not go through it is delayed by the plugin's latency, and so is everything while the insert is off.
+        if (const int lat = insLat.load (std::memory_order_relaxed); lat > 0 || insertFn != nullptr)
+        {
+            const size_t R = insRing[0].size();
+            const bool run = insertFn != nullptr && C == 2 && p.revOn;
+            double dl[kChunk], dr[kChunk];
+            for (int j = 0; j < nb; ++j)
+            {
+                insRing[0][insW] = yBuf[0][(size_t) j]; insRing[1][insW] = C == 2 ? yBuf[1][(size_t) j] : 0.0;
+                const size_t rd = (insW + R - (size_t) std::min (lat, (int) R - 1)) % R;
+                dl[j] = insRing[0][rd]; dr[j] = insRing[1][rd]; insW = (insW + 1) % R;
+            }
+            if (run)
+            {
+                auto& a = insA; auto& b = insB;
+                for (int j = 0; j < nb; ++j)
+                {
+                    const double l = yBuf[0][(size_t) j], r = yBuf[1][(size_t) j], m = 0.5 * (l + r), sd = 0.5 * (l - r);
+                    if (p.revTarget == 0) { a[(size_t) j] = m; b[(size_t) j] = m; }
+                    else if (p.revTarget == 1) { a[(size_t) j] = sd; b[(size_t) j] = -sd; }
+                    else { a[(size_t) j] = l; b[(size_t) j] = r; }
+                }
+                insertFn (insertCtx, a.data(), b.data(), nb);
+                for (int j = 0; j < nb; ++j)
+                {
+                    double mo = 0.5 * (dl[j] + dr[j]), so = 0.5 * (dl[j] - dr[j]);   // delayed, untouched part
+                    if (p.revTarget == 0) mo = 0.5 * (a[(size_t) j] + b[(size_t) j]);
+                    else if (p.revTarget == 1) so = 0.5 * (a[(size_t) j] - b[(size_t) j]);
+                    else { mo = 0.5 * (a[(size_t) j] + b[(size_t) j]); so = 0.5 * (a[(size_t) j] - b[(size_t) j]); }
+                    yBuf[0][(size_t) j] = mo + so; yBuf[1][(size_t) j] = mo - so;
+                }
+            }
+            else
+                for (int j = 0; j < nb; ++j) { yBuf[0][(size_t) j] = dl[j]; if (C == 2) yBuf[1][(size_t) j] = dr[j]; }
+        }
+
+        for (int i = i0; i < i0 + nb; ++i)
+        {
+            double y[kMaxCh] {};
+            for (int c = 0; c < C; ++c) y[c] = yBuf[(size_t) c][(size_t) (i - i0)];
             // E: limiter
             double o[kMaxCh] {};
             if (F > 1)
@@ -742,6 +787,7 @@ public:
             outFast = (C == 1 ? 2 * op : op) + cFast * (outFast - (C == 1 ? 2 * op : op));
             if (C == 1) { acc.inPeak[1] = acc.inPeak[0]; acc.inSumSq[1] = acc.inSumSq[0]; }
             loudnessSample (op);
+        }
         }
         if (resetIntegrated.exchange (false)) resetLoudness();
         meterLevel.store ((float) lvlC);
@@ -970,7 +1016,20 @@ private:
     // audio path (the gains computed on the control path, band-limited by the gain FIR, applied to the delayed input)
     GainFir gfir; std::array<GainFir, 4> gfirOs; int limTail = 16; std::array<FirLine, kMaxCh> firMain, firAmbC, limFir; FirLine firRev;
     std::array<Delay, kMaxCh> xDelay;
-    Biquad ambHpA; Allpass ap1A, ap2A; std::vector<double> ambRingA, ambRingG; size_t ambWA = 0;
+    Biquad ambHpA; Allpass ap1A, ap2A; std::vector<double> ambRingA, ambRingG, ambRingT; size_t ambWA = 0;
+    double trDb = 0, ambDuck = 0, laAmb = 96, cAmbDuck = 0.9997;
+    static constexpr int kChunk = 256;
+    std::array<std::array<double, kChunk>, kMaxCh> yBuf {};
+    std::array<double, kChunk> insA {}, insB {};
+public:
+    // external insert (plugin host side): processes two channels in place, n <= kChunk, on the audio thread
+    using InsertFn = void (*) (void* ctx, double* a, double* b, int n);
+    void setInsert (InsertFn f, void* ctx) { insertFn = f; insertCtx = ctx; }
+    void setInsertLatency (int samples) { insLat.store (std::clamp (samples, 0, (int) insRing[0].size() - 1)); }
+    static constexpr int maxInsertBlock() { return kChunk; }
+private:
+    InsertFn insertFn = nullptr; void* insertCtx = nullptr;
+    std::array<std::vector<double>, 2> insRing; size_t insW = 0; std::atomic<int> insLat { 0 };
     double ambK = 0; bool ambUsed = false;
     std::vector<double> ambRing; size_t ambW = 0; double ambD = 960, ambRms = 1e-10, gAmb = 0;
     double cAmbA = 0, cAmbR = 0, cAmbWin = 0;

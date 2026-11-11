@@ -6,6 +6,12 @@ DeltaCompProcessor::DeltaCompProcessor()
                                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "DeltaComp", createLayout())
 {
+   #if JUCE_PLUGINHOST_VST3
+    formats.addFormat (new juce::VST3PluginFormat());
+   #endif
+   #if JUCE_PLUGINHOST_AU && JUCE_MAC
+    formats.addFormat (new juce::AudioUnitPluginFormat());
+   #endif
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLayout()
@@ -82,6 +88,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     bo ("ambAuto", "Ambiance auto",    true);
     fl ("ambPre",  "Ambiance pré-délai", 2.f,  80.f,  20.f, 0.1f, 20.f,  "ms", 1);
     ch ("ambStage","Ambiance après",   { "UPWARD", "BAS NIV.", "DOUBLE", "PEAK" }, 2);
+    fl ("ambTr",   "Ambiance transitoires", 0.f, 100.f, 50.f, 1.f, 0,   "%", 0);
     // M/S
     fl ("width",   "Largeur",           -6.f,   6.f,   0.f, 0.1f, 0,     "dB", 1);
     fl ("centre",  "Centre",            -6.f,   6.f,   0.f, 0.1f, 0,     "dB", 1);
@@ -89,8 +96,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     fl ("centreFreq", "Fréquence centre", 20.f, 20000.f, 1000.f, 1.f, 1000.f, "Hz", 0);
     fl ("sideLowCut", "Low cut side",    0.f, 300.f,   0.f, 1.f, 0,      "Hz", -1);   // 0 = OFF
     ch ("sideSlope", "Pente",          { "6", "12", "24" }, 1);
-    bo ("revOn",   "Réverbe active",   false);
-    ch ("revTarget","Réverbe sur",     { "MID", "SIDE", "M+S" }, 1);
+    bo ("revOn",   "Insert actif",     false);
+    ch ("revTarget","Insert sur",      { "MID", "SIDE", "M+S" }, 1);
     fl ("revSend", "Réverbe envoi",    -48.f,   0.f, -24.f, 0.1f, 0,     "dB", 1);
     fl ("revDecay","Réverbe durée",    0.3f,   6.f,  1.8f, 0.01f, 1.5f,  "s", 2);
     fl ("revPre",  "Réverbe pré-délai",  0.f,  80.f,  20.f, 0.1f, 20.f,  "ms", 1);
@@ -121,7 +128,7 @@ dcomp::Params DeltaCompProcessor::currentParams() const
     p.thr2 = pv ("thr2"); p.ratio2 = pv ("ratio2"); p.att2 = pv ("att2"); p.rel2 = pv ("rel2"); p.hyst = pv ("hyst");
     p.pkOn = pb ("pkOn"); p.crest = pv ("crest"); p.pkRatio = pv ("pkRatio"); p.pkAtt = pv ("pkAtt"); p.pkRel = pv ("pkRel");
     p.ambOn = pb ("ambOn"); p.ambiance = pv ("ambiance") * 0.01; p.ambThr = pv ("ambThr"); p.ambRatio = pv ("ambRatio");
-    p.ambAtt = pv ("ambAtt"); p.ambRel = pv ("ambRel"); p.ambAuto = pb ("ambAuto"); p.ambPreMs = pv ("ambPre"); p.ambStage = pi ("ambStage") + 1;
+    p.ambAtt = pv ("ambAtt"); p.ambRel = pv ("ambRel"); p.ambAuto = pb ("ambAuto"); p.ambPreMs = pv ("ambPre"); p.ambTr = pv ("ambTr") * 0.01; p.ambStage = pi ("ambStage") + 1;
     p.widthDb = pv ("width"); p.centreDb = pv ("centre"); p.centreFilter = pi ("centreFilter"); p.centreFreq = pv ("centreFreq");
     p.sideLowCut = pv ("sideLowCut"); p.sideSlope = pi ("sideSlope") == 0 ? 6 : pi ("sideSlope") == 1 ? 12 : 24;
     p.revOn = pb ("revOn"); p.revTarget = pi ("revTarget"); p.revSendDb = pv ("revSend"); p.revDecay = pv ("revDecay");
@@ -131,12 +138,88 @@ dcomp::Params DeltaCompProcessor::currentParams() const
     return p;
 }
 
-void DeltaCompProcessor::prepareToPlay (double sampleRate, int)
+void DeltaCompProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    sr = sampleRate; blockSize = juce::jmax (samplesPerBlock, dcomp::Engine::maxInsertBlock());
     engine.prepare (sampleRate, juce::jmax (1, getTotalNumInputChannels()));
     engine.setParams (currentParams());
     engine.reset();
-    setLatencySamples (engine.latency());
+    engine.setInsert (&DeltaCompProcessor::insertCallback, this);
+    {
+        const juce::SpinLock::ScopedLockType l (insertLock);
+        if (insert != nullptr) insert->prepareToPlay (sr, blockSize);
+    }
+    updateLatency();
+}
+
+void DeltaCompProcessor::updateLatency()
+{
+    const int il = insert != nullptr ? insert->getLatencySamples() : 0;
+    insertLatency = il;
+    engine.setInsertLatency (il);
+    setLatencySamples (engine.latency() + il);
+}
+
+void DeltaCompProcessor::insertCallback (void* ctx, double* a, double* b, int n)
+{
+    auto& self = *static_cast<DeltaCompProcessor*> (ctx);
+    const juce::SpinLock::ScopedTryLockType l (self.insertLock);
+    if (! l.isLocked() || self.insert == nullptr) return;
+    auto& buf = self.insertBuf;
+    const int nc = juce::jmax (2, juce::jmax (self.insert->getTotalNumInputChannels(), self.insert->getTotalNumOutputChannels()));
+    if (buf.getNumChannels() < nc || buf.getNumSamples() < n) return;   // sized when loading: never allocate here
+    buf.clear();
+    for (int i = 0; i < n; ++i) { buf.setSample (0, i, (float) a[i]); buf.setSample (1, i, (float) b[i]); }
+    juce::AudioBuffer<float> view (buf.getArrayOfWritePointers(), nc, n);
+    self.insertMidi.clear();
+    self.insert->processBlock (view, self.insertMidi);
+    const bool stereoOut = self.insert->getTotalNumOutputChannels() >= 2;
+    for (int i = 0; i < n; ++i) { a[i] = (double) view.getSample (0, i); b[i] = (double) view.getSample (stereoOut ? 1 : 0, i); }
+}
+
+bool DeltaCompProcessor::loadInsert (const juce::PluginDescription& d, juce::String& error, const juce::MemoryBlock* state)
+{
+    auto inst = formats.createPluginInstance (d, sr, blockSize, error);
+    if (inst == nullptr) return false;
+    // stereo in / out when the plugin allows it
+    auto layout = inst->getBusesLayout();
+    if (layout.inputBuses.size() > 0) layout.inputBuses.getReference (0) = juce::AudioChannelSet::stereo();
+    if (layout.outputBuses.size() > 0) layout.outputBuses.getReference (0) = juce::AudioChannelSet::stereo();
+    inst->setBusesLayout (layout);
+    if (state != nullptr && state->getSize() > 0) inst->setStateInformation (state->getData(), (int) state->getSize());
+    inst->prepareToPlay (sr, blockSize);
+    const int nc = juce::jmax (2, juce::jmax (inst->getTotalNumInputChannels(), inst->getTotalNumOutputChannels()));
+    if (onInsertAboutToChange) onInsertAboutToChange();
+    std::unique_ptr<juce::AudioPluginInstance> old;
+    {
+        const juce::SpinLock::ScopedLockType l (insertLock);
+        insertBuf.setSize (nc, blockSize, false, true, false);
+        old = std::move (insert); insert = std::move (inst); insertDesc = d;
+    }
+    old.reset();
+    updateLatency();
+    if (onInsertChanged) onInsertChanged();
+    return true;
+}
+
+bool DeltaCompProcessor::loadInsertFile (const juce::File& f, juce::String& error)
+{
+    juce::OwnedArray<juce::PluginDescription> types;
+    for (auto* fmt : formats.getFormats()) if (fmt->fileMightContainThisPluginType (f.getFullPathName())) fmt->findAllTypesForFile (types, f.getFullPathName());
+    if (types.isEmpty()) { error = "Aucun plugin dans " + f.getFileName(); return false; }
+    for (auto* t : types) if (t->isInstrument == false) return loadInsert (*t, error);
+    return loadInsert (*types[0], error);
+}
+
+void DeltaCompProcessor::clearInsert()
+{
+    if (insert == nullptr) return;
+    if (onInsertAboutToChange) onInsertAboutToChange();
+    std::unique_ptr<juce::AudioPluginInstance> old;
+    { const juce::SpinLock::ScopedLockType l (insertLock); old = std::move (insert); }
+    old.reset();
+    updateLatency();
+    if (onInsertChanged) onInsertChanged();
 }
 
 bool DeltaCompProcessor::isBusesLayoutSupported (const BusesLayout& l) const
@@ -150,19 +233,54 @@ void DeltaCompProcessor::processAny (juce::AudioBuffer<T>& b)
 {
     juce::ScopedNoDenormals nd;
     engine.setParams (currentParams());
+    {   // the hosted plugin may change its latency (e.g. a convolution reverb's settings)
+        const juce::SpinLock::ScopedTryLockType l (insertLock);
+        if (l.isLocked() && insert != nullptr && insert->getLatencySamples() != insertLatency) updateLatency();
+    }
     const int ch = juce::jmin (b.getNumChannels(), getTotalNumInputChannels());
     engine.process (b.getArrayOfWritePointers(), ch, b.getNumSamples());
+    int w = scopeWrite.load (std::memory_order_relaxed);
+    for (int i = 0; i < b.getNumSamples(); ++i)
+    {
+        const double m = ch > 1 ? 0.5 * ((double) b.getSample (0, i) + (double) b.getSample (1, i)) : (double) b.getSample (0, i);
+        scope[(size_t) (w & (kScopeSize - 1))] = (float) m; ++w;
+    }
+    scopeWrite.store (w, std::memory_order_release);
 }
 
 void DeltaCompProcessor::getStateInformation (juce::MemoryBlock& d)
 {
-    if (auto xml = apvts.copyState().createXml()) copyXmlToBinary (*xml, d);
+    if (auto xml = apvts.copyState().createXml())
+    {
+        if (insert != nullptr)
+        {
+            auto* ins = xml->createNewChildElement ("INSERT");
+            ins->addChildElement (insertDesc.createXml().release());
+            juce::MemoryBlock st; insert->getStateInformation (st);
+            ins->setAttribute ("state", st.toBase64Encoding());
+        }
+        copyXmlToBinary (*xml, d);
+    }
 }
 
 void DeltaCompProcessor::setStateInformation (const void* data, int size)
 {
-    if (auto xml = getXmlFromBinary (data, size))
-        if (xml->hasTagName (apvts.state.getType())) apvts.replaceState (juce::ValueTree::fromXml (*xml));
+    auto xml = getXmlFromBinary (data, size);
+    if (xml == nullptr || ! xml->hasTagName (apvts.state.getType())) return;
+    std::unique_ptr<juce::XmlElement> ins;
+    if (auto* e = xml->getChildByName ("INSERT")) { ins = std::make_unique<juce::XmlElement> (*e); xml->removeChildElement (e, true); }
+    apvts.replaceState (juce::ValueTree::fromXml (*xml));
+    auto restore = [this, ins = std::shared_ptr<juce::XmlElement> (std::move (ins))]
+    {
+        if (ins == nullptr) { clearInsert(); return; }
+        juce::PluginDescription d;
+        if (auto* de = ins->getChildByName ("PLUGIN")) d.loadFromXml (*de);
+        juce::MemoryBlock st; st.fromBase64Encoding (ins->getStringAttribute ("state"));
+        juce::String err; loadInsert (d, err, &st);
+    };
+    // plugins are created on the message thread
+    if (juce::MessageManager::getInstance()->isThisTheMessageThread()) restore();
+    else juce::MessageManager::callAsync (restore);
 }
 
 juce::AudioProcessorEditor* DeltaCompProcessor::createEditor() { return new DeltaCompEditor (*this); }

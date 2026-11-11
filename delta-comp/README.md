@@ -27,6 +27,13 @@ Les seuils des étages RMS sont en LU relatifs à la cible : si tu changes la ci
 
 Latence constante : 909 échantillons à 48 kHz (environ 19 ms), quels que soient l'oversampling et le lookahead.
 
+### Insert (VST3 / AU)
+
+Dans la section M/S, un insert accueille un plugin externe (Altiverb ou autre), sur Mid, Side ou L/R, avant le limiteur.
+La partie non traitée est retardée de la latence du plugin, qui est ajoutée à celle annoncée à l'hôte. Le plugin et son
+état sont sauvegardés avec le projet. AMBIANCE · K-STEREO a un bouton TRANSITOIRES qui retire les attaques de
+l'ambiance remontée (−26 dB sur les attaques, queues à ±0.4 dB).
+
 ### Zéro aliasing, zéro smearing
 
 Les gains sont calculés sur un chemin de contrôle, puis tous réunis en un seul gain par canal (étages, densité,

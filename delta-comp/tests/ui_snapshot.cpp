@@ -16,6 +16,15 @@ int main (int argc, char** argv)
     ed->setSize (DeltaCompEditor::kW, DeltaCompEditor::kH);
     p->setProcessingPrecision (juce::AudioProcessor::doublePrecision);
     p->prepareToPlay (48000, 400);
+    if (argc > 2)
+    {   // optional: host a plugin in the insert, check latency and a state round trip
+        juce::String err;
+        const bool ok = proc.loadInsertFile (juce::File (juce::String (argv[2])), err);
+        std::printf ("insert %s: %s, latency %d (engine %d)\n", ok ? "loaded" : "FAILED", (ok ? proc.insertName() : err).toRawUTF8(), p->getLatencySamples(), proc.engine.latency());
+        proc.apvts.getParameter ("revOn")->setValueNotifyingHost (1.0f);
+        juce::MemoryBlock st; p->getStateInformation (st); proc.clearInsert(); p->setStateInformation (st.getData(), (int) st.getSize());
+        std::printf ("state round trip: insert %s\n", proc.insertName().toRawUTF8());
+    }
     juce::AudioBuffer<double> b (2, 400); juce::MidiBuffer midi; juce::Random rnd (3);
     double tail = 0; long n = 0;
     for (int col = 0; col < ui::Sand::kCols; ++col)

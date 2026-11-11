@@ -1,6 +1,8 @@
 #pragma once
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "PluginProcessor.h"
+#include <complex>
+#include <random>
 
 namespace ui
 {
@@ -50,12 +52,34 @@ struct Section : juce::Component
     juce::OwnedArray<Control> controls;
     std::function<juce::String()> readout;
     juce::String shown;
+    juce::Component* extra = nullptr; int extraCell = 0, extraSpan = 1;   // a free component placed on grid cells
+    juce::Rectangle<int> cell (int i) const;
+};
+
+// Insert slot: pick a VST3 / AU (e.g. Altiverb) from the installed ones, open its own editor, remove it.
+struct InsertSlot : juce::Component
+{
+    explicit InsertSlot (DeltaCompProcessor&);
+    ~InsertSlot() override;
+    void resized() override;
+    void paint (juce::Graphics&) override;
+    void refresh();
+    void closeWindow();
+    void showMenu();
+    void openEditor();
+    DeltaCompProcessor& proc;
+    juce::TextButton pick, edit;
+    juce::String error;
+    std::unique_ptr<juce::DocumentWindow> window;
+    std::unique_ptr<juce::FileChooser> chooser;
+    juce::Array<juce::File> found;
 };
 
 // Big moving sand: detector level as grains scrolling in time, the thresholds, gain traces underneath.
 struct Sand : juce::Component
 {
-    explicit Sand (DeltaCompProcessor& p) : proc (p) {}
+    explicit Sand (DeltaCompProcessor& p);
+    void resized() override;
     void paint (juce::Graphics&) override;
     void push();
     float yOf (float lufs) const;
@@ -63,6 +87,21 @@ struct Sand : juce::Component
     static constexpr int kCols = 420;
     std::array<float, kCols> level {}, in {}, out {}, down {}, up {}, lim {}, amb {};
     int head = 0; unsigned frame = 0;
+    // 3D plate (Dune-like Chladni sand): the output spectrum picks the plate modes, its level shakes the grains,
+    // which jump off the plate, fall back and gather on the nodal lines; seen in perspective
+    static constexpr int kGrains = 14000, kGW = 120, kGH = 80, kModes = 8, kFFT = 4096;
+    std::vector<float> gx, gy, gz, gv;
+    std::array<float, kGW * kGH> field {};
+    std::array<float, kModes> energy {}, target {};
+    float shakeLevel = 0, shakeTarget = 0, grNow = 0;
+    std::vector<std::complex<double>> spec;
+    juce::Image plate;
+    std::mt19937 rng { 7 };
+    void analyse();
+    void stepPlate();
+    void renderPlate();
+    juce::Point<float> project (float x, float y, float z) const;
+    juce::Rectangle<float> plateArea;
     // dynamic range spread (10th..95th percentile of the 400 ms loudness over the last 30 s), set by the meter
     float inLo = -200, inHi = -200, outLo = -200, outHi = -200;
 };
@@ -102,6 +141,7 @@ public:
     ui::Sand sand;
     ui::Meter meter;
     juce::OwnedArray<ui::Section> row1, row2;
+    ui::InsertSlot insertSlot;
 private:
     DeltaCompProcessor& proc;
     ui::Look look;

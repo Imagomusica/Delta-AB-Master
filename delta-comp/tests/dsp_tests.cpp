@@ -255,27 +255,54 @@ int main()
         check (linToDb (a1 / a0) < -3, "transients -100%: attack peak lowered by more than 3 dB", linToDb (a1 / a0));
         check (std::abs (10 * std::log10 (b1 / b0)) < 1.0, "transients -100%: body within 1 dB", 10 * std::log10 (b1 / b0));
     }
-    {   // M/S tail reverb on Side: mono sum untouched, tails added only when quiet
-        Engine e; e.prepare (fs, 2); Params p = neutral(); p.revOn = true; p.revTarget = 1; p.revSendDb = -12; p.revDyn = 1; p.target = -14; p.upThr = -10;
-        e.setParams (p);
-        std::mt19937 rng (5); std::normal_distribution<double> nd (0, 1);
-        const int n = (int) (fs * 4);
-        std::vector<double> l ((size_t) n), r ((size_t) n), mono ((size_t) n), side ((size_t) n);
-        for (int i = 0; i < n; ++i) { const double a = i < n / 2 ? 0.3 : 0.003; l[(size_t) i] = a * nd (rng); r[(size_t) i] = a * nd (rng); }
-        for (int i = 0; i < n; ++i) { mono[(size_t) i] = l[(size_t) i] + r[(size_t) i]; side[(size_t) i] = l[(size_t) i] - r[(size_t) i]; }
-        for (int s = 0; s < n; s += 512) { double* io[2] = { &l[(size_t) s], &r[(size_t) s] }; e.process (io, 2, std::min (512, n - s)); }
-        double err = 0, addLoud = 0, addQuiet = 0, refLoud = 0, refQuiet = 0;
-        for (int i = e.latency(); i < n; ++i)
+    {   // external insert on Side / Mid: the other part of M/S stays untouched, blocks never exceed the limit
+        struct Fake { int maxN = 0; static void run (void* c, double* a, double* b, int n) { auto* f = (Fake*) c; f->maxN = std::max (f->maxN, n); for (int i = 0; i < n; ++i) { a[i] *= 0.5; b[i] *= 0.5; } } };
+        for (int target : { 0, 1 })
         {
-            const size_t k = (size_t) i, j = (size_t) (i - e.latency());
-            err = std::max (err, std::abs (l[k] + r[k] - mono[j]));
-            const double d = (l[k] - r[k]) - side[j];
-            if (i > n / 4 && i < n / 2) { addLoud += d * d; refLoud += side[j] * side[j]; }
-            if (i > 3 * n / 4) { addQuiet += d * d; refQuiet += side[j] * side[j]; }
+            Fake fk; Engine e; e.prepare (fs, 2); e.setInsert (&Fake::run, &fk);
+            Params p = neutral(); p.revOn = true; p.revTarget = target; e.setParams (p);
+            std::mt19937 rng (5); std::normal_distribution<double> nd (0, 1);
+            const int n = (int) fs;
+            std::vector<double> l ((size_t) n), r ((size_t) n), mono ((size_t) n), side ((size_t) n);
+            for (int i = 0; i < n; ++i) { l[(size_t) i] = 0.2 * nd (rng); r[(size_t) i] = 0.2 * nd (rng); mono[(size_t) i] = l[(size_t) i] + r[(size_t) i]; side[(size_t) i] = l[(size_t) i] - r[(size_t) i]; }
+            for (int s0 = 0; s0 < n; s0 += 1000) { double* io[2] = { &l[(size_t) s0], &r[(size_t) s0] }; e.process (io, 2, std::min (1000, n - s0)); }
+            double eKeep = 0, eHalf = 0;
+            for (int i = e.latency(); i < n; ++i)
+            {
+                const size_t k = (size_t) i, j = (size_t) (i - e.latency());
+                const double keep = target == 0 ? (l[k] - r[k]) - side[j] : (l[k] + r[k]) - mono[j];
+                const double half = target == 0 ? (l[k] + r[k]) - 0.5 * mono[j] : (l[k] - r[k]) - 0.5 * side[j];
+                eKeep = std::max (eKeep, std::abs (keep)); eHalf = std::max (eHalf, std::abs (half));
+            }
+            check (eKeep < 1e-9 && eHalf < 1e-9, target == 0 ? "insert on Mid: mid processed, side untouched" : "insert on Side: side processed, mono sum untouched", std::max (eKeep, eHalf));
+            check (fk.maxN <= Engine::maxInsertBlock(), "insert blocks never exceed the declared size", fk.maxN);
         }
-        check (err < 1e-9, "tail reverb on Side: mono sum unchanged", err);
-        const double rl = 10 * std::log10 (addLoud / refLoud), rq = 10 * std::log10 (addQuiet / refQuiet);
-        check (rq > rl + 15, "tail reverb dynamic: much more reverb relative to signal when quiet (dB)", rq - rl);
+    }
+    {   // ambiance transients: with the knob up, the lifted ambiance carries much less of the attacks, tails stay
+        auto run = [&] (double tr, double& att, double& tail) {
+            Engine e; e.prepare (fs, 2); Params p = neutral(); p.ambOn = true; p.ambiance = 1; p.ambThr = 0; p.ambRatio = 3;
+            p.ambAuto = false; p.ambPreMs = 10; p.ambStage = 3; p.ambTr = tr; e.setParams (p);
+            Engine e0; e0.prepare (fs, 2); Params p0 = p; p0.ambOn = false; e0.setParams (p0);
+            std::mt19937 rng (9); std::normal_distribution<double> nd (0, 1);
+            const int n = (int) (fs * 4), per = 24000;
+            std::vector<double> l ((size_t) n, 0.0), r ((size_t) n, 0.0);
+            for (int t0 = 0; t0 + per <= n; t0 += per)
+                for (int i = 0; i < per; ++i) { const double g = (i < 240 ? 0.6 : 0.0) + 0.03 * std::exp (-i / (0.3 * fs)); l[(size_t) (t0 + i)] += g * nd (rng); r[(size_t) (t0 + i)] += g * nd (rng); }
+            auto l0 = l, r0 = r;
+            for (int s0 = 0; s0 < n; s0 += 512) { double* io[2] = { &l[(size_t) s0], &r[(size_t) s0] }; e.process (io, 2, std::min (512, n - s0)); double* io0[2] = { &l0[(size_t) s0], &r0[(size_t) s0] }; e0.process (io0, 2, std::min (512, n - s0)); }
+            att = 0; tail = 0;
+            for (int t0 = per * 2; t0 + per <= n; t0 += per)
+                for (int i = 0; i < per; ++i)
+                {
+                    const size_t k = (size_t) (t0 + i + e.latency());
+                    if (k >= (size_t) n) break;
+                    const double d = (l[k] - r[k]) - (l0[k] - r0[k]);
+                    if (i < (int) (0.04 * fs)) att += d * d; else if (i > (int) (0.15 * fs) && i < (int) (0.45 * fs)) tail += d * d;
+                }
+        };
+        double a0, t0, a1, t1; run (0, a0, t0); run (1, a1, t1);
+        check (10 * std::log10 (a1 / a0) < -6, "ambiance transients 100%: attacks in the lifted ambiance down > 6 dB", 10 * std::log10 (a1 / a0));
+        check (std::abs (10 * std::log10 (t1 / t0)) < 1.5, "ambiance transients 100%: lifted tails within 1.5 dB", 10 * std::log10 (t1 / t0));
     }
     {   // M/S: centre +1.5 dB broadband on a mono signal, side low cut 24 dB/oct at 120 Hz on a 40 Hz side
         Engine e; e.prepare (fs, 2); Params p = neutral(); p.centreDb = 1.5; e.setParams (p);

@@ -34,7 +34,8 @@ target_include_directories(DeltaComp PRIVATE Source)
 
 target_compile_definitions(DeltaComp PUBLIC
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0
-    JUCE_DISPLAY_SPLASH_SCREEN=0)
+    JUCE_DISPLAY_SPLASH_SCREEN=0
+    JUCE_PLUGINHOST_VST3=1 $<$<PLATFORM_ID:Darwin>:JUCE_PLUGINHOST_AU=1>)
 
 if(MSVC)
     target_compile_options(DeltaComp PRIVATE /utf-8)

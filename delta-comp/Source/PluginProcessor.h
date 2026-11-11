@@ -34,9 +34,33 @@ public:
 
     juce::AudioProcessorValueTreeState apvts;
     dcomp::Engine engine;
+    // output (mid) for the sand view's spectrum, written by the audio thread
+    static constexpr int kScopeSize = 8192;
+    std::array<float, kScopeSize> scope {};
+    std::atomic<int> scopeWrite { 0 };
     dcomp::Params currentParams() const;
 
+    // External insert (VST3, e.g. a reverb) on Mid / Side / L-R, before the limiter.
+    // Loaded and released on the message thread; the audio thread only try-locks to use it.
+    bool loadInsert (const juce::PluginDescription&, juce::String& error, const juce::MemoryBlock* state = nullptr);
+    bool loadInsertFile (const juce::File& vst3, juce::String& error);
+    void clearInsert();
+    juce::AudioPluginInstance* getInsert() const { return insert.get(); }
+    juce::String insertName() const { return insert != nullptr ? insert->getName() : juce::String(); }
+    std::function<void()> onInsertChanged;        // editor refresh (message thread)
+    std::function<void()> onInsertAboutToChange;  // editor closes the plugin's window before it is released
+
 private:
+    static void insertCallback (void* ctx, double* a, double* b, int n);
+    void updateLatency();
+    juce::AudioPluginFormatManager formats;
+    std::unique_ptr<juce::AudioPluginInstance> insert;
+    juce::PluginDescription insertDesc;
+    juce::SpinLock insertLock;
+    juce::AudioBuffer<float> insertBuf;
+    juce::MidiBuffer insertMidi;
+    double sr = 48000; int blockSize = 512; int insertLatency = 0;
+
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     template <typename T> void processAny (juce::AudioBuffer<T>&);
     float pv (const char* id) const { return apvts.getRawParameterValue (id)->load(); }
