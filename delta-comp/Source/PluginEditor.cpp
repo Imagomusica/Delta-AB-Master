@@ -325,12 +325,30 @@ void Section::paint (Graphics& g)
         if (shown.contains ("@")) { g.setColour (kGrey); g.setFont (mono (8.5f)); g.drawText (shown.fromFirstOccurrenceOf ("@", true, false), (int) x1 - 70, (int) y - 13, 70, 11, Justification::centredRight); }
     }
     else if (shown.isNotEmpty()) { g.setColour (kGrey); g.setFont (mono (9.5f)); g.drawText (shown, 8, 26, getWidth() - 16, 12, Justification::centredLeft); }
+    if (hairpin)
+    {   // hairpin as printed in a score: opens to the right (crescendo) when louder, closes (diminuendo) when quieter
+        const float x0 = getWidth() * 0.38f, x1 = getWidth() - 60.0f, yc = 32.0f;
+        const float open = jlimit (0.0f, 1.0f, std::abs (hairShown) / 12.0f) * 6.0f;
+        g.setColour (std::abs (hairShown) < 0.2f ? kDim : kFg);
+        if (hairShown >= 0) { g.drawLine (x0, yc, x1, yc - open, 1.6f); g.drawLine (x0, yc, x1, yc + open, 1.6f); }
+        else { g.drawLine (x0, yc - open, x1, yc, 1.6f); g.drawLine (x0, yc + open, x1, yc, 1.6f); }
+        g.setFont (Font (FontOptions (Font::getDefaultSerifFontName(), 12.0f, Font::bold | Font::italic)));
+        g.drawText (hairShown >= 0 ? "cresc." : "dim.", (int) x0 - 46, 25, 44, 14, Justification::centredRight);
+        g.setFont (mono (9.5f, true));
+        g.drawText ((hairShown > 0.05f ? "+" : "") + String (hairShown, 1), (int) x1 + 4, 26, 52, 12, Justification::centredRight);
+    }
     const bool off = on != nullptr && ! on->button.getToggleState();
     if (off) { g.setColour (kBg.withAlpha (0.55f)); g.fillRect (r.withTrimmedTop (25).reduced (1)); }
 }
 
 void Section::tickGain (float dt)
 {
+    if (hairpin)
+    {
+        const float v = hairpin();
+        if (std::isfinite (v)) hairShown += (1.0f - std::exp (-dt / 0.5f)) * (v - hairShown);
+        if (! gain) repaint (0, 24, getWidth(), 16);
+    }
     if (! gain) return;
     const float v = gain();
     // meter ballistics: instant attack, 300 ms return; peak hold 1.5 s
@@ -1075,6 +1093,7 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
                                                             { K::knob, "linkT", "LIEN TRANS." }, { K::knob, "linkR", "LIEN REL." }, { K::choice, "os", "OVERSAMPLING" },
                                                             { K::choice, "truePeak", "TRUE PEAK" } }),
          [&e, db] { return db (e.meterLim.load()); });
+    row2.getLast()->hairpin = [&e] { const float i = e.meterIn.load(), o = e.meterOut.load(); return i > -70.0f && o > -70.0f ? o - i : 0.0f; };
     add (row1, new ui::Section (s, "TILT", "tiltOn", 2, { { K::knob, "tilt", "PENTE" }, { K::knob, "tiltPivot", "PIVOT" },
                                                          { K::choice, "tiltPhase", "PHASE" }, { K::choice, "tiltTarget", "SUR" }, { K::choice, "tiltPos", "POSITION" } }),
          [this] { return ui::u8 (proc.apvts.getRawParameterValue ("tiltPhase")->load() > 0.5f ? "MIN PHASE" : "LINÉAIRE"); });

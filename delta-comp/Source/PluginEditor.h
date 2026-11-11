@@ -54,6 +54,7 @@ struct Section : juce::Component
     juce::String shown;
     juce::Component* extra = nullptr; int extraCell = 0, extraSpan = 1;
     // one-line gain meter in the header: GR (0 at the right, reduction grows left) or bipolar expansion (0 centred)
+    std::function<float()> hairpin; float hairShown = 0;   // crescendo / diminuendo: output louder or quieter than input (dB)
     std::function<float()> gain; bool bipolar = false, expand = false; float range = 20.0f, shownGain = 0, holdGain = 0, holdTime = 0;
     void tickGain (float dt);   // a free component placed on grid cells
     juce::Rectangle<int> cell (int i) const;
