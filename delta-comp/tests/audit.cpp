@@ -202,7 +202,7 @@ int main (int argc, char** argv)
         // a few controls only matter once their parent control is away from neutral
         static const std::map<juce::String, std::vector<std::pair<const char*, float>>> ctx = {
             { "trDur", { { "transient", -60 } } }, { "trTarget", { { "transient", -60 } } }, { "trOn", { { "transient", -60 } } },
-            { "msOn", { { "width", 3 } } }, { "tiltOn", { { "tilt", 1 } } }, { "tiltPivot", { { "tilt", 1 } } },
+            { "msOn", { { "width", 3 } } }, { "tiltOn", { { "tilt", 1 } } }, { "tiltPivot", { { "tilt", 1 } } }, { "tiltPhase", { { "tilt", 1 } } }, { "tiltPos", { { "tilt", 1 } } }, { "tiltTarget", { { "tilt", 1 } } },
             { "centreFilter", { { "centre", 3 } } }, { "centreFreq", { { "centre", 3 }, { "centreFilter", 3 } } },
             { "sideSlope", { { "sideLowCut", 150 } } }, { "ambPre", { { "ambAuto", 0 } } }, { "crest", { { "pkMode", 1 } } },
             { "pkThr", { { "pkMode", 0 } } },

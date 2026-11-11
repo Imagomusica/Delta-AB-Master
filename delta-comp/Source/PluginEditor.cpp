@@ -289,21 +289,32 @@ void Section::paint (Graphics& g)
     g.setColour (kPanel); g.fillRect (r);
     g.setColour (kDim); g.drawRect (r, 1.0f);
     g.setColour (kFg); g.setFont (mono (11.0f, true));
-    g.drawText (title, 8, 5, getWidth() - 62, 14, Justification::centredLeft);
+    float tx = 8.0f;
+    if (marking.isNotEmpty())
+    {   // score dynamics: bold italic serif, as printed under the staff
+        const Font dyn (FontOptions (Font::getDefaultSerifFontName(), 19.0f, Font::bold | Font::italic));
+        g.setFont (dyn);
+        const float mw = GlyphArrangement::getStringWidth (dyn, marking);
+        g.drawText (marking, Rectangle<float> (8.0f, 1.0f, mw + 4.0f, 22.0f), Justification::centredLeft);
+        tx += mw + 10.0f;
+        g.setFont (mono (11.0f, true));
+    }
+    g.drawText (title, (int) tx, 5, getWidth() - 62 - (int) tx, 14, Justification::centredLeft);
     g.drawHorizontalLine (24, 6.0f, (float) getWidth() - 6.0f);
     if (gain)
     {   // one-line meter: track with dB ticks, bar, peak hold, value
         const float x0 = 30.0f, x1 = (float) getWidth() - 62.0f, y = 27.0f, h = 9.0f, w = x1 - x0;
         g.setColour (kGrey); g.setFont (mono (8.5f, true));
-        g.drawText (bipolar ? "G" : "GR", 6, (int) y - 1, 22, 11, Justification::centredLeft);
+        g.drawText (expand ? "GE" : bipolar ? "G" : "GR", 6, (int) y - 1, 22, 11, Justification::centredLeft);
         g.setColour (Colour (0xff050505)); g.fillRect (x0, y, w, h);
         g.setColour (kDim); g.drawRect (x0, y, w, h, 1.0f);
         auto xOf = [&] (float db) {
             return bipolar ? x0 + w * 0.5f + jlimit (-1.0f, 1.0f, db / range) * w * 0.5f
+                 : expand  ? x0 + jlimit (0.0f, 1.0f, db / range) * w      // gain expansion: same meter, grows from the left
                            : x1 - jlimit (0.0f, 1.0f, -db / range) * w;
         };
         const float step = range > 12 ? 5.0f : 3.0f;
-        for (float d = bipolar ? -range : -range; d <= (bipolar ? range : 0.0f) + 0.01f; d += step)
+        for (float d = expand ? 0.0f : -range; d <= (bipolar || expand ? range : 0.0f) + 0.01f; d += step)
         { g.setColour (std::abs (d) < 0.01f ? kGrey : kDim); g.drawVerticalLine ((int) xOf (d), y + (std::abs (d) < 0.01f ? 0.0f : h - 3.0f), y + h); }
         const float z = xOf (0.0f), v = xOf (shownGain);
         g.setColour (shownGain >= 0 ? Colour (0xffbdbdbd) : kFg);
@@ -512,9 +523,9 @@ void Sand::push()
     level[(size_t) head] = e.meterLevel.load();
     in[(size_t) head] = e.meterIn.load();
     out[(size_t) head] = e.meterOut.load();
-    const float v[kLanes] = { jmax (e.meterA.load(), e.meterAmb.load()), e.meterB.load(), e.meterC.load(), e.meterD.load(), e.meterLim.load() };
+    const float v[kLanes] = { e.meterAmb.load(), e.meterA.load(), e.meterB.load(), e.meterC.load(), e.meterD.load(), e.meterLim.load() };
     for (int k = 0; k < kLanes; ++k) lane[(size_t) k][(size_t) head] = v[k];
-    grNow = -(v[1] + v[2] + v[3] + v[4]);
+    grNow = -(v[2] + v[3] + v[4] + v[5]);
     // phase: correlation of L and R over the last 2048 samples, and a slow auto scale for the scope
     {
         const int w = proc.scopeWrite.load (std::memory_order_acquire);
@@ -640,14 +651,14 @@ void Sand::paintPhase (Graphics& g, Rectangle<float> r)
 // Five lanes scrolling in time: the classical zones from the bottom of the dynamics to the top.
 void Sand::paintLanes (Graphics& g, Rectangle<float> r)
 {
-    static const char* names[kLanes] = { "UPWARD", "BAS NIV.", "DOUBLE", "PEAK", "LIMITEUR" };
-    static const float range[kLanes] = { 12, 6, 12, 12, 6 };
+    static const char* names[kLanes] = { "AMBIANCE", "pp", "p", "mp  mf", "f  ff", "LIMITEUR" };
+    static const float range[kLanes] = { 12, 12, 6, 12, 12, 6 };
     const float lh = r.getHeight() / kLanes, labelW = 64.0f, valW = 48.0f;
     const float x0 = r.getX() + labelW, x1 = r.getRight() - valW, colW = (x1 - x0) / kCols;
     for (int k = 0; k < kLanes; ++k)
     {
         const float top = r.getY() + k * lh, h = lh - 4.0f;
-        const bool upLane = k == 0;
+        const bool upLane = k <= 1;
         const float base = upLane ? top + h : top;     // upward grows up from the bottom, reductions hang from the top
         g.setColour (Colour (0xff070707)); g.fillRect (x0, top, x1 - x0, h);
         g.setColour (kFg.withAlpha (0.2f)); g.drawHorizontalLine ((int) base, x0, x1);
@@ -664,7 +675,9 @@ void Sand::paintLanes (Graphics& g, Rectangle<float> r)
             }
             now = v;
         }
-        g.setFont (mono (9.0f, true)); g.setColour (kFg);
+        g.setColour (kFg);
+        if (k >= 1 && k <= 4) g.setFont (Font (FontOptions (Font::getDefaultSerifFontName(), 15.0f, Font::bold | Font::italic)));
+        else g.setFont (mono (9.0f, true));
         g.drawText (names[k], (int) r.getX(), (int) top, (int) labelW - 4, (int) h, Justification::centredRight);
         g.setFont (mono (10.0f, true));
         g.drawText ((now > 0.05f ? "+" : "") + String (now, 1), (int) x1 + 4, (int) top, (int) valW - 4, (int) h, Justification::centredLeft);
@@ -1022,17 +1035,17 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
 
     add (row1, new ui::Section (s, "TRANSITOIRES", "trOn", 2, { { K::knob, "transient", "ROND / ATT." }, { K::knob, "trDur", "DURÉE" }, { K::choice, "trTarget", "SUR" } }),
          [&e, db] { return db (e.meterT.load()); });
-    add (row1, new ui::Section (s, "UPWARD BAS NIV.", "upOn", 2, { { K::knob, "upThr", "SEUIL" }, { K::knob, "upRatio", "RATIO" }, { K::knob, "upRange", "PLAGE" },
+    add (row1, new ui::Section (s, "UPWARD", "upOn", 2, { { K::knob, "upThr", "SEUIL" }, { K::knob, "upRatio", "RATIO" }, { K::knob, "upRange", "PLAGE" },
                                                                   { K::knob, "upAtt", "ATTAQUE" }, { K::knob, "upRel", "RELEASE" } }),
          [&e, db] { return db (e.meterA.load()); });
-    row1.getLast()->gain = [&e] { return e.meterA.load(); }; row1.getLast()->bipolar = true; row1.getLast()->range = 12;
-    add (row1, new ui::Section (s, "DOWNWARD BAS NIV.", "llOn", 2, { { K::knob, "llThr", "SEUIL" }, { K::knob, "llRatio", "RATIO" }, { K::knob, "llRange", "PLAGE" },
+    row1.getLast()->gain = [&e] { return e.meterA.load(); }; row1.getLast()->expand = true; row1.getLast()->range = 12;
+    add (row1, new ui::Section (s, "DOWNWARD", "llOn", 2, { { K::knob, "llThr", "SEUIL" }, { K::knob, "llRatio", "RATIO" }, { K::knob, "llRange", "PLAGE" },
                                                                     { K::knob, "llAtt", "ATTAQUE" }, { K::knob, "llRel", "RELEASE" } }),
          [&e, db] { return db (e.meterB.load()); });
-    row1.getLast()->gain = [&e] { return e.meterB.load(); }; row1.getLast()->bipolar = true; row1.getLast()->range = 12;
-    add (row1, new ui::Section (s, "DOWNWARD DOUBLE SEUIL", "dnOn", 4,
-                                { { K::knob, "thr1", "SEUIL 1" }, { K::knob, "ratio1", "RATIO 1" }, { K::knob, "att1", "ATTAQUE 1" }, { K::knob, "rel1", "RELEASE 1" },
-                                  { K::knob, "thr2", "SEUIL 2" }, { K::knob, "ratio2", "RATIO 2" }, { K::knob, "att2", "ATTAQUE 2" }, { K::knob, "rel2", "RELEASE 2" },
+    row1.getLast()->gain = [&e] { return e.meterB.load(); }; row1.getLast()->range = 12;
+    add (row1, new ui::Section (s, "DOUBLE SEUIL", "dnOn", 4,
+                                { { K::knob, "thr1", "SEUIL mp" }, { K::knob, "ratio1", "RATIO 1" }, { K::knob, "att1", "ATTAQUE 1" }, { K::knob, "rel1", "RELEASE 1" },
+                                  { K::knob, "thr2", "SEUIL mf" }, { K::knob, "ratio2", "RATIO 2" }, { K::knob, "att2", "ATTAQUE 2" }, { K::knob, "rel2", "RELEASE 2" },
                                   { K::knob, "hyst", "HYSTÉRÉSIS" }, { K::knob, "knee", "GENOU" }, { K::knob, "window", "FENÊTRE" }, { K::choice, "opto", "DÉTECTION" } }),
          [&e, db] { return db (e.meterC.load()); });
     row1.getLast()->gain = [&e] { return e.meterC.load(); }; row1.getLast()->range = 20;
@@ -1045,13 +1058,13 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
     add (row2, new ui::Section (s, "AMBIANCE · K-STEREO", "ambOn", 5, { { K::knob, "kStereo", "K-STEREO" }, { K::knob, "ambiance", "QUEUES" }, { K::knob, "ambThr", "SEUIL" }, { K::knob, "ambRatio", "RATIO" },
                                                             { K::knob, "ambAtt", "ATTAQUE" }, { K::knob, "ambRel", "RELEASE" }, { K::knob, "ambPre", "PRÉ-DÉLAI" },
                                                             { K::knob, "ambTr", "TRANSITOIRES" }, { K::choice, "ambAuto", "AUTO RÉFL." }, { K::choice, "ambStage", "APRÈS" },
-                                                            { K::toggle, "revOn", "REVERB" }, { K::choice, "revTarget", "SUR" } }),
+                                                            { K::toggle, "revOn", "REVERB" }, { K::choice, "revTarget", "SUR" }, { K::toggle, "kstOn", "K-STEREO" } }),
          [this, &e, db] { auto n = proc.insertName();
                           return db (e.meterAmb.load()) + ui::u8 ("  réfl. ") + String (roundToInt (e.meterEr.load())) + " ms   "
                                  + (n.isEmpty() ? String ("REVERB --") : n.toUpperCase()); });
     {   // the reverb insert (Altiverb or any plugin) lives with the ambiance, on Mid, Side or both
         auto* amb = row2[0];
-        amb->extra = &insertSlot; amb->extraCell = 12; amb->extraSpan = 3;
+        amb->extra = &insertSlot; amb->extraCell = 13; amb->extraSpan = 2;
         amb->addAndMakeVisible (insertSlot);
     }
     add (row2, new ui::Section (s, "M/S", "msOn", 3, { { K::knob, "centre", "CENTRE" }, { K::knob, "centreFreq", "FRÉQ." }, { K::choice, "centreFilter", "FILTRE" },
@@ -1062,12 +1075,14 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
                                                             { K::knob, "linkT", "LIEN TRANS." }, { K::knob, "linkR", "LIEN REL." }, { K::choice, "os", "OVERSAMPLING" },
                                                             { K::choice, "truePeak", "TRUE PEAK" } }),
          [&e, db] { return db (e.meterLim.load()); });
-    add (row1, new ui::Section (s, "TILT", "tiltOn", 1, { { K::knob, "tilt", "PENTE" }, { K::knob, "tiltPivot", "PIVOT" } }),
-         [] { return ui::u8 ("LINÉAIRE"); });
-    add (row2, new ui::Section (s, "GLOBAL", "active", 4, { { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
-                                                          { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::choice, "autoGain", "GAIN AUTO" } }),
+    add (row1, new ui::Section (s, "TILT", "tiltOn", 2, { { K::knob, "tilt", "PENTE" }, { K::knob, "tiltPivot", "PIVOT" },
+                                                         { K::choice, "tiltPhase", "PHASE" }, { K::choice, "tiltTarget", "SUR" }, { K::choice, "tiltPos", "POSITION" } }),
+         [this] { return ui::u8 (proc.apvts.getRawParameterValue ("tiltPhase")->load() > 0.5f ? "MIN PHASE" : "LINÉAIRE"); });
+    add (row2, new ui::Section (s, "GLOBAL", "active", 4, { { K::knob, "in", "ENTRÉE" }, { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
+                                                          { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::choice, "autoGain", "GAIN AUTO" }, { K::choice, "meterLook", "AVANCE NAGRA" } }),
          [&e, db] { return "GAIN AUTO " + db (e.meterMakeup.load()) + "  DENSITY " + db (e.meterDensity.load()); });
 
+    row1[1]->marking = "pp"; row1[2]->marking = "p"; row1[3]->marking = "mp mf"; row1[4]->marking = "f ff";
     setResizable (true, true);
     setResizeLimits (kW / 2, kH / 2, kW * 3 / 2, kH * 3 / 2);
     if (auto* c = getConstrainer()) c->setFixedAspectRatio ((double) kW / kH);

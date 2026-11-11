@@ -46,7 +46,7 @@ struct Section : juce::Component
              std::vector<std::tuple<Control::Kind, const char*, const char*>> items);
     void paint (juce::Graphics&) override;
     void resized() override;
-    juce::String title;
+    juce::String title, marking;   // marking: the classical dynamic (pp, p, mp mf, f ff) in score style
     int cols;
     std::unique_ptr<Control> on;
     juce::OwnedArray<Control> controls;
@@ -54,7 +54,7 @@ struct Section : juce::Component
     juce::String shown;
     juce::Component* extra = nullptr; int extraCell = 0, extraSpan = 1;
     // one-line gain meter in the header: GR (0 at the right, reduction grows left) or bipolar expansion (0 centred)
-    std::function<float()> gain; bool bipolar = false; float range = 20.0f, shownGain = 0, holdGain = 0, holdTime = 0;
+    std::function<float()> gain; bool bipolar = false, expand = false; float range = 20.0f, shownGain = 0, holdGain = 0, holdTime = 0;
     void tickGain (float dt);   // a free component placed on grid cells
     juce::Rectangle<int> cell (int i) const;
 };
@@ -89,10 +89,10 @@ struct Sand : juce::Component
     DeltaCompProcessor& proc;
     static constexpr int kCols = 420;
     std::array<float, kCols> level {}, in {}, out {};
-    // the five gain lanes: upward (ambiance + upward), mezzo downward, double threshold, peak, limiter
-    static constexpr int kLanes = 5;
+    // the six gain lanes: ambiance, upward, mezzo downward, double threshold, peak, limiter
+    static constexpr int kLanes = 6;
     std::array<std::array<float, kCols>, kLanes> lane {};
-    static constexpr int kBand = 150;      // height of the bottom band (phase scope + gain lanes)
+    static constexpr int kBand = 162;      // height of the bottom band (phase scope + gain lanes)
     float corr = 0, corrShown = 0, scopeGain = 1;
     float lastDb = -100, avgDb = -60, kick = 0;
     void paintPhase (juce::Graphics&, juce::Rectangle<float>);

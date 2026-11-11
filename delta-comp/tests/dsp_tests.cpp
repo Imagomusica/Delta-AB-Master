@@ -101,7 +101,7 @@ int main()
         const double tot = e.curveC1 (-4) + e.curveC2 (-4);   // 10 over thr1, 4 over thr2: -(10/2) - (1/2-1/4)*4 = -6
         check (std::abs (tot + 6) < 1e-9, "C: double threshold 2:1 then 4:1 -> -6 dB at +10", tot);
         check (std::abs (e.curveA (-30) - 100 * std::tanh (3.0 / 100)) < 1e-9, "A: 6 dB under upward threshold, 1:2 -> +3 dB", e.curveA (-30));
-        check (e.curveA (-80) == 0.0, "A: silence (-80 LUFS) is not lifted", e.curveA (-80));
+        check (e.curveA (-110) == 0.0, "A: silence (-110 LUFS) is not lifted", e.curveA (-110));
         check (std::abs (e.curveB (-14) + 3 * std::tanh (15.0 / 3)) < 1e-9, "B: low-level downward capped by its range (3 dB)", e.curveB (-14));
         e.pkRmsDb = -14;
         check (std::abs (e.peakThr() - (-4)) < 1e-9, "D: crest mode, threshold = running RMS -14 + crest 10 = -4 dBFS", e.peakThr());
@@ -109,12 +109,12 @@ int main()
     }
     {   // transparency, latency
         Engine e; e.prepare (fs, 2); e.setParams (neutral());
-        std::vector<double> l (16384, 0.0), r (16384, 0.0); l[0] = 0.5; r[0] = -0.25;
+        std::vector<double> l (32768, 0.0), r (32768, 0.0); l[0] = 0.5; r[0] = -0.25;
         double* io[2] = { l.data(), r.data() };
-        e.process (io, 2, 16384);
+        e.process (io, 2, 32768);
         double err = 0;
-        for (int i = 0; i < 16384; ++i) if (i != e.latency()) err = std::max (err, std::abs (l[(size_t) i]) + std::abs (r[(size_t) i]));
-        check (e.latency() > 256 && e.latency() < 8192, "latency at 48 kHz: look-ahead + gain FIR, constant", e.latency());
+        for (int i = 0; i < 32768; ++i) if (i != e.latency()) err = std::max (err, std::abs (l[(size_t) i]) + std::abs (r[(size_t) i]));
+        check (e.latency() > 256 && e.latency() < 12000, "latency at 48 kHz: look-ahead + gain FIR, constant", e.latency());
         err = std::max ({ err, std::abs (l[(size_t) e.latency()] - 0.5), std::abs (r[(size_t) e.latency()] + 0.25) });
         check (err < 1e-12, "all stages off: transparent (< -240 dB error), delayed by latency()", err);
     }
@@ -124,10 +124,10 @@ int main()
         const double out = runSine (e, fs, -6, 1, 1000);
         char msg[96]; std::snprintf (msg, sizeof msg, "oversampling %dx: 1 kHz passes at unity (+-0.05 dB)", f);
         check (std::abs (out + 6) < 0.05, msg, out);
-        std::vector<double> l (16384, 0.0), r (16384, 0.0); l[0] = 1;
+        std::vector<double> l (32768, 0.0), r (32768, 0.0); l[0] = 1;
         double* io[2] = { l.data(), r.data() };
-        e.process (io, 2, 16384);
-        int pk = 0; for (int i = 0; i < 16384; ++i) if (std::abs (l[(size_t) i]) > std::abs (l[(size_t) pk])) pk = i;
+        e.process (io, 2, 32768);
+        int pk = 0; for (int i = 0; i < 32768; ++i) if (std::abs (l[(size_t) i]) > std::abs (l[(size_t) pk])) pk = i;
         std::snprintf (msg, sizeof msg, "oversampling %dx: impulse peak at latency()", f);
         check (pk == e.latency(), msg, pk);
     }
@@ -243,7 +243,7 @@ int main()
     {   // transients: round off lowers the attack of a drum-like burst, keeps its body
         auto burst = [&] (double amount, double& attackPk, double& bodyRms) {
             Engine e; e.prepare (fs, 2); Params p = neutral(); p.transient = amount; e.setParams (p);
-            const int n = (int) fs; std::vector<double> l ((size_t) n, 0.0), r;
+            const int n = (int) (2 * fs); std::vector<double> l ((size_t) n, 0.0), r;
             for (int t0 = 0; t0 < n; t0 += 12000)
                 for (int i = 0; i < 6000; ++i) l[(size_t) (t0 + i)] = 0.5 * std::exp (-i / 600.0) * std::sin (2 * kPi * 200 * i / fs) + 0.1 * std::sin (2 * kPi * 200 * i / fs);
             r = l;
@@ -329,6 +329,32 @@ int main()
         check (aliasBandDb (48000, 1) < -130, "no aliasing 48k 1x: 5-16 kHz band vs 21 kHz tone (dB)", aliasBandDb (48000, 1));
         check (aliasBandDb (48000, 4) < -130, "no aliasing 48k 4x: 5-16 kHz band vs 21 kHz tone (dB)", aliasBandDb (48000, 4));
         check (aliasBandDb (44100, 1) < -130, "no aliasing 44.1k 1x: 5-16 kHz band vs 21 kHz tone (dB)", aliasBandDb (44100, 1));
+    }
+    {   // tilt: exact magnitude in linear and minimum phase; Mid or Side alone leaves the other untouched
+        for (int mp = 0; mp < 2; ++mp)
+        {
+            TiltEq t; t.prepare (fs); t.design (t.H[1], 1.5, 1000.0, mp == 1);
+            const auto& h = t.lastTaps();
+            double worst = 0;
+            for (double f : { 30.0, 100.0, 440.0, 1000.0, 3000.0, 10000.0, 18000.0 })
+            {
+                std::complex<double> H (0);
+                for (size_t n = 0; n < h.size(); ++n) H += h[n] * std::polar (1.0, -2 * kPi * f * (double) n / fs);
+                const double e = std::abs (20 * std::log10 (std::abs (H)) - TiltEq::targetDb (f, 1.5, 1000.0));
+                worst = std::max (worst, e);
+            }
+            check (worst < 0.01, mp ? "tilt min phase: magnitude error 30 Hz..18 kHz < 0.01 dB" : "tilt linear: magnitude error 30 Hz..18 kHz < 0.01 dB", worst);
+        }
+        TiltEq t; t.prepare (fs); t.setTarget (1.5, 1000.0, false, 2); t.mixM = 0; t.mixS = 1;
+        const int n = 30000; double err = 0; std::vector<double> in ((size_t) n);
+        for (int i = 0; i < n; ++i) in[(size_t) i] = std::sin (2 * kPi * 300 * i / fs) + 0.3 * std::sin (2 * kPi * 7000 * i / fs);
+        for (int i = 0; i < n; ++i)
+        {
+            double v[2] = { in[(size_t) i], in[(size_t) i] };   // mono: all Mid
+            t.process (v, 2);
+            if (i > 20000) err = std::max (err, std::abs (v[0] - in[(size_t) (i - TiltEq::latency())]));
+        }
+        check (err < 1e-12, "tilt on SIDE: a mono (Mid) signal comes out only delayed", err);
     }
     std::printf (fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails ? 1 : 0;

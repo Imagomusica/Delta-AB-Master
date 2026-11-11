@@ -331,8 +331,8 @@ struct Params
     // Ambiance (ambient retrieval), placed after stage 1 = A, 2 = B, 3 = C, 4 = D
     bool ambOn = false; double ambiance = 0.5;   // amount 0..1
     double ambThr = -20, ambRatio = 2, ambAtt = 20, ambRel = 400, ambPreMs = 20;
-    bool ambAuto = true; int ambStage = 3; double ambTr = 0.5; double kStereo = 0.3;   // kStereo: constant ambience extraction 0..1
-    bool trOn = true, msOn = true, tiltOn = true; double tilt = 0.0, tiltPivot = 1000.0;   // tilt dB/oct   // ambTr: transients removed from the lifted ambiance, 0..1
+    bool ambAuto = true; int ambStage = 3; double ambTr = 0.5; double kStereo = 0.3; bool kstOn = true;   // kStereo: constant ambience extraction 0..1
+    bool trOn = true, msOn = true, tiltOn = true; double tilt = 0.0, tiltPivot = 1000.0; int tiltPos = 1, tiltTarget = 0; bool tiltMin = false;   // tiltPos 0 after the dynamics, 1 after the insert, 2 after the limiter   // tilt dB/oct   // ambTr: transients removed from the lifted ambiance, 0..1
 
     // T transient shaper (Bittersweet spirit): -1 rounds the attacks off, +1 accentuates them
     double transient = 0.0; double trDurMs = 30.0; int trTarget = 0;   // 0 stereo, 1 mid, 2 side
@@ -341,7 +341,7 @@ struct Params
     // B downward low level (gentle, capped by range)
     bool llOn = false; double llThr = -24, llRatio = 1.5, llRange = 3, llAtt = 30, llRel = 400;
     // C downward, double threshold
-    bool dnOn = true;  bool opto = false;
+    bool dnOn = true;  bool opto = false, variMu = false;
     double thr1 = 0, ratio1 = 1.5, att1 = 30, rel1 = 300;
     double thr2 = 4, ratio2 = 4,   att2 = 10, rel2 = 150;
     double hyst = 0;           // dB: release only starts when the gain has more than this to recover (C and D)
@@ -375,7 +375,7 @@ struct OutputMeter   // accumulated by the audio thread, taken by the editor
 // overlap-save convolution (blocks of 256). Constant latency whatever the setting; changes crossfade over a block.
 struct TiltEq
 {
-    static constexpr int B = 256, P = 32, N = B * P, F = 2 * B;   // N - 1 taps used, centre (N - 2) / 2
+    static constexpr int B = 256, P = 64, N = B * P, F = 2 * B;   // N - 1 taps used, centre (N - 2) / 2
     using cd = std::complex<double>;
     static void fft (cd* a, int n, bool inv)
     {
@@ -403,7 +403,9 @@ struct TiltEq
             inPrev[k].assign (B, 0.0); inCur[k].assign (B, 0.0); outCur[k].assign (B, 0.0); outNew[k].assign (B, 0.0);
         }
         work.assign (F, cd (0)); big.assign ((size_t) (4 * N), cd (0));
-        design (H[0], 0.0, 1000.0); curSlope = 0; curPivot = 1000; designed = true; reset();
+        design (H[0], 0.0, 1000.0, false); curSlope = 0; curPivot = 1000; curMin = false; designed = true;
+        for (auto& d : dly) d.assign ((size_t) latency() + 1, 0.0);
+        reset();
     }
     void reset()
     {
@@ -412,28 +414,54 @@ struct TiltEq
             std::fill (fdl[k].begin(), fdl[k].end(), cd (0)); std::fill (inPrev[k].begin(), inPrev[k].end(), 0.0);
             std::fill (inCur[k].begin(), inCur[k].end(), 0.0); std::fill (outCur[k].begin(), outCur[k].end(), 0.0);
         }
-        pos = 0; fdlIdx = 0; fading = false;
+        pos = 0; fdlIdx = 0; fading = false; dpos = 0;
+        for (auto& d : dly) std::fill (d.begin(), d.end(), 0.0);
     }
     static double targetDb (double f, double slope, double pivot)
     {
         return slope * std::log2 (std::clamp (f, 20.0, 20000.0) / pivot);
     }
-    void design (std::vector<cd>& Hd, double slope, double pivot)
+    // Exact target magnitude sampled on a 4N grid. Linear phase: zero-phase impulse, Kaiser windowed, centred.
+    // Minimum phase: same magnitude through the real cepstrum (folded), placed at the same centre so the latency
+    // never changes and switching only crossfades.
+    void design (std::vector<cd>& Hd, double slope, double pivot, bool minPhase)
     {
-        const int M = 4 * N;   // frequency sampling grid
-        for (int k = 0; k <= M / 2; ++k)
-        {
-            const double g = std::pow (10.0, targetDb (k * fs / M, slope, pivot) / 20.0);
-            big[(size_t) k] = g; if (k > 0 && k < M / 2) big[(size_t) (M - k)] = g;
-        }
-        fft (big.data(), M, true);   // real, even -> zero-phase impulse
+        const int M = 4 * N;
         const int half = (N - 2) / 2; const double beta = 10.0;
         auto i0 = [] (double x) { double sum = 1, t = 1; for (int k = 1; k < 60; ++k) { t *= (x / (2 * k)) * (x / (2 * k)); sum += t; if (t < 1e-18 * sum) break; } return sum; };
         std::vector<double>& h = inNewScratch; h.assign ((size_t) N, 0.0);
-        for (int n = -half; n <= half; ++n)
+        if (! minPhase)
         {
-            const double r = (double) n / (half + 1);
-            h[(size_t) (n + half)] = big[(size_t) ((n + M) % M)].real() * i0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0 (beta);
+            for (int k = 0; k <= M / 2; ++k)
+            {
+                const double g = std::pow (10.0, targetDb (k * fs / M, slope, pivot) / 20.0);
+                big[(size_t) k] = g; if (k > 0 && k < M / 2) big[(size_t) (M - k)] = g;
+            }
+            fft (big.data(), M, true);   // real, even -> zero-phase impulse
+            for (int n = -half; n <= half; ++n)
+            {
+                const double r = (double) n / (half + 1);
+                h[(size_t) (n + half)] = big[(size_t) ((n + M) % M)].real() * i0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0 (beta);
+            }
+        }
+        else
+        {
+            for (int k = 0; k <= M / 2; ++k)
+            {
+                const double lg = std::log (10.0) * targetDb (k * fs / M, slope, pivot) / 20.0;
+                big[(size_t) k] = lg; if (k > 0 && k < M / 2) big[(size_t) (M - k)] = lg;
+            }
+            fft (big.data(), M, true);   // real cepstrum
+            for (int n = 1; n < M / 2; ++n) big[(size_t) n] *= 2.0;
+            for (int n = M / 2 + 1; n < M; ++n) big[(size_t) n] = 0.0;
+            fft (big.data(), M, false);
+            for (int k = 0; k < M; ++k) big[(size_t) k] = std::exp (big[(size_t) k]);
+            fft (big.data(), M, true);   // minimum-phase impulse
+            for (int n = 0; n <= half; ++n)
+            {
+                const double r = (double) n / (half + 1);   // right half of the Kaiser window: the tail fades out
+                h[(size_t) (n + half)] = big[(size_t) n].real() * i0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0 (beta);
+            }
         }
         for (int part = 0; part < P; ++part)
         {
@@ -442,9 +470,13 @@ struct TiltEq
             std::copy (work.begin(), work.end(), Hd.begin() + part * F);
         }
     }
+    const std::vector<double>& lastTaps() const { return inNewScratch; }
     std::vector<double> inNewScratch;
-    void setTarget (double slope, double pivot) { wantSlope = slope; wantPivot = pivot; }
-    double wantSlope = 0, wantPivot = 1000;
+    // target 0 = stereo, 1 = Mid only, 2 = Side only (the other part only delayed)
+    void setTarget (double slope, double pivot, bool minPhase = false, int target = 0)
+    { wantSlope = slope; wantPivot = pivot; wantMin = minPhase; wantM = target != 2 ? 1.0 : 0.0; wantS = target != 1 ? 1.0 : 0.0; }
+    double wantSlope = 0, wantPivot = 1000, wantM = 1, wantS = 1, mixM = 1, mixS = 1; bool wantMin = false, curMin = false;
+    std::array<std::vector<double>, 2> dly; int dpos = 0;
     void convolve (int c, const std::vector<cd>& Hd, std::vector<double>& out)
     {
         std::fill (work.begin(), work.end(), cd (0));
@@ -467,8 +499,8 @@ struct TiltEq
             std::copy (work.begin(), work.end(), fdl[c].begin() + fdlIdx * F);
             inPrev[c] = inCur[c];
         }
-        const bool change = std::abs (wantSlope - curSlope) > 1e-9 || std::abs (wantPivot - curPivot) > 1e-9;
-        if (change) { design (H[1], wantSlope, wantPivot); fading = true; }
+        const bool change = std::abs (wantSlope - curSlope) > 1e-9 || std::abs (wantPivot - curPivot) > 1e-9 || wantMin != curMin;
+        if (change) { design (H[1], wantSlope, wantPivot, wantMin); fading = true; }
         for (int c = 0; c < C; ++c)
         {
             convolve (c, H[0], outCur[c]);
@@ -478,12 +510,27 @@ struct TiltEq
                 for (int i = 0; i < B; ++i) { const double r = (i + 0.5) / B; outCur[c][(size_t) i] = (1 - r) * outCur[c][(size_t) i] + r * outNew[c][(size_t) i]; }
             }
         }
-        if (fading) { std::swap (H[0], H[1]); curSlope = wantSlope; curPivot = wantPivot; fading = false; }
+        if (fading) { std::swap (H[0], H[1]); curSlope = wantSlope; curPivot = wantPivot; curMin = wantMin; fading = false; }
     }
     // one sample per channel in, one out (latency() samples later)
+    // works on Mid and Side (same filter on both = same as on L and R), so Mid or Side alone can be left out
     void process (double* v, int C)
     {
-        for (int c = 0; c < C; ++c) { inCur[c][(size_t) pos] = v[c]; v[c] = outCur[c][(size_t) pos]; }
+        double x[2] = { v[0], C == 2 ? v[1] : 0.0 };
+        if (C == 2) { const double m = 0.5 * (v[0] + v[1]), sd = 0.5 * (v[0] - v[1]); x[0] = m; x[1] = sd; }
+        const int L = (int) dly[0].size();
+        double y[2];
+        for (int c = 0; c < C; ++c)
+        {
+            inCur[c][(size_t) pos] = x[c];
+            const double dl = dly[(size_t) c][(size_t) ((dpos + 1) % L)];   // input from latency() samples ago
+            dly[(size_t) c][(size_t) dpos] = x[c];
+            const double mix = c == 0 ? mixM : mixS;
+            y[c] = dl + mix * (outCur[c][(size_t) pos] - dl);
+        }
+        dpos = (dpos + 1) % L;
+        mixM = wantM + 0.9995 * (mixM - wantM); mixS = wantS + 0.9995 * (mixS - wantS);
+        if (C == 2) { v[0] = y[0] + y[1]; v[1] = y[0] - y[1]; } else v[0] = y[0];
         if (++pos == B) { pos = 0; block (C); }
     }
 };
@@ -492,7 +539,7 @@ class Engine
 {
 public:
     static constexpr double kMaxLookMs = 5.0;
-    static constexpr double kSilenceLufs = -70.0;   // upward gain fades out between -60 and -70 LUFS
+    static constexpr double kSilenceLufs = -100.0;   // upward gain fades out between -90 and -100 LUFS
 
     void prepare (double sampleRate, int numChannels)
     {
@@ -546,6 +593,8 @@ public:
 
     void reset()
     {
+        erMs = 20; meterEr.store (20); backAvg = -100; sinceOnset = 100000; recLeft = 0; frameAcc = 0; frameCount = 0;
+        pkRms = 0; pkRmsDb = -100;
         for (size_t c = 0; c < (size_t) kMaxCh; ++c)
         {
             for (auto& k : kw[c]) k.reset();
@@ -611,7 +660,7 @@ public:
     // ---- static curves (dB), exposed for tests and the display
     double shape (double over) const
     {
-        const double k = std::max (0.0, p.knee * (p.opto ? 1.5 : 1.0));
+        const double k = std::max (0.0, p.knee * (p.opto ? 1.5 : p.variMu ? 2.0 : 1.0));
         if (k <= 0) return std::max (0.0, over);
         if (over <= -k * 0.5) return 0.0;
         if (over >= k * 0.5) return over;
@@ -630,12 +679,14 @@ public:
         const double dn = (1.0 - 1.0 / p.llRatio) * shape (L - (p.target + p.llThr));
         return -p.llRange * std::tanh (dn / p.llRange);
     }
-    double curveC1 (double L) const { return p.dnOn ? -(1.0 - 1.0 / std::max (1.0, p.ratio1)) * shape (L - thr1Abs()) : 0; }
+    // vari-mu: the ratio grows with the depth of compression (gentle at first, the set ratio further over)
+    double shapeC (double over) const { const double s = shape (over); return p.variMu ? s * s / (s + 8.0) : s; }
+    double curveC1 (double L) const { return p.dnOn ? -(1.0 - 1.0 / std::max (1.0, p.ratio1)) * shapeC (L - thr1Abs()) : 0; }
     double curveC2 (double L) const
     {
         if (! p.dnOn) return 0;
         const double extra = std::max (0.0, 1.0 / std::max (1.0, p.ratio1) - 1.0 / std::max (1.0, p.ratio2));
-        return -extra * shape (L - thr2Abs());
+        return -extra * shapeC (L - thr2Abs());
     }
     double curveD (double peakDb) const { return p.pkOn ? -(1.0 - 1.0 / std::max (1.0, p.pkRatio)) * shape (peakDb - peakThr()) : 0; }
     double thr1Abs() const { return p.target + p.thr1; }
@@ -664,7 +715,7 @@ public:
             widthS = dbToLin (p.widthDb) + cSmooth * (widthS - dbToLin (p.widthDb));
             centreS = dbToLin (p.centreDb) + cSmooth * (centreS - dbToLin (p.centreDb));
             denS = p.density + cSmooth * (denS - p.density); ambS = p.ambiance + cSmooth * (ambS - p.ambiance);
-            kstS = p.kStereo + cSmooth * (kstS - p.kStereo);
+            { const double kt = p.kstOn ? p.kStereo : 0.0; kstS = kt + cSmooth * (kstS - kt); }
             double x[kMaxCh] {}, s[kMaxCh] {}, gPre[kMaxCh] { 1, 1 }, gPost[kMaxCh] { 1, 1 }, dk[kMaxCh] {};
             bool afterAmb = false; ambUsed = false; ambK = 0;
             auto mulGain = [&] (int c, double gl) { if (afterAmb) gPost[c] *= gl; else gPre[c] *= gl; };
@@ -688,7 +739,7 @@ public:
                 trSlow = trFast + cTrSa * (trSlow - trFast);   // slow = fast envelope smoothed: equal on steady tones
                 const double tr = std::clamp (linToDb (trFast + 1e-9) - linToDb (trSlow + 1e-9), 0.0, 12.0);
                 trDb = tr;
-                const double g = trS * tr;
+                const double g = std::clamp (trS * 2.0 * tr, -18.0, 18.0);   // up to +-18 dB on a sharp attack (Bittersweet-like range)
                 mT = std::abs (g) > std::abs (mT) ? g : mT;
                 kT = 0.0;
                 if (std::abs (g) > 1e-6)
@@ -730,11 +781,11 @@ public:
             {
                 const size_t u = (size_t) c;
                 double r1 = cC1r, r2 = cC2r;
-                if (p.opto)   // opto: the longer and deeper it compressed, the slower it lets go
+                if (p.opto || p.variMu)   // opto: the longer and deeper it compressed, the slower it lets go (vari-mu: milder)
                 {
                     const double depth = std::min (1.0, -(gC1[u] + gC2[u]) / 6.0);
                     optoMem[u] = depth + (depth > optoMem[u] ? cOptoUp : cOptoDn) * (optoMem[u] - depth);
-                    const double slow = 1.0 + 4.0 * optoMem[u];
+                    const double slow = 1.0 + (p.variMu ? 2.0 : 4.0) * optoMem[u];
                     r1 = std::pow (cC1r, 1.0 / slow); r2 = std::pow (cC2r, 1.0 / slow);
                 }
                 smoothHyst (gC1[u], curveC1 (L[c]), cC1a, r1, relC1[u]);
@@ -856,6 +907,15 @@ public:
             for (int c = 0; c < C; ++c) yBuf[(size_t) c][(size_t) (i - i0)] = y[c];
         }
 
+        tiltEq.setTarget (p.tiltOn ? p.tilt : 0.0, p.tiltPivot, p.tiltMin, p.tiltTarget);
+        if (p.tiltPos == 0)
+            for (int j = 0; j < nb; ++j)
+            {
+                double y[kMaxCh] {}; for (int c = 0; c < C; ++c) y[c] = yBuf[(size_t) c][(size_t) j];
+                tiltEq.process (y, C);
+                for (int c = 0; c < C; ++c) yBuf[(size_t) c][(size_t) j] = y[c];
+            }
+
         // insert (external plugin, e.g. a reverb) on Mid, Side or L/R, before the limiter. The part of M/S that does
         // not go through it is delayed by the plugin's latency, and so is everything while the insert is off.
         if (const int lat = insLat.load (std::memory_order_relaxed); lat > 0 || insertFn != nullptr)
@@ -897,9 +957,8 @@ public:
         {
             double y[kMaxCh] {};
             for (int c = 0; c < C; ++c) y[c] = yBuf[(size_t) c][(size_t) (i - i0)];
-            // linear tilt, last before the limiter (always running: constant latency, crossfaded changes)
-            tiltEq.setTarget (p.tiltOn ? p.tilt : 0.0, p.tiltPivot);
-            tiltEq.process (y, C);
+            // tilt after the insert (always running at one of its three places: constant latency, crossfaded changes)
+            if (p.tiltPos == 1) tiltEq.process (y, C);
             // E: limiter
             double o[kMaxCh] {};
             if (F > 1)
@@ -927,6 +986,7 @@ public:
                 for (int c = 0; c < C; ++c) o[c] = v[c];
             }
 
+            if (p.tiltPos == 2) tiltEq.process (o, C);   // after the limiter: the ceiling is no longer guaranteed
             // constant latency padding, write out, meter
             double op = 0;
             for (int c = 0; c < C; ++c)

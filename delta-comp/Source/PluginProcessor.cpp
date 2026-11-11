@@ -42,6 +42,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     fl ("knee",    "Genou",              0.f,  18.f,   6.f, 0.1f, 0,     "dB", 1);
     fl ("density", "Density",            0.f, 100.f,   0.f, 1.f, 0,      "%", 0);
     fl ("mix",     "Mix",                0.f, 100.f, 100.f, 1.f, 0,      "%", 0);
+    fl ("in",      "Entrée",           -18.f,  18.f,   0.f, 0.1f, 0,     "dB", 1);
+    ch ("meterLook","Avance modulomètres", { "OFF", "25 ms", "50 ms", "75 ms", "100 ms", "150 ms", "200 ms" }, 0);
     fl ("out",     "Sortie",           -18.f,  18.f,   0.f, 0.1f, 0,     "dB", 1);
     // T transients
     bo ("active",  "Actif (bypass général)", true);
@@ -51,21 +53,21 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     fl ("trDur",   "Durée",              5.f, 200.f,  30.f, 1.f, 30.f,   "ms", 0);
     // A upward low level
     bo ("upOn",    "Upward actif",     true);
-    fl ("upThr",   "Upward seuil",     -40.f,   0.f, -22.f, 0.1f, 0,     "LU", 1);
+    fl ("upThr",   "Upward seuil",     -74.f,   0.f, -22.f, 0.1f, 0,     "LU", 1);
     fl ("upRatio", "Upward ratio",       1.f,   4.f,  2.0f, 0.01f, 1.8f, ":1", 2);
     fl ("upRange", "Upward plage",       0.f,  18.f,   6.f, 0.1f, 0,     "dB", 1);
     fl ("upAtt",   "Upward attaque",   0.5f, 500.f,  50.f, 0.1f, 40.f,   "ms", 1);
     fl ("upRel",   "Upward release",   10.f, 5000.f, 600.f, 1.f, 500.f,  "ms", 0);
     // B downward low level
-    bo ("llOn",    "Bas niveau actif", false);
-    fl ("llThr",   "Bas niveau seuil", -40.f,   0.f, -20.f, 0.1f, 0,     "LU", 1);
+    bo ("llOn",    "Bas niveau actif", true);
+    fl ("llThr",   "Bas niveau seuil", -74.f,   0.f, -20.f, 0.1f, 0,     "LU", 1);
     fl ("llRatio", "Bas niveau ratio",   1.f,   4.f,  1.5f, 0.01f, 1.8f, ":1", 2);
     fl ("llRange", "Bas niveau plage",   0.f,  12.f,   3.f, 0.1f, 0,     "dB", 1);
     fl ("llAtt",   "Bas niveau attaque",0.5f, 500.f, 30.f, 0.1f, 40.f,   "ms", 1);
     fl ("llRel",   "Bas niveau release",10.f, 5000.f, 400.f, 1.f, 500.f, "ms", 0);
     // C double threshold
     bo ("dnOn",    "Double seuil actif", true);
-    ch ("opto",    "Détection",        { "RMS", "OPTO" }, 0);
+    ch ("opto",    "Détection",        { "RMS", "OPTO", "VARI-MU" }, 0);
     fl ("thr1",    "Seuil 1",          -24.f,  12.f,  -9.f, 0.1f, 0,     "LU", 1);
     fl ("ratio1",  "Ratio 1",            1.f,  10.f,  2.0f, 0.01f, 2.5f, ":1", 2);
     fl ("att1",    "Attaque 1",        0.1f, 500.f,  30.f, 0.1f, 30.f,   "ms", 1);
@@ -84,7 +86,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     fl ("pkAtt",   "Peak attaque",    0.05f,  20.f,  0.5f, 0.01f, 1.f,   "ms", 2);
     fl ("pkRel",   "Peak release",       5.f, 1000.f, 80.f, 1.f, 80.f,   "ms", 0);
     // Ambiance
-    bo ("ambOn",   "Ambiance active",  false);
+    bo ("ambOn",   "Ambiance active",  true);
+    bo ("kstOn",   "K-Stereo actif",   true);
     fl ("kStereo", "K-Stereo",           0.f, 100.f,  30.f, 1.f, 0,      "%", 0);
     fl ("ambiance","Ambiance",           0.f, 100.f,  50.f, 1.f, 0,      "%", 0);
     fl ("ambThr",  "Ambiance seuil",   -40.f,   0.f, -30.f, 0.1f, 0,     "LU", 1);
@@ -101,6 +104,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     bo ("tiltOn",  "Tilt actif",       true);
     fl ("tilt",    "Tilt",              -1.5f,  1.5f,  0.f, 0.01f, 0,    "dB/oct", 2);
     fl ("tiltPivot","Tilt pivot",       100.f, 10000.f, 1000.f, 1.f, 1000.f, "Hz", 0);
+    ch ("tiltPhase","Tilt phase",      { "LINÉAIRE", "MIN" }, 0);
+    ch ("tiltPos", "Tilt position",    { "APRÈS COMP", "APRÈS REVERB", "APRÈS LIMITEUR" }, 1);
+    ch ("tiltTarget","Tilt sur",       { "ST", "MID", "SIDE" }, 0);
     fl ("centre",  "Centre",            -6.f,   6.f,   0.f, 0.1f, 0,     "dB", 1);
     ch ("centreFilter", "Filtre centre", { "LARGE", "GRAVE", "AIGU", "CLOCHE" }, 0);
     fl ("centreFreq", "Fréquence centre", 20.f, 20000.f, 1000.f, 1.f, 1000.f, "Hz", 0);
@@ -128,11 +134,12 @@ dcomp::Params DeltaCompProcessor::currentParams() const
     p.trOn = pb ("trOn"); p.trTarget = pi ("trTarget"); p.transient = pv ("transient") * 0.01; p.trDurMs = pv ("trDur");
     p.upOn = pb ("upOn"); p.upThr = pv ("upThr"); p.upRatio = pv ("upRatio"); p.upRange = pv ("upRange"); p.upAtt = pv ("upAtt"); p.upRel = pv ("upRel");
     p.llOn = pb ("llOn"); p.llThr = pv ("llThr"); p.llRatio = pv ("llRatio"); p.llRange = pv ("llRange"); p.llAtt = pv ("llAtt"); p.llRel = pv ("llRel");
-    p.dnOn = pb ("dnOn"); p.opto = pi ("opto") == 1;
+    p.dnOn = pb ("dnOn"); p.opto = pi ("opto") == 1; p.variMu = pi ("opto") == 2;
     p.thr1 = pv ("thr1"); p.ratio1 = pv ("ratio1"); p.att1 = pv ("att1"); p.rel1 = pv ("rel1");
     p.thr2 = pv ("thr2"); p.ratio2 = pv ("ratio2"); p.att2 = pv ("att2"); p.rel2 = pv ("rel2"); p.hyst = pv ("hyst");
     p.pkOn = pb ("pkOn"); p.crest = pv ("crest"); p.pkThr = pv ("pkThr"); p.pkCrest = pi ("pkMode") == 1;
-    p.kStereo = pv ("kStereo") * 0.01; p.msOn = pb ("msOn"); p.tiltOn = pb ("tiltOn"); p.tilt = pv ("tilt"); p.tiltPivot = pv ("tiltPivot"); p.pkRatio = pv ("pkRatio"); p.pkAtt = pv ("pkAtt"); p.pkRel = pv ("pkRel");
+    // K-Stereo: 100 % = 3x the side ambience (about +12 dB of extracted room)
+    p.kStereo = pv ("kStereo") * 0.03; p.kstOn = pb ("kstOn"); p.msOn = pb ("msOn"); p.tiltOn = pb ("tiltOn"); p.tilt = pv ("tilt"); p.tiltPivot = pv ("tiltPivot"); p.tiltPos = pi ("tiltPos"); p.tiltTarget = pi ("tiltTarget"); p.tiltMin = pi ("tiltPhase") == 1; p.pkRatio = pv ("pkRatio"); p.pkAtt = pv ("pkAtt"); p.pkRel = pv ("pkRel");
     p.ambOn = pb ("ambOn"); p.ambiance = pv ("ambiance") * 0.01; p.ambThr = pv ("ambThr"); p.ambRatio = pv ("ambRatio");
     p.ambAtt = pv ("ambAtt"); p.ambRel = pv ("ambRel"); p.ambAuto = pb ("ambAuto"); p.ambPreMs = pv ("ambPre"); p.ambTr = pv ("ambTr") * 0.01; p.ambStage = pi ("ambStage") + 1;
     p.widthDb = pv ("width"); p.centreDb = pv ("centre"); p.centreFilter = pi ("centreFilter"); p.centreFreq = pv ("centreFreq");
@@ -147,6 +154,8 @@ void DeltaCompProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     sr = sampleRate; blockSize = juce::jmax (samplesPerBlock, dcomp::Engine::maxInsertBlock());
     for (auto& r : dryRing) r.assign ((size_t) (6 * sampleRate) + (size_t) samplesPerBlock + 16, 0.0);
+    for (auto& r : lookRing) r.assign ((size_t) (0.25 * sampleRate) + 16, 0.0);
+    lookW = 0; meterLook = wantedMeterLook();
     dryW = 0; bypassMix = pb ("active") ? 0.0 : 1.0; bypassK = std::exp (-1.0 / (0.02 * sampleRate));
     engine.prepare (sampleRate, juce::jmax (1, getTotalNumInputChannels()));
     engine.setParams (currentParams());
@@ -164,7 +173,7 @@ void DeltaCompProcessor::updateLatency()
     const int il = insert != nullptr ? insert->getLatencySamples() : 0;
     insertLatency = il;
     engine.setInsertLatency (il);
-    setLatencySamples (engine.latency() + il);
+    setLatencySamples (engine.latency() + il + meterLook);
 }
 
 void DeltaCompProcessor::insertCallback (void* ctx, double* a, double* b, int n)
@@ -246,9 +255,24 @@ void DeltaCompProcessor::processAny (juce::AudioBuffer<T>& b)
     }
     const int ch = juce::jmin (b.getNumChannels(), getTotalNumInputChannels());
     // dry copy for the general bypass, delayed by the full latency so switching is seamless
-    const int total = getLatencySamples(), R = (int) dryRing[0].size();
+    if (wantedMeterLook() != meterLook)
+    {
+        meterLook = wantedMeterLook();
+        for (auto& r : lookRing) std::fill (r.begin(), r.end(), 0.0);
+        updateLatency();
+    }
+    const int total = getLatencySamples() - meterLook, R = (int) dryRing[0].size();
     for (int c = 0; c < juce::jmin (ch, 2); ++c)
         for (int i = 0; i < b.getNumSamples(); ++i) dryRing[(size_t) c][(size_t) ((dryW + i) % R)] = (double) b.getSample (c, i);
+    {   // input gain, after the dry copy (the bypass compares with the untouched input), 20 ms glide
+        const double gt = juce::Decibels::decibelsToGain ((double) pv ("in"));
+        if (std::abs (gt - inGain) > 1e-12 || gt != 1.0)
+            for (int i = 0; i < b.getNumSamples(); ++i)
+            {
+                inGain = gt + bypassK * (inGain - gt);
+                for (int c = 0; c < ch; ++c) b.setSample (c, i, (T) ((double) b.getSample (c, i) * inGain));
+            }
+    }
     engine.process (b.getArrayOfWritePointers(), ch, b.getNumSamples());
     const double want = pb ("active") ? 0.0 : 1.0;
     if (want != 0.0 || bypassMix > 1e-9)
@@ -268,6 +292,20 @@ void DeltaCompProcessor::processAny (juce::AudioBuffer<T>& b)
         scope[(size_t) (w & (kScopeSize - 1))] = (float) m; scopeS[(size_t) (w & (kScopeSize - 1))] = (float) sd; ++w;
     }
     scopeWrite.store (w, std::memory_order_release);
+    if (meterLook > 0)
+    {
+        const int LR = (int) lookRing[0].size();
+        for (int i = 0; i < b.getNumSamples(); ++i)
+        {
+            const int wr = (lookW + i) % LR, rd = ((lookW + i - meterLook) % LR + LR) % LR;
+            for (int c = 0; c < juce::jmin (ch, 2); ++c)
+            {
+                lookRing[(size_t) c][(size_t) wr] = (double) b.getSample (c, i);
+                b.setSample (c, i, (T) lookRing[(size_t) c][(size_t) rd]);
+            }
+        }
+        lookW = (lookW + b.getNumSamples()) % LR;
+    }
 }
 
 void DeltaCompProcessor::getStateInformation (juce::MemoryBlock& d)

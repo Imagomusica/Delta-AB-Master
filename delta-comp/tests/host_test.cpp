@@ -41,7 +41,7 @@ int main (int argc, char** argv)
     {
         p->setProcessingPrecision (dbl ? juce::AudioProcessor::doublePrecision : juce::AudioProcessor::singlePrecision);
         p->prepareToPlay (48000, 512);
-        check (p->getLatencySamples() == 5260, dbl ? "latency 5260 samples at 48 kHz (double)" : "latency 5260 samples at 48 kHz (float)", p->getLatencySamples());
+        check (p->getLatencySamples() == 9356, dbl ? "latency 9356 samples at 48 kHz (double)" : "latency 9356 samples at 48 kHz (float)", p->getLatencySamples());
         juce::MidiBuffer midi; double acc = 0; int cnt = 0;
         for (int blk = 0; blk < 400; ++blk)
         {
@@ -52,7 +52,7 @@ int main (int argc, char** argv)
             if (blk >= 350) for (int i = 0; i < 512; ++i) { const double v = dbl ? b.getSample (0, i) : f.getSample (0, i); acc += v * v; ++cnt; }
         }
         const double outDb = 10 * std::log10 (acc / cnt) + 3.0103;
-        check (std::abs (outDb - (-10.5)) < 0.4, dbl ? "-6 dBFS sine compressed to -10.5 (double)" : "-6 dBFS sine compressed to -10.5 (float)", outDb);
+        check (std::abs (outDb - (-11.25)) < 0.4, dbl ? "-6 dBFS sine compressed to -11.25 with the default zones (double)" : "-6 dBFS sine compressed to -11.25 with the default zones (float)", outDb);
         p->releaseResources();
     }
     // every oversampling setting keeps the latency
@@ -60,7 +60,7 @@ int main (int argc, char** argv)
     {
         if (auto* r = find ("Oversampling")) r->setValueNotifyingHost ((float) os / 3.0f);
         p->prepareToPlay (48000, 512);
-        check (p->getLatencySamples() == 5260, "latency constant for each oversampling setting", os);
+        check (p->getLatencySamples() == 9356, "latency constant for each oversampling setting", os);
         p->releaseResources();
     }
 
