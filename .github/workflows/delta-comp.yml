@@ -1,0 +1,64 @@
+name: Build Delta Comp
+
+on:
+  push:
+    paths: [ "delta-comp/**", ".github/workflows/delta-comp.yml" ]
+  workflow_dispatch:
+
+jobs:
+  mac:
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    defaults: { run: { working-directory: delta-comp } }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDELTACOMP_HOST_TEST=ON
+      - name: Build (universal arm64 + x86_64)
+        run: cmake --build build --config Release --target DeltaComp_VST3 DeltaComp_AU dsp_tests host_test --parallel 4
+      - name: Ad-hoc signature and package
+        run: |
+          codesign --force --deep -s - "build/DeltaComp_artefacts/Release/VST3/Delta Comp.vst3"
+          codesign --force --deep -s - "build/DeltaComp_artefacts/Release/AU/Delta Comp.component"
+          mkdir -p dist
+          ditto "build/DeltaComp_artefacts/Release/VST3/Delta Comp.vst3" "dist/VST3/Delta Comp.vst3"
+          ditto "build/DeltaComp_artefacts/Release/AU/Delta Comp.component" "dist/Components/Delta Comp.component"
+      - name: Upload Mac (VST3 + AU)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeltaComp-Mac-VST3-AU
+          path: delta-comp/dist/
+      - name: Tests
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+          build/host_test_artefacts/Release/host_test "build/DeltaComp_artefacts/Release/VST3/Delta Comp.vst3"
+
+  windows-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: Windows }
+          - { os: ubuntu-24.04, name: Linux }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults: { run: { working-directory: delta-comp, shell: bash } }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev libfreetype6-dev libfontconfig1-dev libgl1-mesa-dev xvfb
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDELTACOMP_HOST_TEST=ON
+      - name: Build
+        run: cmake --build build --config Release --target DeltaComp_VST3 dsp_tests host_test --parallel 4
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeltaComp-VST3-${{ matrix.name }}
+          path: delta-comp/build/DeltaComp_artefacts/Release/VST3/
+      - name: Tests
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+          if [ "$RUNNER_OS" = "Linux" ]; then xvfb-run -a build/host_test_artefacts/Release/host_test "build/DeltaComp_artefacts/Release/VST3/Delta Comp.vst3"
+          else build/host_test_artefacts/Release/host_test.exe "build/DeltaComp_artefacts/Release/VST3/Delta Comp.vst3"; fi

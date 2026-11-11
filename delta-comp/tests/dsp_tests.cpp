@@ -1,0 +1,256 @@
+// Measurement tests for the Delta Comp engine (no JUCE).
+#include "../Source/dsp/Compressor.h"
+#include <cstdio>
+#include <random>
+
+using namespace dcomp;
+static int fails = 0;
+static void check (bool ok, const char* what, double v) { std::printf ("[%s] %-66s %g\n", ok ? " OK " : "FAIL", what, v); if (! ok) ++fails; }
+
+static Params neutral()
+{
+    Params p; p.upOn = p.llOn = p.dnOn = p.pkOn = p.limOn = p.ambOn = false; p.autoGain = false; p.knee = 0; p.density = 0;
+    return p;
+}
+
+// Stereo sine for `seconds`, returns output RMS (peak-equivalent dB) over the last 0.5 s.
+static double runSine (Engine& e, double fs, double ampDb, double seconds, double freq = 997.0)
+{
+    const int n = (int) (seconds * fs), blk = 512, tail = (int) (0.5 * fs);
+    std::vector<double> l (blk), r (blk);
+    double* io[2] = { l.data(), r.data() };
+    const double a = dbToLin (ampDb);
+    double acc = 0; int cnt = 0;
+    for (int s = 0; s < n; s += blk)
+    {
+        const int m = std::min (blk, n - s);
+        for (int i = 0; i < m; ++i) l[(size_t) i] = r[(size_t) i] = a * std::sin (2 * kPi * freq * (s + i) / fs);
+        e.process (io, 2, m);
+        for (int i = 0; i < m; ++i) if (s + i >= n - tail) { acc += l[(size_t) i] * l[(size_t) i]; ++cnt; }
+    }
+    return 10 * std::log10 (acc / cnt) + 3.0103;
+}
+
+static double maxTruePeakDb (const std::vector<double>& l, const std::vector<double>& r)
+{
+    TruePeak t1, t2; double m = 0;
+    for (size_t i = 0; i < l.size(); ++i) m = std::max ({ m, t1.process (l[i]), t2.process (r[i]) });
+    return linToDb (m);
+}
+
+int main()
+{
+    const double fs = 48000;
+    {
+        TruePeak tp; double m = 0, sp = 0;
+        for (int i = 0; i < 2000; ++i) { const double x = std::sin (2 * kPi * 0.25 * i + kPi / 4); sp = std::max (sp, std::abs (x)); m = std::max (m, tp.process (x)); }
+        check (m > 0.98 && m < 1.02, "true peak of a fs/4 sine at 45 deg (samples at 0.707) = 1.0", m);
+    }
+    {   // static curves
+        Engine e; e.prepare (fs, 2);
+        Params p = neutral(); p.dnOn = p.upOn = p.llOn = p.pkOn = true; p.target = -14;
+        p.thr1 = 0; p.ratio1 = 2; p.thr2 = 6; p.ratio2 = 4; p.upThr = -10; p.upRatio = 2; p.upRange = 100;
+        p.llThr = -30; p.llRatio = 2; p.llRange = 3; p.crest = 10; p.pkRatio = 4;
+        e.setParams (p);
+        check (std::abs (e.curveC1 (-10) + 2) < 1e-9, "C: 4 dB over threshold 1, 2:1 -> -2 dB", e.curveC1 (-10));
+        const double tot = e.curveC1 (-4) + e.curveC2 (-4);   // 10 over thr1, 4 over thr2: -(10/2) - (1/2-1/4)*4 = -6
+        check (std::abs (tot + 6) < 1e-9, "C: double threshold 2:1 then 4:1 -> -6 dB at +10", tot);
+        check (std::abs (e.curveA (-30) - 100 * std::tanh (3.0 / 100)) < 1e-9, "A: 6 dB under upward threshold, 1:2 -> +3 dB", e.curveA (-30));
+        check (e.curveA (-80) == 0.0, "A: silence (-80 LUFS) is not lifted", e.curveA (-80));
+        check (std::abs (e.curveB (-14) + 3 * std::tanh (15.0 / 3)) < 1e-9, "B: low-level downward capped by its range (3 dB)", e.curveB (-14));
+        check (std::abs (e.peakThr() - (-4)) < 1e-9, "D: peak threshold = threshold 1 + crest = -4 dBFS", e.peakThr());
+        check (std::abs (e.curveD (0) + 3) < 1e-9, "D: peak 4 dB over, 4:1 -> -3 dB", e.curveD (0));
+    }
+    {   // transparency, latency
+        Engine e; e.prepare (fs, 2); e.setParams (neutral());
+        std::vector<double> l (4096, 0.0), r (4096, 0.0); l[0] = 0.5; r[0] = -0.25;
+        double* io[2] = { l.data(), r.data() };
+        e.process (io, 2, 4096);
+        double err = 0;
+        for (int i = 0; i < 4096; ++i) if (i != e.latency()) err = std::max (err, std::abs (l[(size_t) i]) + std::abs (r[(size_t) i]));
+        check (e.latency() == 240 + 16, "latency at 48 kHz = 256 samples, constant", e.latency());
+        check (l[(size_t) e.latency()] == 0.5 && r[(size_t) e.latency()] == -0.25 && err == 0, "all stages off: bit-transparent, delayed by latency()", l[(size_t) e.latency()]);
+    }
+    for (int f : { 2, 4, 8 })
+    {   // oversampled path keeps the same latency and is transparent in band
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.os = f; e.setParams (p);
+        const double out = runSine (e, fs, -6, 1, 1000);
+        char msg[96]; std::snprintf (msg, sizeof msg, "oversampling %dx: 1 kHz passes at unity (+-0.05 dB)", f);
+        check (std::abs (out + 6) < 0.05, msg, out);
+        std::vector<double> l (2048, 0.0), r (2048, 0.0); l[0] = 1;
+        double* io[2] = { l.data(), r.data() };
+        e.process (io, 2, 2048);
+        int pk = 0; for (int i = 0; i < 2048; ++i) if (std::abs (l[(size_t) i]) > std::abs (l[(size_t) pk])) pk = i;
+        std::snprintf (msg, sizeof msg, "oversampling %dx: impulse peak at latency()", f);
+        check (pk == e.latency(), msg, pk);
+    }
+    {   // steady downward through C
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.dnOn = true; p.target = -14; p.thr1 = 2; p.ratio1 = 4; p.thr2 = 20; e.setParams (p);
+        const double out = runSine (e, fs, -6, 5);
+        check (std::abs (out + 10.5) < 0.3, "C: -6 in, thr -12, 4:1 -> -10.5 dBFS out", out);
+    }
+    {   // opto releases slower after long compression than RMS mode
+        auto relTime = [&] (bool opto) {
+            Engine e; e.prepare (fs, 2); Params p = neutral(); p.dnOn = true; p.opto = opto; p.thr1 = -6; p.ratio1 = 4; p.rel1 = 200; p.thr2 = 20; e.setParams (p);
+            runSine (e, fs, -6, 4);
+            const int blk = 480; std::vector<double> l (blk), r (blk); double* io[2] = { l.data(), r.data() };
+            const double a = dbToLin (-30.0);
+            for (int b = 0; b < 400; ++b)
+            {
+                for (int i = 0; i < blk; ++i) l[(size_t) i] = r[(size_t) i] = a * std::sin (2 * kPi * 997 * (b * blk + i) / fs);
+                e.process (io, 2, blk);
+                if (e.meterC.load() > -1.0f) return b * 10.0;
+            }
+            return 4000.0;
+        };
+        const double tr = relTime (false), to = relTime (true);
+        check (to > tr * 1.5, "opto: recovery to -1 dB slower than RMS after 4 s of compression (ms)", to);
+    }
+    {   // hysteresis: with 3 dB hysteresis, a 2 dB drop of level does not release
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.dnOn = true; p.thr1 = -8; p.ratio1 = 3; p.thr2 = 20; p.hyst = 3; p.rel1 = 50; e.setParams (p);
+        runSine (e, fs, -6, 3);
+        const float before = e.meterC.load();
+        runSine (e, fs, -8, 2);
+        const float after = e.meterC.load();
+        check (std::abs (after - before) < 0.05, "hysteresis 3 dB: small level drop keeps the gain (dB change)", after - before);
+        runSine (e, fs, -40, 2);
+        check (e.meterC.load() > -0.1f, "hysteresis: a big drop releases fully", e.meterC.load());
+    }
+    {   // upward
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.upOn = true; p.target = -14; p.upThr = -6; p.upRatio = 2; p.upRange = 20; e.setParams (p);
+        const double out = runSine (e, fs, -30, 8);
+        check (std::abs (out - (-30 + 20 * std::tanh (5.0 / 20))) < 0.3, "A: -30 in, thr -20, 1:2 -> -25.1 dBFS out", out);
+    }
+    {   // density lifts low level more than high level
+        auto lift = [&] (double lvl) {
+            Engine a; a.prepare (fs, 2); a.setParams (neutral());
+            Engine b; b.prepare (fs, 2); Params p = neutral(); p.density = 1; b.setParams (p);
+            return runSine (b, fs, lvl, 3) - runSine (a, fs, lvl, 3);
+        };
+        const double lo = lift (-40), hi = lift (-8);
+        check (lo > hi + 6, "density: lift at -40 dBFS much larger than at -8 dBFS (dB)", lo - hi);
+    }
+    {   // auto gain
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.autoGain = true; p.target = -16; e.setParams (p);
+        runSine (e, fs, -30, 60);
+        check (std::abs (e.meterS.load() + 16) < 0.5, "auto gain brings -30 LUFS to the -16 LUFS target", e.meterS.load());
+    }
+    {   // loudness meters
+        Engine e; e.prepare (fs, 2); e.setParams (neutral());
+        runSine (e, fs, -20, 5);
+        check (std::abs (e.meterS.load() + 20) < 0.15, "short-term: -20 dBFS stereo sine = -20 LUFS", e.meterS.load());
+        check (std::abs (e.meterI.load() + 20) < 0.15, "integrated (gated) = -20 LUFS", e.meterI.load());
+        check (std::abs (e.meterM.load() + 20) < 0.15, "momentary = -20 LUFS", e.meterM.load());
+    }
+    // limiter: noise with hot spikes, every mode
+    for (int mode = 0; mode < 5; ++mode)
+    {
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.limOn = true; p.ceiling = -1;
+        p.truePeak = mode != 0; p.os = mode <= 1 ? 1 : (mode == 2 ? 2 : mode == 3 ? 4 : 8);
+        e.setParams (p);
+        std::mt19937 rng (7); std::normal_distribution<double> nd (0, 0.2);
+        const int n = (int) (fs * 3);
+        std::vector<double> l ((size_t) n), r ((size_t) n);
+        for (int i = 0; i < n; ++i) { l[(size_t) i] = nd (rng); r[(size_t) i] = nd (rng); if (i % 4800 == 100) l[(size_t) i] = 2.0; }
+        for (int s = 0; s < n; s += 512) { double* io[2] = { &l[(size_t) s], &r[(size_t) s] }; e.process (io, 2, std::min (512, n - s)); }
+        double sp = 0; for (int i = 0; i < n; ++i) sp = std::max ({ sp, std::abs (l[(size_t) i]), std::abs (r[(size_t) i]) });
+        const double tp = maxTruePeakDb (l, r);
+        const char* names[] = { "limiter sample peak: no sample above -1 dBFS", "limiter true peak (1x): output true peak <= -0.8 dBTP",
+                                "limiter 2x oversampled: true peak <= -0.7 dBTP", "limiter 4x oversampled: true peak <= -0.7 dBTP", "limiter 8x oversampled: true peak <= -0.7 dBTP" };
+        if (mode == 0) check (linToDb (sp) <= -1.0 + 1e-6, names[mode], linToDb (sp));
+        else check (tp <= (mode == 1 ? -0.8 : -0.7), names[mode], tp);
+    }
+    {   // unlinked limiter: a spike on L leaves R untouched
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.limOn = true; p.linkT = 0; p.linkR = 0; p.ceiling = -1; e.setParams (p);
+        const int n = 9600; std::vector<double> l ((size_t) n, 0.0), r ((size_t) n);
+        for (int i = 0; i < n; ++i) { r[(size_t) i] = 0.3 * std::sin (2 * kPi * 500 * i / fs); l[(size_t) i] = 0.3 * std::sin (2 * kPi * 500 * i / fs); }
+        l[4000] = 2.0;
+        std::vector<double> rIn = r;
+        double* io[2] = { l.data(), r.data() };
+        e.process (io, 2, n);
+        double err = 0; for (int i = e.latency(); i < n; ++i) err = std::max (err, std::abs (r[(size_t) i] - rIn[(size_t) (i - e.latency())]));
+        check (err < 1e-12, "unlinked limiter: right channel untouched by a left spike", err);
+    }
+    {   // ambiance: mono compatible, lifts the side in quiet passages, auto finds early reflections
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.ambOn = true; p.ambiance = 1; p.ambThr = -8; p.ambRatio = 3; p.ambAuto = true; p.ambStage = 3;
+        e.setParams (p);
+        // synthetic room: clicks every 0.5 s with 3 early reflections (4, 9, 15 ms) then an exponential diffuse tail from 25 ms
+        std::mt19937 rng (3); std::normal_distribution<double> nd (0, 1);
+        const int n = (int) (fs * 12);
+        std::vector<double> l ((size_t) n, 0.0), r ((size_t) n, 0.0), mono ((size_t) n, 0.0);
+        for (int t0 = 0; t0 + 24000 <= n; t0 += 24000)
+        {
+            l[(size_t) t0] += 0.5; r[(size_t) t0] += 0.5;
+            const int er[3] = { 192, 432, 720 }; const double eg[3] = { 0.3, 0.25, 0.2 };
+            for (int k = 0; k < 3; ++k) { l[(size_t) (t0 + er[k])] += eg[k]; r[(size_t) (t0 + er[k] + 7)] += eg[k] * 0.9; }
+            for (int i = 1200; i < 24000; ++i) { const double g = 0.05 * std::exp (-(i - 1200) / (0.25 * fs)); l[(size_t) (t0 + i)] += g * nd (rng); r[(size_t) (t0 + i)] += g * nd (rng); }
+        }
+        for (int i = 0; i < n; ++i) mono[(size_t) i] = l[(size_t) i] + r[(size_t) i];
+        for (int s = 0; s < n; s += 512) { double* io[2] = { &l[(size_t) s], &r[(size_t) s] }; e.process (io, 2, std::min (512, n - s)); }
+        double err = 0; for (int i = e.latency(); i < n; ++i) err = std::max (err, std::abs (l[(size_t) i] + r[(size_t) i] - mono[(size_t) (i - e.latency())]));
+        check (err < 1e-9, "ambiance: L+R (mono) unchanged", err);
+        check (e.meterAmb.load() > 1.0f, "ambiance: tails lifted (dB of upward on the side)", e.meterAmb.load());
+        const float er = e.meterEr.load();
+        check (er > 22 && er < 32, "ambiance auto: early reflections end found (synthetic 25 ms, starts at 20)", er);
+    }
+    {   // transients: round off lowers the attack of a drum-like burst, keeps its body
+        auto burst = [&] (double amount, double& attackPk, double& bodyRms) {
+            Engine e; e.prepare (fs, 2); Params p = neutral(); p.transient = amount; e.setParams (p);
+            const int n = (int) fs; std::vector<double> l ((size_t) n, 0.0), r;
+            for (int t0 = 0; t0 < n; t0 += 12000)
+                for (int i = 0; i < 6000; ++i) l[(size_t) (t0 + i)] = 0.5 * std::exp (-i / 600.0) * std::sin (2 * kPi * 200 * i / fs) + 0.1 * std::sin (2 * kPi * 200 * i / fs);
+            r = l;
+            for (int s = 0; s < n; s += 512) { double* io[2] = { &l[(size_t) s], &r[(size_t) s] }; e.process (io, 2, std::min (512, n - s)); }
+            const int t0 = 3 * 12000 + e.latency();
+            attackPk = 0; for (int i = 0; i < 300; ++i) attackPk = std::max (attackPk, std::abs (l[(size_t) (t0 + i)]));
+            bodyRms = 0; for (int i = 4000; i < 6000; ++i) bodyRms += l[(size_t) (t0 + i)] * l[(size_t) (t0 + i)];
+        };
+        double a0, b0, a1, b1; burst (0, a0, b0); burst (-1, a1, b1);
+        check (linToDb (a1 / a0) < -3, "transients -100%: attack peak lowered by more than 3 dB", linToDb (a1 / a0));
+        check (std::abs (10 * std::log10 (b1 / b0)) < 1.0, "transients -100%: body within 1 dB", 10 * std::log10 (b1 / b0));
+    }
+    {   // M/S tail reverb on Side: mono sum untouched, tails added only when quiet
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.revOn = true; p.revTarget = 1; p.revSendDb = -12; p.revDyn = 1; p.target = -14; p.upThr = -10;
+        e.setParams (p);
+        std::mt19937 rng (5); std::normal_distribution<double> nd (0, 1);
+        const int n = (int) (fs * 4);
+        std::vector<double> l ((size_t) n), r ((size_t) n), mono ((size_t) n), side ((size_t) n);
+        for (int i = 0; i < n; ++i) { const double a = i < n / 2 ? 0.3 : 0.003; l[(size_t) i] = a * nd (rng); r[(size_t) i] = a * nd (rng); }
+        for (int i = 0; i < n; ++i) { mono[(size_t) i] = l[(size_t) i] + r[(size_t) i]; side[(size_t) i] = l[(size_t) i] - r[(size_t) i]; }
+        for (int s = 0; s < n; s += 512) { double* io[2] = { &l[(size_t) s], &r[(size_t) s] }; e.process (io, 2, std::min (512, n - s)); }
+        double err = 0, addLoud = 0, addQuiet = 0, refLoud = 0, refQuiet = 0;
+        for (int i = e.latency(); i < n; ++i)
+        {
+            const size_t k = (size_t) i, j = (size_t) (i - e.latency());
+            err = std::max (err, std::abs (l[k] + r[k] - mono[j]));
+            const double d = (l[k] - r[k]) - side[j];
+            if (i > n / 4 && i < n / 2) { addLoud += d * d; refLoud += side[j] * side[j]; }
+            if (i > 3 * n / 4) { addQuiet += d * d; refQuiet += side[j] * side[j]; }
+        }
+        check (err < 1e-9, "tail reverb on Side: mono sum unchanged", err);
+        const double rl = 10 * std::log10 (addLoud / refLoud), rq = 10 * std::log10 (addQuiet / refQuiet);
+        check (rq > rl + 15, "tail reverb dynamic: much more reverb relative to signal when quiet (dB)", rq - rl);
+    }
+    {   // M/S: centre +1.5 dB broadband on a mono signal, side low cut 24 dB/oct at 120 Hz on a 40 Hz side
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.centreDb = 1.5; e.setParams (p);
+        const double out = runSine (e, fs, -12, 1);
+        check (std::abs (out + 10.5) < 0.02, "centre +1.5 dB (broadband) on a mono sine", out);
+        Engine e2; e2.prepare (fs, 2); p = neutral(); p.sideLowCut = 120; p.sideSlope = 24; e2.setParams (p);
+        const int n = (int) fs; std::vector<double> l ((size_t) n), r ((size_t) n);
+        for (int i = 0; i < n; ++i) { const double s = 0.25 * std::sin (2 * kPi * 40 * i / fs); l[(size_t) i] = s; r[(size_t) i] = -s; }
+        for (int s = 0; s < n; s += 512) { double* io[2] = { &l[(size_t) s], &r[(size_t) s] }; e2.process (io, 2, std::min (512, n - s)); }
+        double pk = 0; for (int i = n / 2; i < n; ++i) pk = std::max (pk, std::abs (l[(size_t) i]));
+        check (linToDb (pk / 0.25) < -30, "side low cut 120 Hz 24 dB/oct: 40 Hz side down > 30 dB", linToDb (pk / 0.25));
+        Engine e3; e3.prepare (fs, 2); p = neutral(); p.centreDb = 3; p.centreFilter = 1; p.centreFreq = 200; e3.setParams (p);
+        const double lo = runSine (e3, fs, -12, 1, 50), hi = runSine (e3, fs, -12, 1, 5000);
+        check (std::abs (lo + 9) < 0.2 && std::abs (hi + 12) < 0.1, "centre low shelf +3 dB at 200 Hz: 50 Hz +3, 5 kHz 0", lo);
+    }
+    {   // float mono
+        Engine e; e.prepare (44100, 1); e.setParams (Params());
+        std::vector<float> m (1024, 0.1f); float* io[1] = { m.data() };
+        e.process (io, 1, 1024);
+        check (std::isfinite (m[1023]), "float mono processing runs, default settings", m[1023]);
+    }
+    std::printf (fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
+    return fails ? 1 : 0;
+}

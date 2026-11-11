@@ -2,6 +2,7 @@ name: Build Delta AB
 
 on:
   push:
+    paths-ignore: [ "delta-comp/**", ".github/workflows/delta-comp.yml" ]
   workflow_dispatch:
 
 jobs:
