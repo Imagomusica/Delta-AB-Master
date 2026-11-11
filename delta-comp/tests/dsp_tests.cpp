@@ -2,6 +2,7 @@
 #include "../Source/dsp/Compressor.h"
 #include <cstdio>
 #include <random>
+#include <complex>
 
 using namespace dcomp;
 static int fails = 0;
@@ -38,6 +39,50 @@ static double maxTruePeakDb (const std::vector<double>& l, const std::vector<dou
     return linToDb (m);
 }
 
+
+// Aliasing: a 21 kHz tone rides along with band-limited 100 Hz bursts that make every stage work hard.
+// Without aliasing nothing can appear between 5 and 16 kHz (the bursts stay below ~4 kHz even with their
+// gain modulation, the tone's sidebands stay above 17 kHz). Returns that band's power relative to the tone, dB.
+static double aliasBandDb (double fs, int os)
+{
+    Engine e; e.prepare (fs, 2);
+    Params p = neutral();
+    p.pkOn = true; p.pkAtt = 0.05; p.pkRel = 30; p.crest = 0; p.dnOn = true; p.att1 = 1; p.att2 = 0.5; p.thr1 = -10; p.ratio1 = 3;
+    p.thr2 = -4; p.ratio2 = 8; p.upOn = true; p.limOn = true; p.ceiling = -6; p.transient = -1; p.autoGain = true; p.os = os;
+    p.ambOn = true; p.ambiance = 1; p.density = 0.5;
+    e.setParams (p);
+    const int N = 1 << 16, skip = (int) fs + e.latency(), total = skip + N;
+    std::vector<double> l ((size_t) total), r ((size_t) total);
+    const int period = (int) (0.125 * fs); const double sig = 0.004 * fs;
+    for (int i = 0; i < total; ++i)
+    {
+        const double t = (double) (i % period) - 0.5 * period, env = 0.9 * std::exp (-0.5 * t * t / (sig * sig));
+        const double b = env * std::sin (2 * kPi * 100.0 * i / fs), h = 0.25 * std::sin (2 * kPi * 21000.0 * i / fs);
+        l[(size_t) i] = b + h; r[(size_t) i] = 0.7 * b + h;
+    }
+    for (int s = 0; s < total; s += 512) { double* io[2] = { &l[(size_t) s], &r[(size_t) s] }; e.process (io, 2, std::min (512, total - s)); }
+    std::vector<std::complex<double>> a ((size_t) N);
+    for (int i = 0; i < N; ++i)
+    {
+        const double t = 2.0 * i / (N - 1) - 1, w = std::cyl_bessel_i (0.0, 20 * std::sqrt (std::max (0.0, 1 - t * t))) / std::cyl_bessel_i (0.0, 20.0);
+        a[(size_t) i] = l[(size_t) (skip + i)] * w;
+    }
+    for (size_t i = 1, j = 0; i < (size_t) N; ++i) { size_t bit = (size_t) N >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) std::swap (a[i], a[j]); }
+    for (size_t len = 2; len <= (size_t) N; len <<= 1)
+    {
+        const std::complex<double> wl (std::cos (-2 * kPi / (double) len), std::sin (-2 * kPi / (double) len));
+        for (size_t i = 0; i < (size_t) N; i += len) { std::complex<double> w (1); for (size_t j = 0; j < len / 2; ++j) { auto u = a[i + j], v = a[i + j + len / 2] * w; a[i + j] = u + v; a[i + j + len / 2] = u - v; w *= wl; } }
+    }
+    double band = 0, tone = 0;
+    for (int k = 1; k < N / 2; ++k)
+    {
+        const double f = k * fs / N, pw = std::norm (a[(size_t) k]);
+        if (f > 5000 && f < 16000) band += pw;
+        if (f > 20500 && f < 21500) tone += pw;
+    }
+    return 10 * std::log10 (band / tone + 1e-300);
+}
+
 int main()
 {
     const double fs = 48000;
@@ -68,8 +113,9 @@ int main()
         e.process (io, 2, 4096);
         double err = 0;
         for (int i = 0; i < 4096; ++i) if (i != e.latency()) err = std::max (err, std::abs (l[(size_t) i]) + std::abs (r[(size_t) i]));
-        check (e.latency() == 240 + 16, "latency at 48 kHz = 256 samples, constant", e.latency());
-        check (l[(size_t) e.latency()] == 0.5 && r[(size_t) e.latency()] == -0.25 && err == 0, "all stages off: bit-transparent, delayed by latency()", l[(size_t) e.latency()]);
+        check (e.latency() > 256 && e.latency() < 1024, "latency at 48 kHz: look-ahead + gain FIR, constant", e.latency());
+        err = std::max ({ err, std::abs (l[(size_t) e.latency()] - 0.5), std::abs (r[(size_t) e.latency()] + 0.25) });
+        check (err < 1e-12, "all stages off: transparent (< -240 dB error), delayed by latency()", err);
     }
     for (int f : { 2, 4, 8 })
     {   // oversampled path keeps the same latency and is transparent in band
@@ -250,6 +296,11 @@ int main()
         std::vector<float> m (1024, 0.1f); float* io[1] = { m.data() };
         e.process (io, 1, 1024);
         check (std::isfinite (m[1023]), "float mono processing runs, default settings", m[1023]);
+    }
+    {   // aliasing: nothing folds back below 20 kHz
+        check (aliasBandDb (48000, 1) < -130, "no aliasing 48k 1x: 5-16 kHz band vs 21 kHz tone (dB)", aliasBandDb (48000, 1));
+        check (aliasBandDb (48000, 4) < -130, "no aliasing 48k 4x: 5-16 kHz band vs 21 kHz tone (dB)", aliasBandDb (48000, 4));
+        check (aliasBandDb (44100, 1) < -130, "no aliasing 44.1k 1x: 5-16 kHz band vs 21 kHz tone (dB)", aliasBandDb (44100, 1));
     }
     std::printf (fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails ? 1 : 0;

@@ -223,6 +223,8 @@ struct Oversampler
     }
 };
 
+// Ambiance side extraction: high-pass, pre-delay (past the early reflections), two allpasses.
+struct AmbExtract;
 // Small 4-line feedback delay network for discreet tails.
 struct TailVerb
 {
@@ -259,6 +261,49 @@ struct TailVerb
         for (size_t i = 0; i < 4; ++i) { line[i][(size_t) pos[i]] = x + g[i] * m[i]; pos[i] = (pos[i] + 1) % len[i]; }
         outA = 0.5 * (o[0] + o[1] - o[2] + o[3]);
         outB = 0.5 * (o[0] - o[1] + o[2] + o[3]);
+    }
+};
+
+// Linear-phase Kaiser low-pass applied to gain signals (anti-aliasing of the gain modulation):
+// stopband at (Nyquist - 20 kHz), -140 dB, so a gain change can never fold anything below 20 kHz.
+struct GainFir
+{
+    std::vector<double> h; int N = 1, half = 0;
+    static double i0 (double x) { double s = 1, t = 1; for (int k = 1; k < 60; ++k) { t *= (x / (2 * k)) * (x / (2 * k)); s += t; if (t < 1e-18 * s) break; } return s; }
+    // Kaiser linear-phase low-pass, 140 dB stopband from fsb, passband to fsb / 4, unity DC gain.
+    // half is rounded up to a multiple of 'mult' (oversampled use needs a whole number of base samples).
+    void design (double fs, double fsb, int mult = 1)
+    {
+        const double fp = fsb * 0.25, A = 140.0;
+        const double dw = 2 * kPi * (fsb - fp) / fs, beta = 0.1102 * (A - 8.7);
+        half = (int) std::ceil ((A - 8.0) / (2.285 * dw) * 0.5);
+        half = ((half + mult - 1) / mult) * mult; N = 2 * half + 1;
+        h.assign ((size_t) N, 0.0);
+        const double fc = 0.5 * (fp + fsb) / fs; double sum = 0;
+        for (int i = 0; i < N; ++i)
+        {
+            const double t = i - half, r = (double) t / half;
+            const double sinc = t == 0 ? 2 * fc : std::sin (2 * kPi * fc * t) / (kPi * t);
+            h[(size_t) i] = sinc * i0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0 (beta); sum += h[(size_t) i];
+        }
+        for (auto& v : h) v /= sum;
+    }
+};
+struct FirLine   // one gain stream through a GainFir (doubled ring buffer, contiguous dot product)
+{
+    std::vector<double> ring; int pos = 0, N = 1;
+    void prepare (int n, double init) { N = n; ring.assign ((size_t) (2 * N), init); pos = 0; }
+    void reserve (int n) { ring.reserve ((size_t) (2 * n)); }   // then prepare (m <= n) never allocates
+    void reset (double init) { std::fill (ring.begin(), ring.end(), init); pos = 0; }
+    double process (double x, const std::vector<double>& h)
+    {
+        ring[(size_t) pos] = ring[(size_t) (pos + N)] = x; pos = (pos + 1) % N;
+        const double* w = &ring[(size_t) pos];   // oldest .. newest
+        const double* k = h.data();
+        double a0 = 0, a1 = 0, a2 = 0, a3 = 0; int i = 0;
+        for (; i + 3 < N; i += 4) { a0 += k[i] * w[i]; a1 += k[i + 1] * w[i + 1]; a2 += k[i + 2] * w[i + 2]; a3 += k[i + 3] * w[i + 3]; }
+        for (; i < N; ++i) a0 += k[i] * w[i];
+        return (a0 + a1) + (a2 + a3);
     }
 };
 
@@ -332,18 +377,39 @@ public:
     {
         fs = sampleRate; nch = std::clamp (numChannels, 1, kMaxCh);
         lookMax = std::max (1, (int) std::lround (kMaxLookMs * 0.001 * fs));
-        latencySamples = lookMax + Oversampler::kDelayBase;
+        // Alias-free budget: a gain with bandwidth B shifts the audio by at most B. Up to three gain
+        // modulations follow each other on the way out (dynamics, reverb send, 1x limiter), so each one is
+        // band-limited to a third of (fs/2 - 20 kHz): nothing can fold back below 20 kHz.
+        gfir.design (fs, std::clamp ((fs * 0.5 - 20000.0) / 3.0, 300.0, 8000.0));
+        const int hf = gfir.half;
+        // oversampled limiter: its gain only has to stay below (F - 1) fs / 2 (the rest is removed when coming down)
+        int tailOs = 0, nMax = gfir.N, hoMax = 0;
+        for (int k = 1; k <= 3; ++k)
+        {
+            const int F = 1 << k;
+            gfirOs[(size_t) k].design (F * fs, (F - 1) * fs * 0.5, F);
+            tailOs = std::max (tailOs, Oversampler::kDelayBase + 2 * gfirOs[(size_t) k].half / F);
+            nMax = std::max (nMax, gfirOs[(size_t) k].N); hoMax = std::max (hoMax, 2 * gfirOs[(size_t) k].half);
+        }
+        limTail = std::max (TruePeak::kDelay + 2 * hf, tailOs);
+        latencySamples = hf + lookMax + limTail;
         for (int c = 0; c < kMaxCh; ++c)
         {
             for (auto& k : kw[(size_t) c]) k.prepare (fs);
             wetKw[(size_t) c].prepare (fs); outKw[(size_t) c].prepare (fs); inKw[(size_t) c].prepare (fs);
-            limDelay[(size_t) c].reserve ((lookMax + 1) * Oversampler::kMaxF + 8);
+            limDelay[(size_t) c].reserve ((lookMax + 1) * Oversampler::kMaxF + 2 * hf + hoMax + 16);
+            xDelay[(size_t) c].reserve (hf + 1); xDelay[(size_t) c].setLength (hf);
+            firMain[(size_t) c].prepare (gfir.N, 1.0); firAmbC[(size_t) c].prepare (gfir.N, 0.0);
+            limFir[(size_t) c].reserve (nMax); limFir[(size_t) c].prepare (gfir.N, 1.0);
             spDelay[(size_t) c].reserve (TruePeak::kDelay + 1); spDelay[(size_t) c].setLength (TruePeak::kDelay);
-            hold[(size_t) c].reserve ((lookMax + 2) * Oversampler::kMaxF);
+            hold[(size_t) c].reserve ((lookMax + 2) * Oversampler::kMaxF + 2 * hf + hoMax);
             box[(size_t) c].reserve ((lookMax + 2) * Oversampler::kMaxF);
             pad[(size_t) c].reserve (latencySamples + 2);
         }
-        ambHp.highpass (fs, 150.0);
+        firRev.prepare (gfir.N, 0.0);
+        ambHp.highpass (fs, 150.0); ambHpA.highpass (fs, 150.0);
+        ambRingA.assign ((size_t) (0.1 * fs) + 4, 0.0); ambRingG.assign (ambRingA.size(), 1.0);
+        ap1A.prepare ((int) std::lround (0.0053 * fs), 0.6); ap2A.prepare ((int) std::lround (0.0079 * fs), 0.55);
         ambRing.assign ((size_t) (0.1 * fs) + 4, 0.0); ambW = 0; ambD = (double) std::lround (0.02 * fs);
         ambKw.prepare (fs); verb.prepare (fs);
         frameLen = std::max (1, (int) std::lround (0.001 * fs));
@@ -365,6 +431,8 @@ public:
             pkEnv[c] = 0;
             gA[c] = gB[c] = gC1[c] = gC2[c] = gD[c] = gDen[c] = 0; relC1[c] = relC2[c] = relD[c] = false; optoMem[c] = 0;
         }
+        for (size_t c = 0; c < (size_t) kMaxCh; ++c) { xDelay[c].reset(); firMain[c].reset (1.0); firAmbC[c].reset (0.0); limFir[c].reset (1.0); }
+        firRev.reset (0.0); ambHpA.reset(); ap1A.reset(); ap2A.reset(); std::fill (ambRingA.begin(), ambRingA.end(), 0.0); std::fill (ambRingG.begin(), ambRingG.end(), 1.0); ambWA = 0;
         ambHp.reset(); std::fill (ambRing.begin(), ambRing.end(), 0.0); ap1.reset(); ap2.reset(); ambKw.reset(); verb.reset(); lvlA = -100;
         ambRms = 1e-10; gAmb = 0; frameAcc = 0; frameCount = 0; frameIdx = 0; recLeft = 0; sinceOnset = 100000;
         frames.fill (-120); erMs = 20; meterEr.store ((float) erMs);
@@ -466,7 +534,9 @@ public:
             widthS = dbToLin (p.widthDb) + cSmooth * (widthS - dbToLin (p.widthDb));
             centreS = dbToLin (p.centreDb) + cSmooth * (centreS - dbToLin (p.centreDb));
             denS = p.density + cSmooth * (denS - p.density); ambS = p.ambiance + cSmooth * (ambS - p.ambiance);
-            double x[kMaxCh] {}, s[kMaxCh] {};
+            double x[kMaxCh] {}, s[kMaxCh] {}, gPre[kMaxCh] { 1, 1 }, gPost[kMaxCh] { 1, 1 }, dk[kMaxCh] {};
+            bool afterAmb = false; ambUsed = false; ambK = 0;
+            auto mulGain = [&] (int c, double gl) { if (afterAmb) gPost[c] *= gl; else gPre[c] *= gl; };
             for (int c = 0; c < C; ++c) s[c] = x[c] = (double) io[c][i];
             {   // input metering (sand, crest, dynamic range)
                 double ip = 0;
@@ -488,7 +558,7 @@ public:
                 const double tr = std::clamp (linToDb (trFast + 1e-9) - linToDb (trSlow + 1e-9), 0.0, 12.0);
                 const double g = trS * tr;
                 mT = std::abs (g) > std::abs (mT) ? g : mT;
-                if (std::abs (g) > 1e-6) { const double gl = dbToLin (g); for (int c = 0; c < C; ++c) s[c] *= gl; }
+                if (std::abs (g) > 1e-6) { const double gl = dbToLin (g); for (int c = 0; c < C; ++c) { s[c] *= gl; mulGain (c, gl); } }
             }
 
             // A, B, C: RMS stages in series, each detects its own input
@@ -507,11 +577,11 @@ public:
             };
             double L[kMaxCh] {};
             lvlA = rmsLevels (0, s, L);
-            for (int c = 0; c < C; ++c) { auto& g = gA[(size_t) c]; smooth (g, curveA (L[c]), cAa, cAr); s[c] *= dbToLin (g); mA = std::max (mA, g); }
-            if (p.ambStage == 1) ambiance (s, C, mAmb);
+            for (int c = 0; c < C; ++c) { auto& g = gA[(size_t) c]; smooth (g, curveA (L[c]), cAa, cAr); s[c] *= dbToLin (g); mulGain (c, dbToLin (g)); mA = std::max (mA, g); }
+            if (p.ambStage == 1) { ambiance (s, C, mAmb); afterAmb = ambUsed; }
             rmsLevels (1, s, L);
-            for (int c = 0; c < C; ++c) { auto& g = gB[(size_t) c]; smooth (g, curveB (L[c]), cBa, cBr); s[c] *= dbToLin (g); mB = std::min (mB, g); }
-            if (p.ambStage == 2) ambiance (s, C, mAmb);
+            for (int c = 0; c < C; ++c) { auto& g = gB[(size_t) c]; smooth (g, curveB (L[c]), cBa, cBr); s[c] *= dbToLin (g); mulGain (c, dbToLin (g)); mB = std::min (mB, g); }
+            if (p.ambStage == 2) { ambiance (s, C, mAmb); afterAmb = ambUsed; }
             lvlC = rmsLevels (2, s, L);
             for (int c = 0; c < C; ++c)
             {
@@ -526,9 +596,9 @@ public:
                 }
                 smoothHyst (gC1[u], curveC1 (L[c]), cC1a, r1, relC1[u]);
                 smoothHyst (gC2[u], curveC2 (L[c]), cC2a, r2, relC2[u]);
-                s[c] *= dbToLin (gC1[u] + gC2[u]); mC = std::min (mC, gC1[u] + gC2[u]);
+                s[c] *= dbToLin (gC1[u] + gC2[u]); mulGain (c, dbToLin (gC1[u] + gC2[u])); mC = std::min (mC, gC1[u] + gC2[u]);
             }
-            if (p.ambStage == 3) ambiance (s, C, mAmb);
+            if (p.ambStage == 3) { ambiance (s, C, mAmb); afterAmb = ambUsed; }
 
             // D: peak
             double pk = 0, pkc[kMaxCh] {};
@@ -544,9 +614,9 @@ public:
                 const double lv = linToDb (p.link * pk + (1.0 - p.link) * pkc[c]);
                 auto& g = gD[(size_t) c];
                 smoothHyst (g, curveD (lv), cDa, cDr, relD[(size_t) c]);
-                s[c] *= dbToLin (g); mD = std::min (mD, g);
+                s[c] *= dbToLin (g); mulGain (c, dbToLin (g)); mD = std::min (mD, g);
             }
-            if (p.ambStage == 4) ambiance (s, C, mAmb);
+            if (p.ambStage == 4) { ambiance (s, C, mAmb); afterAmb = ambUsed; }
 
             // Density: parallel, heavily compressed (thr target - 30 LU, 10:1), made up to the target level
             if (denS > 1e-4)
@@ -557,7 +627,8 @@ public:
                 {
                     auto& g = gDen[(size_t) c];
                     smooth (g, -(1.0 - 1.0 / 10.0) * std::max (0.0, L[c] - thr), cDenA, cDenR);
-                    s[c] += 0.5 * denS * x[c] * dbToLin (g + makeup) * std::clamp ((L[c] - kSilenceLufs) / 10.0, 0.0, 1.0);
+                    dk[c] = 0.5 * denS * dbToLin (g + makeup) * std::clamp ((L[c] - kSilenceLufs) / 10.0, 0.0, 1.0);
+                    s[c] += dk[c] * x[c];
                     mDen = std::min (mDen, g);
                 }
             }
@@ -573,8 +644,38 @@ public:
             }
             else makeupDb *= cMakeup;
             const double mk = dbToLin (makeupDb);
-            double y[kMaxCh] {};
-            for (int c = 0; c < C; ++c) y[c] = outS * ((1.0 - mixS) * x[c] + mixS * s[c] * mk);
+
+            // audio path: the input delayed by the gain FIR, times ONE band-limited gain per channel that holds
+            // every stage, the density, the makeup, the mix and the output gain (a product of separately filtered
+            // gains would widen the band again). The ambiance is a second, additive band-limited term.
+            double xd[kMaxCh] {}, y[kMaxCh] {};
+            const bool same = C == 2 && p.link >= 1.0;
+            double G[kMaxCh] {};
+            for (int c = 0; c < C; ++c)
+            {
+                xd[c] = xDelay[(size_t) c].process (x[c]);
+                if (same && c == 1) { G[1] = G[0]; continue; }
+                G[c] = firMain[(size_t) c].process (outS * ((1.0 - mixS) + mixS * mk * (gPre[c] * gPost[c] + dk[c])), gfir.h);
+            }
+            for (int c = 0; c < C; ++c) y[c] = xd[c] * G[c];
+            if (C == 2)
+            {
+                // decorrelated side of the (unprocessed) input, pre-delayed like the control path; the gain applied
+                // before the ambiance on the control path is delayed by the same pre-delay
+                const size_t R = ambRingA.size(), rd = (ambWA + R - (size_t) ambD) % R;
+                ambRingA[ambWA] = ambHpA.process (0.5 * (xd[0] - xd[1]));
+                ambRingG[ambWA] = 0.5 * (gPre[0] + gPre[1]);
+                const double del = ambRingA[rd], gDel = ambRingG[rd];
+                ambWA = (ambWA + 1) % R;
+                const double e = ap2A.process (ap1A.process (del));
+                double ka[kMaxCh] {};
+                for (int c = 0; c < 2; ++c)
+                {
+                    if (same && c == 1) { ka[1] = ka[0]; continue; }
+                    ka[c] = firAmbC[(size_t) c].process (outS * mixS * mk * gDel * ambK * gPost[c], gfir.h);
+                }
+                y[0] += ka[0] * e; y[1] -= ka[1] * e;
+            }
 
             // M/S end section: width, discreet tail reverb on Mid / Side, sent mostly at low level
             if (C == 2 && (p.revOn || std::abs (p.widthDb) > 1e-6 || std::abs (p.centreDb) > 1e-6 || p.sideLowCut > 0))
@@ -591,7 +692,7 @@ public:
                     verb.setPreDelay (p.revPreAuto ? erMs : p.revPreMs);
                     const double in = p.revTarget == 0 ? m : p.revTarget == 1 ? sd : m + sd;
                     double ra = 0, rb = 0;
-                    verb.process (in * revSendS, ra, rb);
+                    verb.process (in * firRev.process (revSendS, gfir.h), ra, rb);
                     if (p.revTarget == 0) m += ra; else if (p.revTarget == 1) sd += ra; else { m += ra; sd += rb; }
                 }
                 y[0] = m + sd; y[1] = m - sd;
@@ -704,6 +805,7 @@ private:
         ambW = (ambW + 1) % R;
         const double e = ap2.process (ap1.process (delayed));
         const double amt = p.ambOn ? ambS : 0.0;
+        ambUsed = true; ambK = amt * (dbToLin (gAmb) - 1.0);
         if (amt <= 0) return;
         const double s2 = sd + amt * (dbToLin (gAmb) - 1.0) * e;
         s[0] = m + s2; s[1] = m - s2;
@@ -763,25 +865,32 @@ private:
     {
         curOs = wantOs; curLook = wantLook;
         const int Lh = curLook * curOs;
-        const int padLen = curOs > 1 ? lookMax - curLook
-                                     : lookMax - curLook + Oversampler::kDelayBase - TruePeak::kDelay;
+        const int hf = gfir.half, tail = limTail;
+        const GainFir& lf = curOs > 1 ? gfirOs[(size_t) (curOs == 2 ? 1 : curOs == 4 ? 2 : 3)] : gfir;
+        const int hl = lf.half;   // limiter gain FIR half length, at the limiter's rate
+        const int padLen = curOs > 1 ? lookMax - curLook + tail - Oversampler::kDelayBase - 2 * hl / curOs
+                                     : lookMax - curLook + tail - TruePeak::kDelay - 2 * hf;
         for (size_t c = 0; c < (size_t) kMaxCh; ++c)
         {
             os[c].setFactor (curOs);
-            limDelay[c].setLength (curOs > 1 ? Lh : curLook + TruePeak::kDelay);   // 1x: detection is TruePeak::kDelay late
-            hold[c].setLength ((curOs > 1 ? Lh : curLook) + 1);
+            // the gain goes through a band-limiting FIR (window 2 * hl); at 1x detection is also TruePeak::kDelay late
+            limDelay[c].setLength (curOs > 1 ? Lh + 2 * hl : curLook + TruePeak::kDelay + 2 * hl);
+            hold[c].setLength ((curOs > 1 ? Lh : curLook) + 2 * hl + 1);
+            limFir[c].prepare (lf.N, 1.0);
             box[c].setLength (curOs > 1 ? Lh : curLook);
             pad[c].setLength (padLen);
             limEnv[c] = 1; tpLim[c].reset(); spDelay[c].reset();
         }
     }
 
+    const std::vector<double>& limH() const { return curOs > 1 ? gfirOs[(size_t) (curOs == 2 ? 1 : curOs == 4 ? 2 : 3)].h : gfir.h; }
+
     // one limiter step at the current rate: a = detected peak per channel (already aligned), v = audio in / out
     void limitSample (const double* a, double* v, int C, double& meterMin)
     {
         if (! p.limOn)
         {
-            for (int c = 0; c < C; ++c) { const size_t u = (size_t) c; hold[u].process (1.0); box[u].process (1.0); limEnv[u] = 1; v[c] = limDelay[u].process (v[c]); }
+            for (int c = 0; c < C; ++c) { const size_t u = (size_t) c; hold[u].process (1.0); box[u].process (1.0); limFir[u].process (1.0, limH()); limEnv[u] = 1; v[c] = limDelay[u].process (v[c]); }
             return;
         }
         double want[kMaxCh] {}, wmin = 1.0;
@@ -799,7 +908,8 @@ private:
         {
             const size_t u = (size_t) c;
             const double e = p.linkR * emin + (1.0 - p.linkR) * limEnv[u];
-            const double g = box[u].process (e);
+            const double gb = box[u].process (e);
+            const double g = limFir[u].process (gb, limH());   // band-limited limiter gain
             v[c] = limDelay[u].process (v[c]) * g;
             meterMin = std::min (meterMin, g);
         }
@@ -857,6 +967,11 @@ private:
     std::array<MinHold, kMaxCh> hold;
     std::array<Box, kMaxCh> box;
     Biquad ambHp; Allpass ap1, ap2; KWeighting ambKw;
+    // audio path (the gains computed on the control path, band-limited by the gain FIR, applied to the delayed input)
+    GainFir gfir; std::array<GainFir, 4> gfirOs; int limTail = 16; std::array<FirLine, kMaxCh> firMain, firAmbC, limFir; FirLine firRev;
+    std::array<Delay, kMaxCh> xDelay;
+    Biquad ambHpA; Allpass ap1A, ap2A; std::vector<double> ambRingA, ambRingG; size_t ambWA = 0;
+    double ambK = 0; bool ambUsed = false;
     std::vector<double> ambRing; size_t ambW = 0; double ambD = 960, ambRms = 1e-10, gAmb = 0;
     double cAmbA = 0, cAmbR = 0, cAmbWin = 0;
     static constexpr int kFrames = 200;

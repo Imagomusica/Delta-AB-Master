@@ -25,7 +25,17 @@ entrée ─ TRANSIT. ─┬─ UPWARD BAS NIV. ─ DOWNWARD BAS NIV. ─ DOUBLE 
 
 Les seuils des étages RMS sont en LU relatifs à la cible : si tu changes la cible, toute la chaîne suit.
 
-Latence constante : 5 ms + 16 échantillons (256 à 48 kHz), quels que soient l'oversampling et le lookahead.
+Latence constante : 909 échantillons à 48 kHz (environ 19 ms), quels que soient l'oversampling et le lookahead.
+
+### Zéro aliasing, zéro smearing
+
+Les gains sont calculés sur un chemin de contrôle, puis tous réunis en un seul gain par canal (étages, densité,
+makeup, mix, sortie) filtré par un FIR Kaiser à phase linéaire (−140 dB). Le son n'est jamais filtré : il est
+seulement retardé puis multiplié par ce gain. Un gain de bande passante B déplace le spectre d'au plus B ; il y a au
+plus trois modulations en série (dynamique, envoi de reverb, limiteur 1x), donc chacune est limitée à un tiers de
+(fs/2 − 20 kHz) : rien ne peut se replier sous 20 kHz. Le limiteur oversamplé a son propre FIR au taux suréchantillonné.
+Mesure (test automatique) : ton à 21 kHz + salves qui font travailler tous les étages, énergie entre 5 et 16 kHz
+−218 dB à 48 kHz, −197 dB à 44.1 kHz (avant : −62 dB).
 
 ## Mesure
 

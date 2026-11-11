@@ -41,7 +41,7 @@ int main (int argc, char** argv)
     {
         p->setProcessingPrecision (dbl ? juce::AudioProcessor::doublePrecision : juce::AudioProcessor::singlePrecision);
         p->prepareToPlay (48000, 512);
-        check (p->getLatencySamples() == 256, dbl ? "latency 256 samples (double)" : "latency 256 samples (float)", p->getLatencySamples());
+        check (p->getLatencySamples() == 909, dbl ? "latency 909 samples at 48 kHz (double)" : "latency 909 samples at 48 kHz (float)", p->getLatencySamples());
         juce::MidiBuffer midi; double acc = 0; int cnt = 0;
         for (int blk = 0; blk < 400; ++blk)
         {
@@ -60,7 +60,7 @@ int main (int argc, char** argv)
     {
         if (auto* r = find ("Oversampling")) r->setValueNotifyingHost ((float) os / 3.0f);
         p->prepareToPlay (48000, 512);
-        check (p->getLatencySamples() == 256, "latency constant for each oversampling setting", os);
+        check (p->getLatencySamples() == 909, "latency constant for each oversampling setting", os);
         p->releaseResources();
     }
 
