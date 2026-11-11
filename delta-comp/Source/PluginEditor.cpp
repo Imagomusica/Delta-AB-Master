@@ -28,11 +28,28 @@ Look::Look()
 void Look::drawRotarySlider (Graphics& g, int x, int y, int w, int h, float pos, float a0, float a1, Slider& s)
 {
     const auto r = Rectangle<float> ((float) x, (float) y, (float) w, (float) h);
-    const float Rt = jmin (r.getWidth(), r.getHeight()) * 0.5f - 2.0f;
-    const auto c = r.getCentre();
+    const int npos = (int) s.getProperties().getWithDefault ("positions", 0);
+    // rotary selector: fewer, bigger detents with their names engraved around, smaller cup
+    float Rt = jmin (r.getWidth(), r.getHeight()) * 0.5f - (npos == 2 ? 9.0f : 2.0f);
+    const auto c = r.getCentre().translated (0, npos == 2 ? 4.0f : 0.0f);
     const float R = Rt - 6.0f;
-    // engraved graduations
-    for (int i = 0; i <= 10; ++i)
+    if (npos > 0)
+    {
+        const auto names = StringArray::fromTokens (s.getProperties()["labels"].toString(), "|", "");
+        const int cur = roundToInt (pos * (float) (npos - 1));
+        g.setFont (mono (7.5f, true));
+        for (int i = 0; i < npos; ++i)
+        {
+            const float a = npos > 1 ? a0 + (a1 - a0) * (float) i / (float) (npos - 1) : a0;
+            g.setColour (i == cur ? kFg : kGrey);
+            g.drawLine ({ c.getPointOnCircumference (R + 1.5f, a), c.getPointOnCircumference (Rt, a) }, i == cur ? 1.6f : 1.0f);
+            // names left of the knob end at their detent, names right of it start there: nothing is clipped
+            if (npos > 2) continue;   // 3 positions or more: the chosen name is written under the selector
+            const auto tp = c.getPointOnCircumference (Rt + 9.0f, a);
+            g.drawText (names[i], Rectangle<float> (60.0f, 10.0f).withCentre (tp.translated (0, -2.0f)), Justification::centred);
+        }
+    }
+    else for (int i = 0; i <= 10; ++i)
     {
         const float a = a0 + (a1 - a0) * (float) i / 10.0f;
         const bool major = i % 5 == 0;
@@ -62,8 +79,48 @@ void Look::drawRotarySlider (Graphics& g, int x, int y, int w, int h, float pos,
     g.drawLine (c.x + std::sin (a) * L * 0.55f, c.y - std::cos (a) * L * 0.55f, c.x + std::sin (a) * (L - 2), c.y - std::cos (a) * (L - 2), 2.0f);
 }
 
+// Toggle switch: chrome nut with a bat lever, thrown towards ON or OFF (engraved beside it).
+static void drawLever (Graphics& g, Rectangle<float> r, bool on, bool over, bool vertical)
+{
+    g.setFont (mono (8.5f, true));
+    Point<float> c; Point<float> tip;
+    if (vertical)
+    {
+        g.setColour (on ? kFg : kGrey);  g.drawText ("ON",  r.removeFromTop (10.0f), Justification::centred);
+        g.setColour (on ? kGrey : kFg);  g.drawText ("OFF", r.removeFromBottom (10.0f), Justification::centred);
+        c = r.getCentre(); const float L = r.getHeight() * 0.42f;
+        tip = c.translated (0, on ? -L : L);
+    }
+    else
+    {
+        g.setColour (on ? kGrey : kFg);  g.drawText ("OFF", r.removeFromLeft (17.0f), Justification::centred);
+        g.setColour (on ? kFg : kGrey);  g.drawText ("ON",  r.removeFromRight (13.0f), Justification::centred);
+        c = r.getCentre(); const float L = r.getWidth() * 0.42f;
+        tip = c.translated (on ? L : -L, 0);
+    }
+    const float nut = jmin (r.getWidth(), r.getHeight()) * 0.30f;
+    // hex nut and threaded bush
+    Path hex; for (int i = 0; i < 6; ++i) { const auto pt = c.getPointOnCircumference (nut * 1.15f, MathConstants<float>::pi / 6.0f + i * MathConstants<float>::pi / 3.0f); if (i == 0) hex.startNewSubPath (pt); else hex.lineTo (pt); }
+    hex.closeSubPath();
+    g.setColour (kDim); g.fillPath (hex); g.setColour (kGrey); g.strokePath (hex, PathStrokeType (1.0f));
+    g.setColour (Colour (0xff1a1a1a)); g.fillEllipse (Rectangle<float> (nut * 1.3f, nut * 1.3f).withCentre (c));
+    // bat lever: tapered shaft, rounded tip
+    const float w0 = jmax (2.0f, nut * 0.55f), w1 = jmax (3.0f, nut * 0.85f);
+    const auto d = (tip - c) / jmax (1.0f, c.getDistanceFrom (tip)); const Point<float> n (-d.y, d.x);
+    Path bat; bat.startNewSubPath (c + n * (w0 * 0.5f)); bat.lineTo (tip + n * (w1 * 0.5f)); bat.lineTo (tip - n * (w1 * 0.5f)); bat.lineTo (c - n * (w0 * 0.5f)); bat.closeSubPath();
+    g.setColour (over ? Colour (0xffeeeeee) : Colour (0xffcfcfcf)); g.fillPath (bat);
+    g.fillEllipse (Rectangle<float> (w1 * 1.25f, w1 * 1.25f).withCentre (tip));
+    g.setColour (kFg); g.strokePath (bat, PathStrokeType (0.8f));
+    g.setColour (Colour (0xff1a1a1a)); g.fillEllipse (Rectangle<float> (w0, w0).withCentre (c));
+}
+
 void Look::drawButtonBackground (Graphics& g, Button& b, const Colour&, bool over, bool)
 {
+    if ((bool) b.getProperties().getWithDefault ("lever", false))
+    {
+        drawLever (g, b.getLocalBounds().toFloat().reduced (1.0f), b.getToggleState(), over, b.getHeight() > b.getWidth());
+        return;
+    }
     const auto r = b.getLocalBounds().toFloat().reduced (0.5f);
     if (b.getToggleState()) { g.setColour (kFg); g.fillRect (r); }
     else { g.setColour (over ? kFg : kGrey); g.drawRect (r, 1.0f); }
@@ -71,6 +128,7 @@ void Look::drawButtonBackground (Graphics& g, Button& b, const Colour&, bool ove
 
 void Look::drawButtonText (Graphics& g, TextButton& b, bool, bool)
 {
+    if ((bool) b.getProperties().getWithDefault ("lever", false)) return;
     g.setFont (mono (10.5f, true));
     g.setColour (b.getToggleState() ? kBg : kFg);
     g.drawText (b.getButtonText(), b.getLocalBounds(), Justification::centred);
@@ -111,21 +169,38 @@ Control::Control (AudioProcessorValueTreeState& s, Kind k, const char* id, const
     else if (kind == toggle)
     {
         button.setButtonText (label);
+        button.getProperties().set ("lever", true);
         button.setClickingTogglesState (true);
         addAndMakeVisible (button);
         bAtt = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (s, id, button);
     }
     else
     {
-        if (auto* c = dynamic_cast<AudioParameterChoice*> (param)) combo.addItemList (c->choices, 1);
-        addAndMakeVisible (combo);
-        cAtt = std::make_unique<AudioProcessorValueTreeState::ComboBoxAttachment> (s, id, combo);
+        // rotary selector (choices and switches that are not a bypass)
+        StringArray names;
+        if (auto* c = dynamic_cast<AudioParameterChoice*> (param)) names = c->choices; else names = { "OFF", "ON" };
+        const int n = names.size();
+        const float span = n > 2 ? jmin (MathConstants<float>::pi * 1.2f, (float) (n - 1) * MathConstants<float>::pi * 0.3f) : MathConstants<float>::pi * 0.44f;
+        slider.getProperties().set ("positions", n);
+        slider.getProperties().set ("labels", names.joinIntoString ("|"));
+        slider.setSliderStyle (Slider::RotaryVerticalDrag);
+        slider.setTextBoxStyle (Slider::NoTextBox, false, 0, 0);
+        slider.setRotaryParameters (MathConstants<float>::twoPi - span * 0.5f, MathConstants<float>::twoPi + span * 0.5f, true);
+        slider.setMouseDragSensitivity (40 * n);
+        slider.setDoubleClickReturnValue (true, param->convertFrom0to1 (param->getDefaultValue()));
+        addAndMakeVisible (slider);
+        sAtt = std::make_unique<AudioProcessorValueTreeState::SliderAttachment> (s, id, slider);
+        slider.onValueChange = [this] { repaint(); if (auto* sec = getParentComponent()) sec->repaint(); };
+        slider.onDragStart = slider.onDragEnd = [this] { repaint(); };
     }
 }
 
 void Control::resized()
 {
     auto r = getLocalBounds();
+    if (kind == choice) { slider.setBounds (r.withTrimmedBottom ((int) slider.getProperties()["positions"] > 2 ? 26 : 14)); return; }
+    if (kind == toggle && label != "ON") { button.setBounds (r.withTrimmedBottom (14).withSizeKeepingCentre (26, jmin (54, r.getHeight() - 18))); return; }
+    if (kind == toggle) { button.setBounds (r); return; }
     if (kind == knob) { slider.setBounds (r.withTrimmedBottom (26).withSizeKeepingCentre (jmin (r.getWidth(), r.getHeight() - 26), r.getHeight() - 26)); return; }
     auto box = r.withSizeKeepingCentre (r.getWidth() - 8, 20).translated (0, kind == choice ? 6 : 0);
     if (kind == toggle) button.setBounds (box); else combo.setBounds (box);
@@ -133,10 +208,19 @@ void Control::resized()
 
 void Control::paint (Graphics& g)
 {
-    if (kind == choice)
+    if (kind == choice && (int) slider.getProperties()["positions"] > 2)
     {
-        g.setColour (kGrey); g.setFont (mono (9.0f));
-        g.drawText (label, getLocalBounds().withHeight (getHeight() / 2 - 6), Justification::centredBottom);
+        auto r = getLocalBounds().removeFromBottom (26);
+        g.setColour (kFg); g.setFont (mono (9.5f, true));
+        g.drawText (label, r.removeFromTop (12), Justification::centred);
+        g.setColour (slider.isMouseOverOrDragging() ? kFg : kGrey); g.setFont (mono (9.5f));
+        g.drawText (param->getCurrentValueAsText(), r, Justification::centred);
+        return;
+    }
+    if (kind == choice || (kind == toggle && label != "ON"))
+    {
+        g.setColour (kFg); g.setFont (mono (9.5f, true));
+        g.drawText (label, getLocalBounds().removeFromBottom (13), Justification::centred);
         return;
     }
     if (kind != knob) return;
@@ -164,7 +248,7 @@ void Section::paint (Graphics& g)
     g.setColour (kPanel); g.fillRect (r);
     g.setColour (kDim); g.drawRect (r, 1.0f);
     g.setColour (kFg); g.setFont (mono (11.0f, true));
-    g.drawText (title, 8, 5, getWidth() - 60, 14, Justification::centredLeft);
+    g.drawText (title, 8, 5, getWidth() - 62, 14, Justification::centredLeft);
     g.drawHorizontalLine (24, 6.0f, (float) getWidth() - 6.0f);
     if (shown.isNotEmpty()) { g.setColour (kGrey); g.setFont (mono (9.5f)); g.drawText (shown, 8, 26, getWidth() - 16, 12, Justification::centredLeft); }
     const bool off = on != nullptr && ! on->button.getToggleState();
@@ -173,7 +257,7 @@ void Section::paint (Graphics& g)
 
 void Section::resized()
 {
-    if (on) on->setBounds (getWidth() - 46, 3, 40, 18);
+    if (on) on->setBounds (getWidth() - 54, 2, 50, 20);
     auto r = getLocalBounds().reduced (4, 0).withTrimmedTop (38).withTrimmedBottom (4);
     const int rows = ((int) controls.size() + cols - 1) / cols;
     const int cw = r.getWidth() / cols, rh = jmin (84, r.getHeight() / jmax (1, rows));
@@ -551,20 +635,20 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
 
     add (row2, new ui::Section (s, "AMBIANCE", "ambOn", 3, { { K::knob, "ambiance", "QUANTITÉ" }, { K::knob, "ambThr", "SEUIL" }, { K::knob, "ambRatio", "RATIO" },
                                                             { K::knob, "ambAtt", "ATTAQUE" }, { K::knob, "ambRel", "RELEASE" }, { K::knob, "ambPre", "PRÉ-DÉLAI" },
-                                                            { K::toggle, "ambAuto", "AUTO RÉFL." }, { K::choice, "ambStage", "APRÈS" } }),
+                                                            { K::choice, "ambAuto", "AUTO RÉFL." }, { K::choice, "ambStage", "APRÈS" } }),
          [&e, db] { return db (e.meterAmb.load()) + ui::u8 ("  réfl. ") + String (roundToInt (e.meterEr.load())) + " ms"; });
     add (row2, new ui::Section (s, "M/S", nullptr, 5, { { K::knob, "centre", "CENTRE" }, { K::knob, "centreFreq", "FRÉQ." }, { K::choice, "centreFilter", "FILTRE" },
                                                        { K::knob, "width", "LARGEUR" }, { K::knob, "sideLowCut", "LOW CUT S" },
                                                        { K::choice, "sideSlope", "PENTE dB/oct" }, { K::toggle, "revOn", "REVERBE" }, { K::choice, "revTarget", "SUR" },
                                                        { K::knob, "revSend", "ENVOI" }, { K::knob, "revDecay", "DURÉE" },
-                                                       { K::knob, "revPre", "PRÉ-DÉLAI" }, { K::toggle, "revPreAuto", "PRE AUTO" }, { K::knob, "revDyn", "DYNAMIQUE" } }),
+                                                       { K::knob, "revPre", "PRÉ-DÉLAI" }, { K::choice, "revPreAuto", "PRE AUTO" }, { K::knob, "revDyn", "DYNAMIQUE" } }),
          [&e] { return String ("REVERBE ") + (e.meterRev.load() < -90 ? String ("--") : String (e.meterRev.load(), 1) + " dB"); });
     add (row2, new ui::Section (s, "LIMITEUR", "limOn", 3, { { K::knob, "ceiling", "PLAFOND" }, { K::knob, "limRel", "RELEASE" }, { K::knob, "look", "LOOKAHEAD" },
                                                             { K::knob, "linkT", "LIEN TRANS." }, { K::knob, "linkR", "LIEN REL." }, { K::choice, "os", "OVERSAMPLING" },
-                                                            { K::toggle, "truePeak", "TRUE PEAK" } }),
+                                                            { K::choice, "truePeak", "TRUE PEAK" } }),
          [&e, db] { return db (e.meterLim.load()); });
     add (row2, new ui::Section (s, "GLOBAL", nullptr, 4, { { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
-                                                          { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::toggle, "autoGain", "GAIN AUTO" } }),
+                                                          { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::choice, "autoGain", "GAIN AUTO" } }),
          [&e, db] { return "GAIN AUTO " + db (e.meterMakeup.load()) + "  DENSITY " + db (e.meterDensity.load()); });
 
     setResizable (true, true);
