@@ -64,7 +64,7 @@ static double aliasBandDb (double fs, int os)
     std::vector<std::complex<double>> a ((size_t) N);
     for (int i = 0; i < N; ++i)
     {
-        const double t = 2.0 * i / (N - 1) - 1, w = std::cyl_bessel_i (0.0, 20 * std::sqrt (std::max (0.0, 1 - t * t))) / std::cyl_bessel_i (0.0, 20.0);
+        const double t = 2.0 * i / (N - 1) - 1, w = GainFir::i0 (20 * std::sqrt (std::max (0.0, 1 - t * t))) / GainFir::i0 (20.0);
         a[(size_t) i] = l[(size_t) (skip + i)] * w;
     }
     for (size_t i = 1, j = 0; i < (size_t) N; ++i) { size_t bit = (size_t) N >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) std::swap (a[i], a[j]); }
