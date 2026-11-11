@@ -24,25 +24,42 @@ Look::Look()
     setColour (PopupMenu::highlightedTextColourId, kBg);
 }
 
-// Moog style: white tick ring, black knob with a grey rim, white pointer line.
+// Nagra style: flat bar knob with a pointed tip, sunk in a round cup, graduations engraved around it.
 void Look::drawRotarySlider (Graphics& g, int x, int y, int w, int h, float pos, float a0, float a1, Slider& s)
 {
     const auto r = Rectangle<float> ((float) x, (float) y, (float) w, (float) h);
-    const float rad = jmin (r.getWidth(), r.getHeight()) * 0.5f - 2.0f;
+    const float Rt = jmin (r.getWidth(), r.getHeight()) * 0.5f - 2.0f;
     const auto c = r.getCentre();
-    g.setColour (kFg.withAlpha (0.7f));
+    const float R = Rt - 6.0f;
+    // engraved graduations
     for (int i = 0; i <= 10; ++i)
     {
         const float a = a0 + (a1 - a0) * (float) i / 10.0f;
-        const float r0 = rad - (i % 5 == 0 ? 4.5f : 3.0f);
-        g.drawLine ({ c.getPointOnCircumference (r0, a), c.getPointOnCircumference (rad, a) }, i % 5 == 0 ? 1.4f : 0.9f);
+        const bool major = i % 5 == 0;
+        g.setColour (major ? kFg : kGrey);
+        g.drawLine ({ c.getPointOnCircumference (R + 1.5f, a), c.getPointOnCircumference (major ? Rt : Rt - 2.5f, a) }, major ? 1.4f : 1.0f);
     }
-    const float kr = rad - 7.0f;
-    g.setColour (Colour (0xff4a4a4a)); g.fillEllipse (c.x - kr, c.y - kr, 2 * kr, 2 * kr);
-    g.setColour (kBg); g.fillEllipse (c.x - kr + 2, c.y - kr + 2, 2 * kr - 4, 2 * kr - 4);
-    const float a = a0 + pos * (a1 - a0);
-    g.setColour (s.isMouseOverOrDragging() ? kFg : kFg.withAlpha (0.9f));
-    g.drawLine ({ c.getPointOnCircumference (kr * 0.25f, a), c.getPointOnCircumference (kr - 1.5f, a) }, 2.0f);
+    // cup: bevelled rim, dark well
+    g.setColour (kGrey); g.fillEllipse (c.x - R, c.y - R, 2 * R, 2 * R);
+    g.setColour (kDim);  g.fillEllipse (c.x - R + 1.5f, c.y - R + 1.5f, 2 * R - 3, 2 * R - 3);
+    g.setColour (Colour (0xff101010)); g.fillEllipse (c.x - R * 0.86f, c.y - R * 0.86f, R * 1.72f, R * 1.72f);
+    // bar knob across the cup, pointed at the value
+    const float a = a0 + pos * (a1 - a0), L = R * 0.84f, Wd = R * 0.30f;
+    Path bar;
+    bar.startNewSubPath (0, -L);
+    bar.lineTo (Wd, -L + Wd * 1.3f);
+    bar.lineTo (Wd, L - Wd * 0.4f);
+    bar.quadraticTo (Wd, L, 0, L);
+    bar.quadraticTo (-Wd, L, -Wd, L - Wd * 0.4f);
+    bar.lineTo (-Wd, -L + Wd * 1.3f);
+    bar.closeSubPath();
+    bar.applyTransform (AffineTransform::rotation (a).translated (c));
+    g.setColour (s.isMouseOverOrDragging() ? Colour (0xffeeeeee) : Colour (0xffd0d0d0)); g.fillPath (bar);
+    g.setColour (kFg); g.strokePath (bar, PathStrokeType (1.0f));
+    g.setColour (kGrey);
+    g.drawLine (c.x - std::sin (a) * L * 0.8f, c.y + std::cos (a) * L * 0.8f, c.x + std::sin (a) * L * 0.5f, c.y - std::cos (a) * L * 0.5f, 1.0f);
+    g.setColour (kBg);
+    g.drawLine (c.x + std::sin (a) * L * 0.55f, c.y - std::cos (a) * L * 0.55f, c.x + std::sin (a) * (L - 2), c.y - std::cos (a) * (L - 2), 2.0f);
 }
 
 void Look::drawButtonBackground (Graphics& g, Button& b, const Colour&, bool over, bool)
