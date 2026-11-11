@@ -103,7 +103,13 @@ struct Sand : juce::Component
     // which jump off the plate, fall back and gather on the nodal lines; seen in perspective
     static constexpr int kGrains = 14000, kGW = 120, kGH = 80, kModes = 8, kFFT = 4096;
     std::vector<float> gx, gy, gz, gv;
-    std::array<float, kGW * kGH> field {};
+    static constexpr int kTiers = 4, kTH = 30;
+    static constexpr float kStep = 0.09f;      // height of each terrace step (plate widths)
+    std::array<std::array<float, kGW * kTH>, kTiers> fields {};
+    std::array<float, kTiers> act {}, actTarget {}, ceilDb {}, ceilTarget {};   // ceiling over each terrace: down with GR, up with expansion
+    float ceilH (int t) const { return juce::jlimit (0.012f, 0.16f, 0.07f * (1.0f + ceilDb[(size_t) t] / 12.0f)); }
+    int tierOf (float y) const { return juce::jlimit (0, kTiers - 1, (int) (y * kTiers)); }
+    float tierBase (float y) const;
     std::array<float, kModes> energy {}, target {};
     float shakeLevel = 0, shakeTarget = 0, grNow = 0;
     std::vector<std::complex<double>> spec;

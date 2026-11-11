@@ -464,52 +464,77 @@ void Sand::analyse()
     (void) rms;
 }
 
+// Four terraces, one per dynamic zone (pp at the back and highest, then p, mp mf, f ff in front and lowest).
+// Each terrace is a Chladni plate: the output spectrum picks its modes (a different set per terrace), the music
+// shakes it, and its own stage's gain makes it work harder. The sand creeps forward and pours over each front
+// edge onto the next terrace, like the signal going through the stages; from the last edge it goes back to pp.
+float Sand::tierBase (float y) const { return (float) (kTiers - 1 - tierOf (y)) * kStep; }
+
 void Sand::stepPlate()
 {
     analyse();
     for (int k = 0; k < kModes; ++k) energy[(size_t) k] += 0.15f * (target[(size_t) k] - energy[(size_t) k]);
     shakeLevel += (shakeTarget > shakeLevel ? 0.6f : 0.12f) * (shakeTarget - shakeLevel);
     const float kNow = kick; kick *= 0.5f;
+    for (int t = 0; t < kTiers; ++t)
+    {
+        act[(size_t) t] += (actTarget[(size_t) t] > act[(size_t) t] ? 0.5f : 0.08f) * (actTarget[(size_t) t] - act[(size_t) t]);
+        ceilDb[(size_t) t] += 0.35f * (ceilTarget[(size_t) t] - ceilDb[(size_t) t]);
+    }
     static const int modes[kModes][2] = { { 1, 2 }, { 1, 3 }, { 2, 3 }, { 1, 4 }, { 3, 4 }, { 2, 5 }, { 3, 5 }, { 4, 7 } };
-    static float cx[8][kGW], cy[8][kGH]; static bool init = false;
+    static float cx[8][kGW], cy[8][kTH]; static bool init = false;
     if (! init)
     {
         for (int m = 1; m < 8; ++m)
         {
             for (int i = 0; i < kGW; ++i) cx[m][i] = std::cos (m * MathConstants<float>::pi * (i + 0.5f) / kGW);
-            for (int j = 0; j < kGH; ++j) cy[m][j] = std::cos (m * MathConstants<float>::pi * (j + 0.5f) / kGH);
+            for (int j = 0; j < kTH; ++j) cy[m][j] = std::cos (m * MathConstants<float>::pi * (j + 0.5f) / kTH);
         }
         init = true;
     }
-    for (int j = 0; j < kGH; ++j)
-        for (int i = 0; i < kGW; ++i)
-        {
-            float a = 0;
-            for (int k = 0; k < kModes; ++k) { const int m1 = modes[k][0], m2 = modes[k][1]; a += energy[(size_t) k] * (cx[m1][i] * cy[m2][j] - cx[m2][i] * cy[m1][j]); }
-            field[(size_t) (j * kGW + i)] = std::abs (a);
-        }
-    // gain reduction presses the plate: compression damps the jumps (the sand stays lower and denser)
-    const float damp = 1.0f / (1.0f + 0.08f * grNow);
+    for (int t = 0; t < kTiers; ++t)
+        for (int j = 0; j < kTH; ++j)
+            for (int i = 0; i < kGW; ++i)
+            {
+                float a = 0;
+                for (int k = 0; k < kModes; ++k)
+                {
+                    const int mk = (k + 2 * t) % kModes, m1 = modes[mk][0], m2 = modes[mk][1];
+                    a += energy[(size_t) k] * (cx[m1][i] * cy[m2][j] - cx[m2][i] * cy[m1][j]);
+                }
+                fields[(size_t) t][(size_t) (j * kGW + i)] = std::abs (a);
+            }
     std::normal_distribution<float> N (0, 1); std::uniform_real_distribution<float> U (0, 1);
-    const float shake = 0.0006f + 0.02f * shakeLevel * shakeLevel;
+    const float tierD = 1.0f / kTiers;
     for (int i = 0; i < kGrains; ++i)
     {
         float& x = gx[(size_t) i]; float& y = gy[(size_t) i]; float& z = gz[(size_t) i]; float& v = gv[(size_t) i];
-        const int ci = jlimit (0, kGW - 1, (int) (x * kGW)), cj = jlimit (0, kGH - 1, (int) (y * kGH));
-        const float f = field[(size_t) (cj * kGW + ci)];
+        const int t = tierOf (y);
+        const float base = tierBase (y), ly = (y - t * tierD) / tierD;
+        const int ci = jlimit (0, kGW - 1, (int) (x * kGW)), cj = jlimit (0, kTH - 1, (int) (ly * kTH));
+        const float f = fields[(size_t) t][(size_t) (cj * kGW + ci)];
+        const float drive = shakeLevel * (0.35f + 0.65f * act[(size_t) t]);
+        const float shake = 0.0006f + 0.02f * drive * drive;
         const float amp = f * shake + 0.00015f;
-        if (z <= 0.0f)
-        {   // on the plate: kicked up where it vibrates
-            z = 0.0f;
-            if (U (rng) < f * (shakeLevel * 0.9f + kNow)) v = (0.004f + 0.05f * f * (shakeLevel + 1.5f * kNow) * U (rng)) * damp;
+        if (z <= base)
+        {   // on its terrace: kicked up where it vibrates
+            z = base;
+            if (U (rng) < f * (drive * 0.9f + kNow)) v = 0.004f + 0.05f * f * (drive + 1.5f * kNow) * U (rng);
         }
-        if (z > 0.0f || v > 0.0f) { z += v; v -= 0.0045f; if (z < 0.0f) { z = 0.0f; v = 0.0f; } }
-        x += amp * N (rng); y += amp * N (rng) * 1.5f;
+        if (z > base || v > 0.0f)
+        {
+            z += v; v -= 0.0045f;
+            if (z < base) { z = base; v = 0.0f; }
+            if (y < (t + 1) * tierD && z > base + ceilH (t)) { z = base + ceilH (t); v = -0.5f * std::abs (v); }   // hits the ceiling
+        }
+        x += amp * N (rng);
+        // creep towards the front edge, faster when the music is loud; over the edge it falls to the next terrace
+        y += amp * N (rng) * 1.2f + 0.0002f + 0.0012f * drive * (z <= base + 1e-6f ? 1.0f : 0.3f);
         if (x < 0) x = -x;
         if (x > 1) x = 2 - x;
-        if (y < 0) y = -y;
-        if (y > 1) y = 2 - y;
-        x = jlimit (0.0f, 1.0f, x); y = jlimit (0.0f, 1.0f, y);
+        x = jlimit (0.0f, 1.0f, x);
+        if (y < t * tierD) y = t * tierD + (t * tierD - y);   // a terrace's back wall
+        if (y >= 1.0f) { y = U (rng) * 0.05f; z = tierBase (y) + 0.25f + 0.1f * U (rng); v = 0.0f; }   // back to pp, raining in
     }
 }
 
@@ -528,8 +553,9 @@ void Sand::renderPlate()
         const float depth = 0.35f + 0.65f * y;                       // far grains dimmer and smaller
         const auto p = project (x, y, z);
         const int px = (int) p.x, py = (int) p.y;
-        if (z > 0.0f) { const auto s = project (x, y, 0.0f); put ((int) s.x, (int) s.y, (uint8) (40 * depth)); }   // shadow on the plate
-        const uint8 v = (uint8) jlimit (0.0f, 255.0f, (150.0f + (float) (i % 90)) * depth + 60.0f * jmin (1.0f, z * 12.0f));
+        const float base = tierBase (y);
+        if (z > base) { const auto s = project (x, y, base); put ((int) s.x, (int) s.y, (uint8) (40 * depth)); }   // shadow on its terrace
+        const uint8 v = (uint8) jlimit (0.0f, 255.0f, (150.0f + (float) (i % 90)) * depth + 60.0f * jmin (1.0f, (z - base) * 12.0f));
         put (px, py, v);
         if (y > 0.55f) { put (px + 1, py, v); if (y > 0.8f) { put (px, py + 1, v); put (px + 1, py + 1, v); } }
     }
@@ -544,6 +570,7 @@ void Sand::push()
     const float v[kLanes] = { e.meterAmb.load(), e.meterA.load(), e.meterB.load(), e.meterC.load(), e.meterD.load(), e.meterLim.load() };
     for (int k = 0; k < kLanes; ++k) lane[(size_t) k][(size_t) head] = v[k];
     grNow = -(v[2] + v[3] + v[4] + v[5]);
+    for (int t = 0; t < kTiers; ++t) { actTarget[(size_t) t] = jlimit (0.0f, 1.0f, std::abs (v[t + 1]) / 6.0f); ceilTarget[(size_t) t] = v[t + 1]; }   // pp, p, mp mf, f ff
     // phase: correlation of L and R over the last 2048 samples, and a slow auto scale for the scope
     {
         const int w = proc.scopeWrite.load (std::memory_order_acquire);
@@ -574,21 +601,38 @@ void Sand::paint (Graphics& g)
     {
         Graphics::ScopedSaveState ss (g);
         g.addTransform (AffineTransform::translation (plateArea.getX(), plateArea.getY()));
-        Path edge;
-        const auto c0 = project (0, 0, 0), c1 = project (1, 0, 0), c2 = project (1, 1, 0), c3 = project (0, 1, 0);
-        edge.startNewSubPath (c0); edge.lineTo (c1); edge.lineTo (c2); edge.lineTo (c3); edge.closeSubPath();
-        g.setColour (Colour (0xff070707)); g.fillPath (edge);
-        g.setColour (kFg.withAlpha (0.05f));
-        for (int k = 1; k < 8; ++k)
+        static const char* names[kTiers] = { "pp", "p", "mp mf", "f ff" };
+        for (int t = 0; t < kTiers; ++t)
         {
-            const float t = (float) k / 8.0f;
-            g.drawLine (Line<float> (project (t, 0, 0), project (t, 1, 0)), 0.6f);
-            g.drawLine (Line<float> (project (0, t, 0), project (1, t, 0)), 0.6f);
+            const float y0 = (float) t / kTiers, y1 = (float) (t + 1) / kTiers, zb = (float) (kTiers - 1 - t) * kStep;
+            Path top; top.startNewSubPath (project (0, y0, zb)); top.lineTo (project (1, y0, zb)); top.lineTo (project (1, y1, zb)); top.lineTo (project (0, y1, zb)); top.closeSubPath();
+            g.setColour (Colour (0xff070707)); g.fillPath (top);
+            g.setColour (kFg.withAlpha (0.05f));
+            for (int k = 1; k < 8; ++k) { const float u = (float) k / 8.0f; g.drawLine (Line<float> (project (u, y0, zb), project (u, y1, zb)), 0.6f); }
+            g.setColour (kFg.withAlpha (0.25f)); g.strokePath (top, PathStrokeType (1.0f));
+            // riser: the front face down to the next terrace (or a slab under the last one)
+            const float zn = t < kTiers - 1 ? zb - kStep : -0.02f;
+            Path face; face.startNewSubPath (project (0, y1, zb)); face.lineTo (project (1, y1, zb)); face.lineTo (project (1, y1, zn)); face.lineTo (project (0, y1, zn)); face.closeSubPath();
+            g.setColour (Colour (0xff1e1e1e)); g.fillPath (face);
+            g.setColour (kFg.withAlpha (0.18f)); g.strokePath (face, PathStrokeType (0.8f));
+            g.setColour (kFg.withAlpha (0.8f));
+            g.setFont (Font (FontOptions (Font::getDefaultSerifFontName(), 16.0f, Font::bold | Font::italic)));
+            const auto lp = project (0, 0.5f * (y0 + y1), zb);
+            g.drawText (names[t], Rectangle<float> (lp.x - 64.0f, lp.y - 9.0f, 58.0f, 18.0f), Justification::centredRight);
         }
-        g.setColour (kFg.withAlpha (0.25f)); g.strokePath (edge, PathStrokeType (1.0f));
-        // front edge thickness: the plate is a slab
-        Path slab; slab.startNewSubPath (c3); slab.lineTo (c2); slab.lineTo (c2.translated (0, 6)); slab.lineTo (c3.translated (0, 6)); slab.closeSubPath();
-        g.setColour (Colour (0xff2a2a2a)); g.fillPath (slab);
+        // the ceilings, mirror of each terrace: pressed down by gain reduction, lifted by expansion
+        for (int t = 0; t < kTiers; ++t)
+        {
+            const float y0 = (float) t / kTiers, y1 = (float) (t + 1) / kTiers, zc = (float) (kTiers - 1 - t) * kStep + ceilH (t);
+            const float gdb = ceilDb[(size_t) t];
+            Path c; c.startNewSubPath (project (0, y0, zc)); c.lineTo (project (1, y0, zc)); c.lineTo (project (1, y1, zc)); c.lineTo (project (0, y1, zc)); c.closeSubPath();
+            g.setColour (kFg.withAlpha (0.035f + 0.05f * jmin (1.0f, std::abs (gdb) / 6.0f))); g.fillPath (c);
+            g.setColour (kFg.withAlpha (std::abs (gdb) > 0.2f ? 0.75f : 0.3f));
+            g.drawLine (Line<float> (project (0, y1, zc), project (1, y1, zc)), std::abs (gdb) > 0.2f ? 1.4f : 0.8f);
+            const auto rp = project (1, y1, zc);
+            g.setFont (mono (9.5f, true));
+            g.drawText ((gdb > 0.05f ? "GE +" : gdb < -0.05f ? "GR " : "") + String (std::abs (gdb) < 0.05f ? 0.0f : gdb, 1), Rectangle<float> (rp.x + 6.0f, rp.y - 7.0f, 64.0f, 14.0f), Justification::centredLeft);
+        }
         g.setColour (kFg);
         g.drawImageAt (plate, 0, 0, true);
     }
