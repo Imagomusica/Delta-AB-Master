@@ -134,6 +134,7 @@ struct Meter : juce::Component
     DeltaCompProcessor& proc;
     Sand* sand = nullptr;
     float ppm[2] { -100, -100 }, vuPow[2] {}, rms3Pow = 0;
+    float grSlow = 0, grFast = 0;
     double longSum = 0; long long longN = 0;
     float peakNow[2] { -100, -100 }, tpNow[2] { -100, -100 }, peakMax[2] { -100, -100 }, tpMax[2] { -100, -100 };
     float holdT = 0;

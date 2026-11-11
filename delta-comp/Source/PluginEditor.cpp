@@ -774,6 +774,12 @@ void Meter::tick (float dt)
         cwInPk = cwOutPk = cwInSq = cwOutSq = 0; cwN = 0; cwT = 0;
     }
     for (int c = 0; c < 2; ++c) ppm[c] = jmax (ampDb (m.peak[c]), ppm[c] - 20.0f * dt / 1.7f);   // Nagra peak: 20 dB in 1.7 s
+    {   // global gain reduction (p + mp mf + f ff + limiter): slow needle 300 ms, fast needle instant with the Nagra return
+        auto& eg = proc.engine;
+        const float grNow = jmin (0.0f, eg.meterB.load() + eg.meterC.load() + eg.meterD.load() + eg.meterLim.load());
+        grSlow += (1.0f - std::exp (-dt / 0.3f)) * (grNow - grSlow);
+        grFast = grNow < grFast ? grNow : jmin (0.0f, grFast + 20.0f * dt / 1.7f);
+    }
     holdT += dt;
     for (int c = 0; c < 2; ++c)
     {
@@ -816,7 +822,8 @@ void Meter::mouseDown (const MouseEvent&)
 // Modulometer in the spirit of the Nagra: chrome bezel with screws, white face, dB scale graduated every dB
 // at the top, % modulation scale inside, thick band above 0, plate over the pivot, glass reflection.
 // Black needle = peak (PPM), grey needle = VU (sine calibrated: a steady tone reads the same on both).
-static void drawDial (Graphics& g, Rectangle<float> b, float peakDb, float vuDb, const String& name)
+// gr = true: the global gain reduction modulometer, 0 dB at the right, -20 at the left, burgundy needles
+static void drawDial (Graphics& g, Rectangle<float> b, float peakDb, float vuDb, const String& name, bool gr = false)
 {
     const float R = jmin (b.getWidth(), b.getHeight()) / 2 - 2;
     const auto c = b.getCentre();
@@ -833,7 +840,8 @@ static void drawDial (Graphics& g, Rectangle<float> b, float peakDb, float vuDb,
     const float Rf = R * 0.89f;
     g.setColour (Colour (0xfff4f4f0)); g.fillEllipse (c.x - Rf, c.y - Rf, 2 * Rf, 2 * Rf);
     const Point<float> pv (c.x, c.y + Rf * 0.55f);
-    auto ang = [] (float db) {
+    auto ang = [gr] (float db) {
+        if (gr) return 50.0f - 100.0f * jlimit (0.0f, 1.0f, -db / 20.0f);
         if (db <= -60) return -50.0f;
         const float t = jlimit (0.0f, 1.0f, std::pow (10.0f, (db - 3.0f) / 20.0f));
         return -50.0f + 100.0f * std::pow (t, 0.5f);
@@ -843,8 +851,29 @@ static void drawDial (Graphics& g, Rectangle<float> b, float peakDb, float vuDb,
     g.setColour (kBg);
     Path arc; arc.addCentredArc (pv.x, pv.y, Rs, Rs, 0, degreesToRadians (-50.0f), degreesToRadians (50.0f), true);
     g.strokePath (arc, PathStrokeType (1.1f));
-    Path over; over.addCentredArc (pv.x, pv.y, Rs + 3.0f, Rs + 3.0f, 0, degreesToRadians (ang (0.0f)), degreesToRadians (50.0f), true);
-    g.strokePath (over, PathStrokeType (4.5f));
+    if (! gr)
+    {
+        Path over; over.addCentredArc (pv.x, pv.y, Rs + 3.0f, Rs + 3.0f, 0, degreesToRadians (ang (0.0f)), degreesToRadians (50.0f), true);
+        g.strokePath (over, PathStrokeType (4.5f));
+    }
+    if (gr)
+    {   // GR scale: every dB to -10, every 2 dB to -20
+        for (int db = 0; db >= -20; --db)
+        {
+            if (db < -10 && db % 2 != 0) continue;
+            const bool major = db % 5 == 0 || db == -2;
+            const float a = ang ((float) db);
+            g.drawLine (Line<float> (pt (a, Rs), pt (a, Rs + (major ? 7.5f : 4.0f))), major ? 1.3f : 0.7f);
+        }
+        g.setFont (mono (jmax (7.5f, R * 0.08f), true));
+        for (int db : { 0, -2, -5, -10, -15, -20 })
+        {
+            const auto q = pt (ang ((float) db), Rs + 15.5f);
+            g.drawText (String (-db), Rectangle<float> (q.x - 14, q.y - 6, 28, 12), Justification::centred);
+        }
+    }
+    else
+    {
     // fine graduations: every dB from -20 to +3, every 5 dB below
     for (int db = -40; db <= 3; ++db)
     {
@@ -879,13 +908,14 @@ static void drawDial (Graphics& g, Rectangle<float> b, float peakDb, float vuDb,
         }
     }
     g.drawText ("%", Rectangle<float> (pv.x - 10, pv.y - Ri * 0.62f, 20, 10), Justification::centred);
+    }
     g.setColour (kBg); g.setFont (mono (jmax (7.5f, R * 0.075f), true));
-    g.drawText ("dB", Rectangle<float> (pt (-43.0f, Rs * 0.86f).x - 12, pt (-43.0f, Rs * 0.86f).y - 6, 24, 12), Justification::centred);
+    g.drawText (gr ? "GR dB" : "dB", Rectangle<float> (pt (-43.0f, Rs * 0.86f).x - 16, pt (-43.0f, Rs * 0.86f).y - 6, 32, 12), Justification::centred);
     g.setFont (mono (jmax (7.0f, R * 0.07f), true));
     g.drawText (u8 ("MODULOMÈTRE"), Rectangle<float> (c.x - R, pv.y - Rs * 0.42f, 2 * R, 11), Justification::centred);
     // needles: VU (grey) under peak (black)
-    g.setColour (Colour (0xff8a8a8a)); g.drawLine (Line<float> (pv, pt (ang (vuDb), Rs + 6)), 1.5f);
-    g.setColour (kBg); g.drawLine (Line<float> (pv, pt (ang (peakDb), Rs + 7)), 1.6f);
+    g.setColour (gr ? Colour (0xffb25563) : Colour (0xff8a8a8a)); g.drawLine (Line<float> (pv, pt (ang (vuDb), Rs + 6)), 1.5f);
+    g.setColour (gr ? Colour (0xff6e1423) : kBg); g.drawLine (Line<float> (pv, pt (ang (peakDb), Rs + 7)), 1.6f);
     const float chY = pv.y - 5;
     {
         Graphics::ScopedSaveState ss (g);
@@ -900,8 +930,8 @@ static void drawDial (Graphics& g, Rectangle<float> b, float peakDb, float vuDb,
     }
     g.setColour (Colour (0xff4a4a4a)); g.fillEllipse (pv.x - 3.5f, pv.y - 3.5f, 7.0f, 7.0f);
     g.setFont (mono (jmax (8.0f, R * 0.08f), true));
-    g.setColour (kBg); g.drawText ("PEAK", Rectangle<float> (c.x - 50, chY + 6, 44, 11), Justification::centredRight);
-    g.setColour (Colour (0xff5a5a5a)); g.drawText ("VU", Rectangle<float> (c.x + 6, chY + 6, 44, 11), Justification::centredLeft);
+    g.setColour (gr ? Colour (0xff6e1423) : kBg); g.drawText (gr ? "RAPIDE" : "PEAK", Rectangle<float> (c.x - 50, chY + 6, 44, 11), Justification::centredRight);
+    g.setColour (gr ? Colour (0xffb25563) : Colour (0xff5a5a5a)); g.drawText (gr ? "LENT" : "VU", Rectangle<float> (c.x + 6, chY + 6, 44, 11), Justification::centredLeft);
     g.setColour (kBg); g.setFont (mono (jmax (10.0f, R * 0.12f), true));
     g.drawText (name, Rectangle<float> (c.x - 20, chY + Rf * 0.18f, 40, 16), Justification::centred);
 }
@@ -915,10 +945,27 @@ void Meter::paint (Graphics& g)
     auto dials = r.removeFromTop (r.getWidth() * 0.5f);
     drawDial (g, dials.removeFromLeft (dials.getWidth() * 0.5f).reduced (2), ppm[0], powDb (vuPow[0]) + 3.01f, "L");
     drawDial (g, dials.reduced (2), ppm[1], powDb (vuPow[1]) + 3.01f, "R");
-    r.removeFromTop (8);
-
-    auto f = [] (float db) { return db < -150 ? String (u8 ("-\xe2\x88\x9e")) : String (db, 1); };
+    r.removeFromTop (6);
     auto& e = proc.engine;
+    auto f = [] (float db) { return db < -150 ? String (u8 ("-\xe2\x88\x9e")) : String (db, 1); };
+    {   // second row: the global GR modulometer, and the loudness figures beside it
+        auto row = r.removeFromTop (r.getWidth() * 0.5f);
+        drawDial (g, row.removeFromLeft (row.getWidth() * 0.5f).reduced (2), grFast, grSlow, "GR", true);
+        row.removeFromLeft (10);
+        const std::pair<const char*, String> big[] = {
+            { "LUFS M", f (e.meterM.load()) }, { "LUFS S", f (e.meterS.load()) }, { "LUFS I", f (e.meterI.load()) },
+            { "CREST", String (crestOut, 1) }, { "DYN. RANGE", String (drOut, 1) }, { "GAIN AUTO", String (e.meterMakeup.load(), 1) } };
+        const float bh = row.getHeight() / (float) std::size (big);
+        for (auto& [name, val] : big)
+        {
+            auto line = row.removeFromTop (bh);
+            g.setColour (kGrey); g.setFont (mono (9.5f, true));
+            g.drawText (u8 (name), line.removeFromLeft (line.getWidth() * 0.5f), Justification::centredLeft);
+            g.setColour (kFg); g.setFont (mono (15.0f, true));
+            g.drawText (val, line, Justification::centredRight);
+        }
+    }
+    r.removeFromTop (6);
     struct RowT { const char* name; String a, b; bool strong; };
     const RowT rows[] = {
         { "", "L", "R", false },
@@ -926,22 +973,14 @@ void Meter::paint (Graphics& g)
         { "  MAX", f (peakMax[0]), f (peakMax[1]), false },
         { "TRUE PEAK", f (tpNow[0]), f (tpNow[1]), true },
         { "  MAX", f (tpMax[0]), f (tpMax[1]), false },
-        { "", u8 ("ENTRÉE"), "SORTIE", false },
-        { "CREST", String (crestIn, 1), String (crestOut, 1), true },
-        { "DYN. RANGE", String (drIn, 1), String (drOut, 1), true },
-        { "LUFS M", "", f (e.meterM.load()), true },
-        { "LUFS S", "", f (e.meterS.load()), true },
-        { "LUFS I", "", f (e.meterI.load()), true },
-        { "RMS 3 s", "", f (powDb (rms3Pow) + 3.01f), false },
-        { "RMS LONG", "", f (longN > 0 ? powDb (longSum / (double) longN) + 3.01f : -200.0f), false },
-        { "GAIN AUTO", "", String (e.meterMakeup.load(), 1), false },
-        { "RÉFLEXIONS", "", String (roundToInt (e.meterEr.load())) + " ms", false },
+        { "CREST ENTR\xc3\x89" "E", "", String (crestIn, 1), false },
+        { "RMS 3 s / LONG", f (powDb (rms3Pow) + 3.01f), f (longN > 0 ? powDb (longSum / (double) longN) + 3.01f : -200.0f), false },
     };
-    const float rh = jmin (16.0f, (r.getHeight() - 12) / (float) std::size (rows));
+    const float rh = jmin (16.0f, (r.getHeight() - 10) / (float) std::size (rows));
     for (auto& row : rows)
     {
         auto line = r.removeFromTop (rh);
-        g.setFont (mono (10.5f, row.strong));
+        g.setFont (mono (10.0f, row.strong));
         g.setColour (row.strong ? kFg : kGrey);
         g.drawText (u8 (row.name), line.removeFromLeft (line.getWidth() * 0.42f), Justification::centredLeft);
         g.setColour (row.name[0] == 0 ? kGrey : kFg);
