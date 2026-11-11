@@ -60,9 +60,11 @@ struct Sand : juce::Component
     void push();
     float yOf (float lufs) const;
     DeltaCompProcessor& proc;
-    static constexpr int kCols = 300;
-    std::array<float, kCols> level {}, down {}, up {}, lim {}, amb {};
+    static constexpr int kCols = 420;
+    std::array<float, kCols> level {}, in {}, out {}, down {}, up {}, lim {}, amb {};
     int head = 0; unsigned frame = 0;
+    // dynamic range spread (10th..95th percentile of the 400 ms loudness over the last 30 s), set by the meter
+    float inLo = -200, inHi = -200, outLo = -200, outHi = -200;
 };
 
 // Nagra style modulometer (VU needle + peak needle) and the numeric readouts.
@@ -73,10 +75,17 @@ struct Meter : juce::Component
     void mouseDown (const juce::MouseEvent&) override;
     void tick (float dt);
     DeltaCompProcessor& proc;
-    float ppm = -100, vuPow = 0, rms3Pow = 0;
+    Sand* sand = nullptr;
+    float ppm[2] { -100, -100 }, vuPow[2] {}, rms3Pow = 0;
     double longSum = 0; long long longN = 0;
     float peakNow[2] { -100, -100 }, tpNow[2] { -100, -100 }, peakMax[2] { -100, -100 }, tpMax[2] { -100, -100 };
     float holdT = 0;
+    // crest factor (1 s windows) and dynamic range history
+    double cwInPk = 0, cwInSq = 0, cwOutPk = 0, cwOutSq = 0; long long cwN = 0; float cwT = 0;
+    float crestIn = 0, crestOut = 0;
+    static constexpr int kHist = 900;
+    std::array<float, kHist> histIn {}, histOut {}; int histPos = 0, histN = 0;
+    float mIn = 0, mOut = 0, drIn = 0, drOut = 0;
 };
 } // namespace ui
 
@@ -88,7 +97,7 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
     void timerCallback() override;
-    static constexpr int kW = 1128, kH = 900;
+    static constexpr int kW = 1440, kH = 1000;
     juce::Component content;
     ui::Sand sand;
     ui::Meter meter;

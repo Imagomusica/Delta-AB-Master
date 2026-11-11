@@ -318,6 +318,7 @@ struct Params
 struct OutputMeter   // accumulated by the audio thread, taken by the editor
 {
     double peak[kMaxCh] {}, tp[kMaxCh] {}, sumSq[kMaxCh] {};
+    double inPeak[kMaxCh] {}, inSumSq[kMaxCh] {};
     int n = 0;
 };
 
@@ -335,7 +336,7 @@ public:
         for (int c = 0; c < kMaxCh; ++c)
         {
             for (auto& k : kw[(size_t) c]) k.prepare (fs);
-            wetKw[(size_t) c].prepare (fs); outKw[(size_t) c].prepare (fs);
+            wetKw[(size_t) c].prepare (fs); outKw[(size_t) c].prepare (fs); inKw[(size_t) c].prepare (fs);
             limDelay[(size_t) c].reserve ((lookMax + 1) * Oversampler::kMaxF + 8);
             spDelay[(size_t) c].reserve (TruePeak::kDelay + 1); spDelay[(size_t) c].setLength (TruePeak::kDelay);
             hold[(size_t) c].reserve ((lookMax + 2) * Oversampler::kMaxF);
@@ -358,7 +359,7 @@ public:
         for (size_t c = 0; c < (size_t) kMaxCh; ++c)
         {
             for (auto& k : kw[c]) k.reset();
-            wetKw[c].reset(); outKw[c].reset(); spDelay[c].reset(); tpLim[c].reset(); tpMeter[c].reset(); pad[c].reset();
+            wetKw[c].reset(); outKw[c].reset(); inKw[c].reset(); spDelay[c].reset(); tpLim[c].reset(); tpMeter[c].reset(); pad[c].reset();
             os[c].reset(); limDelay[c].reset(); hold[c].reset(); box[c].reset(); limEnv[c] = 1;
             for (auto& r : rms[c]) r = 1e-10;
             pkEnv[c] = 0;
@@ -391,7 +392,7 @@ public:
         cDenA = co (3.0); cDenR = co (120.0);
         cOptoUp = co (400.0); cOptoDn = co (3000.0);
         cTrFa = co (0.5); cTrFr = co (p.trDurMs); cTrSa = co (p.trDurMs * 0.7); cTrSr = 0;
-        cRevSend = co (150.0);
+        cRevSend = co (150.0); cFast = co (50.0);
         cAmbA = co (p.ambAtt); cAmbR = co (p.ambRel); cAmbWin = co (50.0);
         verb.setDecay (p.revDecay);
         if (p.centreFilter >= 1 && p.centreFilter <= 3) { centreEq.eq (p.centreFilter, fs, std::clamp (p.centreFreq, 20.0, 0.45 * fs), p.centreDb, 0.8); }
@@ -467,6 +468,16 @@ public:
             denS = p.density + cSmooth * (denS - p.density); ambS = p.ambiance + cSmooth * (ambS - p.ambiance);
             double x[kMaxCh] {}, s[kMaxCh] {};
             for (int c = 0; c < C; ++c) s[c] = x[c] = (double) io[c][i];
+            {   // input metering (sand, crest, dynamic range)
+                double ip = 0;
+                for (int c = 0; c < C; ++c)
+                {
+                    const double k = inKw[(size_t) c].process (x[c]); ip += k * k;
+                    acc.inPeak[c] = std::max (acc.inPeak[c], std::abs (x[c])); acc.inSumSq[c] += x[c] * x[c];
+                }
+                if (C == 1) ip *= 2;
+                inFast = ip + cFast * (inFast - ip);
+            }
 
             // T: transients = fast envelope over slow envelope (linked), turned into a gain
             {
@@ -627,10 +638,13 @@ public:
             }
             ++acc.n;
             if (C == 1) { acc.peak[1] = acc.peak[0]; acc.tp[1] = acc.tp[0]; acc.sumSq[1] = acc.sumSq[0]; }
+            outFast = (C == 1 ? 2 * op : op) + cFast * (outFast - (C == 1 ? 2 * op : op));
+            if (C == 1) { acc.inPeak[1] = acc.inPeak[0]; acc.inSumSq[1] = acc.inSumSq[0]; }
             loudnessSample (op);
         }
         if (resetIntegrated.exchange (false)) resetLoudness();
         meterLevel.store ((float) lvlC);
+        meterIn.store ((float) powToLufs (inFast)); meterOut.store ((float) powToLufs (outFast));
         meterA.store ((float) mA); meterB.store ((float) mB); meterC.store ((float) mC); meterD.store ((float) mD);
         meterLim.store ((float) linToDb (mL)); meterMakeup.store ((float) makeupDb); meterDensity.store ((float) mDen); meterAmb.store ((float) mAmb); meterT.store ((float) mT); meterRev.store ((float) linToDb (mRev + 1e-9));
         if (meterLock.try_lock())
@@ -639,6 +653,7 @@ public:
             {
                 shared.peak[c] = std::max (shared.peak[c], acc.peak[c]); shared.tp[c] = std::max (shared.tp[c], acc.tp[c]);
                 shared.sumSq[c] += acc.sumSq[c];
+                shared.inPeak[c] = std::max (shared.inPeak[c], acc.inPeak[c]); shared.inSumSq[c] += acc.inSumSq[c];
             }
             shared.n += acc.n;
             meterLock.unlock();
@@ -649,7 +664,7 @@ public:
     OutputMeter takeMeter() { std::lock_guard<std::mutex> l (meterLock); auto m = shared; shared = {}; return m; }
 
     std::atomic<float> meterLevel { -100 }, meterA { 0 }, meterB { 0 }, meterC { 0 }, meterD { 0 }, meterLim { 0 },
-                       meterMakeup { 0 }, meterDensity { 0 }, meterAmb { 0 }, meterEr { 20 }, meterT { 0 }, meterRev { -100 }, meterM { -100 }, meterS { -100 }, meterI { -100 };
+                       meterMakeup { 0 }, meterDensity { 0 }, meterAmb { 0 }, meterEr { 20 }, meterT { 0 }, meterRev { -100 }, meterIn { -100 }, meterOut { -100 }, meterM { -100 }, meterS { -100 }, meterI { -100 };
     std::atomic<bool> resetIntegrated { false };
 
 private:
@@ -828,6 +843,7 @@ private:
     double cDenA = 0, cDenR = 0, cOptoUp = 0, cOptoDn = 0, cLoud = 0, cMakeup = 0, cSmooth = 0, cLimRel = 0, ceiling = 1;
     double mixS = 1, outS = 1, denS = 0, ambS = 0, trS = 0, trFast = 0, trSlow = 0;
     Biquad centreEq, sideHp1, sideHp2; int lastCentreFilter = -1, lastSlope = -1; bool lastLowCutOn = false; double centreS = 1;
+    std::array<KWeighting, kMaxCh> inKw; double inFast = 0, outFast = 0, cFast = 0;
     double widthS = 1, revSendS = 0, cRevSend = 0, lvlA = -100; TailVerb verb;
     double cTrFa = 0, cTrFr = 0, cTrSa = 0, cTrSr = 0;
     std::array<std::array<KWeighting, 4>, kMaxCh> kw;
