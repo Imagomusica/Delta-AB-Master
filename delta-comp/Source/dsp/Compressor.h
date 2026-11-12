@@ -140,6 +140,7 @@ struct Delay
     void reserve (int cap) { buf.assign ((size_t) std::max (1, cap), 0.0); }
     void setLength (int l) { len = std::clamp (l, 0, (int) buf.size()); reset(); }
     void reset() { std::fill (buf.begin(), buf.end(), 0.0); pos = 0; }
+    void fill (double v) { std::fill (buf.begin(), buf.end(), v); }
     double process (double x) { if (len == 0) return x; const double y = buf[(size_t) pos]; buf[(size_t) pos] = x; pos = (pos + 1) % len; return y; }
 };
 
@@ -174,53 +175,207 @@ struct Box       // moving average over len samples
 };
 
 // Linear-phase polyphase oversampler, factor 1/2/4/8. Filter length 16F+1, so up + down = exactly 16 base samples.
-struct Oversampler
+// in-place radix-2 complex FFT (inverse scaled by 1/n)
+inline void fftInPlace (std::complex<double>* a, int n, bool inv)
 {
-    static constexpr int kMaxF = 8, kPer = 17, kDelayBase = 16;
-    int F = 1, N = 1;
-    std::array<double, kPer * kMaxF> h {};
-    std::array<double, kPer> xh {};
-    std::array<double, kPer * kMaxF * 2> ring {}; int rpos = 0;
-    void setFactor (int f)
+    for (int i = 1, j = 0; i < n; ++i) { int bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) std::swap (a[i], a[j]); }
+    for (int len = 2; len <= n; len <<= 1)
     {
-        F = std::clamp (f, 1, kMaxF); N = 16 * F + 1;
-        h.fill (0);
-        if (F > 1)
-        {
-            const double fc = 0.47 / F;   // of the high rate
-            double sum = 0;
-            for (int i = 0; i < N; ++i)
-            {
-                const double t = i - (N - 1) * 0.5;
-                const double s = std::abs (t) < 1e-12 ? 2 * fc : std::sin (2 * kPi * fc * t) / (kPi * t);
-                const double w = 0.42 - 0.5 * std::cos (2 * kPi * i / (N - 1)) + 0.08 * std::cos (4 * kPi * i / (N - 1));
-                h[(size_t) i] = s * w; sum += s * w;
-            }
-            for (int i = 0; i < N; ++i) h[(size_t) i] /= sum;
-        }
-        reset();
+        const double ang = (inv ? 2.0 : -2.0) * kPi / len; const std::complex<double> wl (std::cos (ang), std::sin (ang));
+        for (int i = 0; i < n; i += len) { std::complex<double> w (1); for (int j = 0; j < len / 2; ++j) { const auto u = a[i + j], v = a[i + j + len / 2] * w; a[i + j] = u + v; a[i + j + len / 2] = u - v; w *= wl; } }
     }
-    void reset() { xh.fill (0); ring.fill (0); rpos = 0; }
+    if (inv) for (int i = 0; i < n; ++i) a[i] /= (double) n;
+}
+
+struct PolyStage
+{
+    // Polyphase interpolator / decimator (Kaiser, 120 dB). P taps per phase are fixed per sample rate, so the round
+    // trip up + down is always P base samples (constant latency). Inside that length the filter is set by hand:
+    // cutoff (-6 dB point), steepness (transition width) and pre-ringing, from linear phase (symmetric ringing) to
+    // minimum phase (no pre-ringing, all of it after), always placed at the same centre.
+    static constexpr int kMaxF = 40, kMaxP = 128;
+    using cd = std::complex<double>;
+    int F = 1, P = 16, N = 1, lo = 0, hi = 1;
+    std::vector<double> h, ring; int rpos = 0;
+    // transition width range for a given P (Kaiser 120 dB needs 7.8 fs / tw taps per phase)
+    static double twMin (double fs, int P) { return 7.8 * fs / (P - 1) * 1.02; }
+    static double twMax (double fs, int P) { return std::max (twMin (fs, P), 0.46 * fs); }
+    static double tw (double fs, int P, double steep) { return twMax (fs, P) * std::pow (twMin (fs, P) / twMax (fs, P), std::clamp (steep, 0.0, 1.0)); }
+    // the high-rate impulse (N = P F + 1 taps, centre P F / 2), normalised to unity DC gain; lo / hi = useful span
+    static void design (int F, int P, double fs, double cutHz, double steep, double pre, std::vector<double>& out, int& lo, int& hi, std::vector<cd>& work)
+    {
+        const int N = P * F + 1, c = P * F / 2; const double Fh = F * fs;
+        out.assign ((size_t) N, 0.0);
+        if (F <= 1) { out.assign (1, 1.0); lo = 0; hi = 1; return; }
+        const double fc = std::min (cutHz, 0.5 * fs) / Fh, w = Fh > 0 ? tw (fs, P, steep) / Fh : 0.1;
+        int L = (int) std::ceil (112.0 / (2.285 * 2 * kPi * w)) + 1; L = std::min (L | 1, N);   // N is odd (P even)
+        const int hl = (L - 1) / 2; const double beta = 0.1102 * (120.0 - 8.7);
+        auto i0 = [] (double x) { double sum = 1, t = 1; for (int k = 1; k < 80; ++k) { t *= (x / (2 * k)) * (x / (2 * k)); sum += t; if (t < 1e-18 * sum) break; } return sum; };
+        const double ib = i0 (beta);
+        auto proto = [&] (int n) { const double r = (double) n / (hl + 1), sn = n == 0 ? 2 * fc : std::sin (2 * kPi * fc * n) / (kPi * n);
+                                   return sn * i0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / ib; };
+        pre = std::clamp (pre, 0.0, 1.0);
+        if (pre >= 0.999)
+            for (int n = -hl; n <= hl; ++n) out[(size_t) (c + n)] = proto (n);
+        else
+        {
+            int M = 1; while (M < 2 * N) M <<= 1;
+            work.assign ((size_t) M, cd (0));
+            for (int n = -hl; n <= hl; ++n) work[(size_t) ((n + M) % M)] = proto (n);
+            fftInPlace (work.data(), M, false);
+            std::vector<double>& lm = logScratch (); lm.resize ((size_t) M);
+            for (int k = 0; k < M; ++k) lm[(size_t) k] = std::log (std::max (std::abs (work[(size_t) k]), 1e-9));
+            // minimum-phase share a of the magnitude (|H|^a, real cepstrum folded), linear-phase share |H|^(1-a)
+            const double a = 1.0 - pre;
+            for (int k = 0; k < M; ++k) work[(size_t) k] = a * lm[(size_t) k];
+            fftInPlace (work.data(), M, true);
+            for (int n = 1; n < M / 2; ++n) work[(size_t) n] *= 2.0;
+            for (int n = M / 2 + 1; n < M; ++n) work[(size_t) n] = 0.0;
+            fftInPlace (work.data(), M, false);
+            for (int k = 0; k < M; ++k) work[(size_t) k] = std::exp (work[(size_t) k] + (1.0 - a) * lm[(size_t) k]);
+            fftInPlace (work.data(), M, true);
+            const int left = c, right = N - 1 - c;
+            for (int n = -left; n <= right; ++n)
+            {   // short raised-cosine fades at both ends of the window (truncation of long minimum-phase tails)
+                const int fa = std::max (1, left / 8), fb = std::max (1, right / 4);
+                const double fl = n < -left + fa ? 0.5 - 0.5 * std::cos (kPi * (n + left) / fa) : 1.0;
+                const double fr = n > right - fb ? 0.5 - 0.5 * std::cos (kPi * (right - n) / fb) : 1.0;
+                out[(size_t) (c + n)] = work[(size_t) ((n + M) % M)].real() * fl * fr;
+            }
+        }
+        double sum = 0, mx = 0; for (double v : out) { sum += v; mx = std::max (mx, std::abs (v)); }
+        for (auto& v : out) v /= sum;
+        lo = 0; hi = N; while (lo < N - 1 && std::abs (out[(size_t) lo]) < 1e-11 * mx / std::abs (sum)) ++lo;
+        while (hi > lo + 1 && std::abs (out[(size_t) (hi - 1)]) < 1e-11 * mx / std::abs (sum)) --hi;
+    }
+    static std::vector<double>& logScratch() { static thread_local std::vector<double> v; return v; }
+    // runtime: polyphase taps stored per phase, histories in doubled rings written backwards (contiguous dot products)
+    std::vector<double> hp; std::array<int, kMaxF> k0 {}, k1 {};
+    std::vector<double> xr; int xpos = 0;
+    void setTaps (int f, int p, const std::vector<double>& taps, int l, int hgh)
+    {
+        const bool same = f == F && p == P && ! ring.empty();
+        F = std::clamp (f, 1, kMaxF); P = p; N = (int) taps.size(); lo = l; hi = hgh;
+        h.assign (taps.begin(), taps.end());
+        hp.assign ((size_t) (F * (P + 1)), 0.0);
+        for (int ph = 0; ph < F; ++ph)
+        {
+            k0[(size_t) ph] = std::max (0, (lo - ph + F - 1) / F); k1[(size_t) ph] = std::min (P, (hi - 1 - ph) / F);
+            for (int k = 0; k <= P; ++k) if (k * F + ph < N) hp[(size_t) (ph * (P + 1) + k)] = h[(size_t) (k * F + ph)] * F;
+        }
+        if (! same) { xr.assign ((size_t) (2 * (P + 1)), 0.0); xpos = 0; ring.assign ((size_t) (2 * (P * F + 2 * F)), 0.0); rpos = 0; }
+    }
+    void reserve (int maxR, int maxP) { h.reserve ((size_t) (maxP * maxR + 1)); hp.reserve ((size_t) (maxR * (maxP + 1))); xr.reserve ((size_t) (2 * (maxP + 1)));
+                                        ring.reserve ((size_t) (2 * (maxP * maxR + 2 * maxR))); }   // never allocates afterwards
+    void reset() { std::fill (xr.begin(), xr.end(), 0.0); std::fill (ring.begin(), ring.end(), 0.0); xpos = 0; rpos = 0; }
+    // four independent accumulators: the multiply-adds overlap instead of waiting on each other
+    static double dot (const double* a, const double* b, int from, int to)
+    {
+        double s0 = 0, s1 = 0, s2 = 0, s3 = 0; int j = from;
+        for (; j + 3 < to; j += 4) { s0 += a[j] * b[j]; s1 += a[j + 1] * b[j + 1]; s2 += a[j + 2] * b[j + 2]; s3 += a[j + 3] * b[j + 3]; }
+        for (; j < to; ++j) s0 += a[j] * b[j];
+        return (s0 + s1) + (s2 + s3);
+    }
     void up (double x, double* out)
     {
-        for (int k = kPer - 1; k > 0; --k) xh[(size_t) k] = xh[(size_t) (k - 1)];
-        xh[0] = x;
-        for (int p = 0; p < F; ++p)
+        const int L = P + 1;
+        xpos = (xpos - 1 + L) % L; xr[(size_t) xpos] = xr[(size_t) (xpos + L)] = x;   // xr[xpos + k] = x[i - k]
+        const double* xs = xr.data() + xpos;
+        for (int ph = 0; ph < F; ++ph)
         {
-            double acc = 0;
-            for (int k = 0; k * F + p < N; ++k) acc += h[(size_t) (k * F + p)] * xh[(size_t) k];
-            out[p] = acc * F;
+            const double* hk = hp.data() + ph * L;
+            out[ph] = dot (hk, xs, k0[(size_t) ph], k1[(size_t) ph] + 1);
         }
     }
     double down (const double* v)   // v: the F high-rate samples of this base period
     {
-        const int L = kPer * kMaxF;
-        for (int p = 0; p < F; ++p) { ring[(size_t) rpos] = ring[(size_t) (rpos + L)] = v[p]; rpos = (rpos + 1) % L; }
+        const int L = (int) ring.size() / 2;
+        for (int ph = 0; ph < F; ++ph) { rpos = (rpos - 1 + L) % L; ring[(size_t) rpos] = ring[(size_t) (rpos + L)] = v[ph]; }   // ring[rpos + j] = y[n - j]
         // output aligned on the first high-rate sample of the period: newest - (F - 1)
-        const int newest = (rpos - 1 + L) % L + L;
-        double acc = 0;
-        for (int j = 0; j < N; ++j) acc += h[(size_t) j] * ring[(size_t) (newest - (F - 1) - j)];
-        return acc;
+        const double* ys = ring.data() + rpos + (F - 1);
+        return dot (h.data(), ys, lo, hi);
+    }
+};
+
+// Two-stage oversampler: stage A goes to 2x with the filter set by hand (cutoff, slope, pre-ringing: that is the
+// one that shapes the sound), stage B goes from 2x to F x with a short fixed filter (flat to 0.55 fs, images
+// rejected 120 dB from 1.45 fs). Same result as one long filter at F x, a fraction of the cost. Round trip:
+// P (stage A) + kDB base samples, whatever the factor.
+struct Oversampler
+{
+    static constexpr int kMaxF = 40, kMaxP = 128, kDB = 10;
+    static constexpr int kNumF = 7; static constexpr int kFactors[kNumF] = { 1, 2, 4, 8, 16, 32, 40 };
+    static int index (int f) { for (int i = kNumF - 1; i > 0; --i) if (f >= kFactors[i]) return i; return 0; }
+    using cd = std::complex<double>;
+    static double tw (double fs, int P, double steep) { return PolyStage::tw (fs, P, steep); }
+    static void design (int F, int P, double fs, double cutHz, double steep, double pre, std::vector<double>& out, int& lo, int& hi, std::vector<cd>& work)
+    { PolyStage::design (F, P, fs, cutHz, steep, pre, out, lo, hi, work); }
+    // stage B: R = F / 2 from 2 fs, N = 2 kDB R + 1 taps (R = 1: a pure delay of kDB / 2 base samples)
+    static void designB (int R, double fs, std::vector<double>& out, int& lo, int& hi)
+    {
+        const int N = 2 * kDB * R + 1, c = kDB * R; out.assign ((size_t) N, 0.0); lo = 0; hi = N;
+        if (R <= 1) { out[(size_t) c] = 1.0; lo = c; hi = c + 1; return; }
+        const double Fh = 2.0 * fs * R, fc = fs / Fh, beta = 0.1102 * (120.0 - 8.7);
+        auto i0 = [] (double x) { double sum = 1, t = 1; for (int k = 1; k < 80; ++k) { t *= (x / (2 * k)) * (x / (2 * k)); sum += t; if (t < 1e-18 * sum) break; } return sum; };
+        double sum = 0;
+        for (int n = -c; n <= c; ++n)
+        {
+            const double r = (double) n / (c + 1), sn = n == 0 ? 2 * fc : std::sin (2 * kPi * fc * n) / (kPi * n);
+            out[(size_t) (n + c)] = sn * i0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0 (beta); sum += out[(size_t) (n + c)];
+        }
+        for (auto& v : out) v /= sum;
+    }
+    PolyStage a, b; int F = 1, R = 1;
+    void reserve() { a.reserve (2, kMaxP); b.reserve (kMaxF / 2, 2 * kDB); }
+    void setTaps (int f, int p, const std::vector<double>& tapsA, int loA, int hiA, const std::vector<double>& tapsB, int loB, int hiB)
+    {
+        F = std::max (2, f); R = F / 2;
+        a.setTaps (2, p, tapsA, loA, hiA);
+        b.setTaps (R, 2 * kDB, tapsB, loB, hiB);
+    }
+    void reset() { a.reset(); b.reset(); }
+    void up (double x, double* out)
+    {
+        double t[2]; a.up (x, t);
+        b.up (t[0], out); b.up (t[1], out + R);
+    }
+    double down (const double* v)
+    {
+        double t[2] = { b.down (v), b.down (v + R) };
+        return a.down (t);
+    }
+};
+
+// A base-rate gain stream brought to F x fs: linear interpolation then the band-limiting gain FIR, folded into one
+// polyphase kernel of a few taps per phase (same result, far cheaper than filtering at the high rate).
+struct GainUp
+{
+    int F = 1, E = 1; std::vector<double> kq; std::array<double, 2 * 72> hist {}; int pos = 0;
+    void prepare (int f, const std::vector<double>& hfir, double init)
+    {
+        F = f; const int T = (int) hfir.size();   // G[m] = sum_j r[j] K[m - (j + 1) F], K[u] = sum_t h[t] tri ((u - t) / F)
+        E = (T + 2 * F) / F + 2; E = std::min (E, 72);
+        kq.assign ((size_t) (F * E), 0.0);
+        for (int q = 0; q < F; ++q)
+            for (int e = 0; e < E; ++e)
+            {
+                const int u = (e - 1) * F + q; double k = 0;
+                for (int t = std::max (0, u - F + 1); t <= std::min (T - 1, u + F - 1); ++t) k += hfir[(size_t) t] * (1.0 - std::abs ((double) (u - t)) / F);
+                kq[(size_t) (q * E + e)] = k;
+            }
+        hist.fill (init); pos = 0;
+    }
+    // r: this base sample's gain; out: the F high-rate gains of this period
+    void process (double r, double* out)
+    {
+        pos = (pos - 1 + E) % E; hist[(size_t) pos] = hist[(size_t) (pos + E)] = r;   // hist[pos + e] = r[i - e]
+        const double* hs = hist.data() + pos;
+        for (int q = 0; q < F; ++q)
+        {
+            const double* k = kq.data() + q * E; double acc = 0;
+            for (int e = 0; e < E; ++e) acc += k[e] * hs[e];
+            out[q] = acc;
+        }
     }
 };
 
@@ -359,6 +514,7 @@ struct Params
     double revDyn = 1.0;           // 0 = constant send, 1 = send only when the level is low (under stage A threshold)
     // E limiter
     bool limOn = true; double ceiling = -1, limRel = 60, lookMs = 2; int os = 1; bool truePeak = true;
+    double osCut = 96000, osSteep = 0.85, osPre = 1.0;   // oversampling filter: -6 dB point Hz, steepness 0..1, pre-ringing 1 = linear phase .. 0 = minimum phase
     double linkT = 1.0, linkR = 1.0;
 };
 
@@ -663,14 +819,23 @@ public:
         gfir.design (fs, std::clamp ((fs * 0.5 - 20000.0) / 3.0, 300.0, 8000.0));
         const int hf = gfir.half;
         // oversampled limiter: its gain only has to stay below (F - 1) fs / 2 (the rest is removed when coming down)
-        int tailOs = 0, nMax = gfir.N, hoMax = 0;
-        for (int k = 1; k <= 3; ++k)
+        for (auto& o : os) o.reserve();
+        for (auto& o : dynOs) o.reserve();
+        dynOsE.reserve();
+        osTaps.reserve ((size_t) (2 * Oversampler::kMaxP + 1)); osTapsB.reserve ((size_t) (Oversampler::kDB * Oversampler::kMaxF + 1)); osWork.reserve (16384);
+        int tailOs = 0, nMax = gfir.N, hoMax = 0, hlMax = 0;
+        for (int k = 1; k < Oversampler::kNumF; ++k)
         {
-            const int F = 1 << k;
+            const int F = Oversampler::kFactors[k];
             gfirOs[(size_t) k].design (F * fs, (F - 1) * fs * 0.5, F);
-            tailOs = std::max (tailOs, Oversampler::kDelayBase + 2 * gfirOs[(size_t) k].half / F);
+            hlMax = std::max (hlMax, gfirOs[(size_t) k].half / F);
             nMax = std::max (nMax, gfirOs[(size_t) k].N); hoMax = std::max (hoMax, 2 * gfirOs[(size_t) k].half);
         }
+        // oversampling filter taps per phase: as long as allowed (128), but the oversampled dynamics path must fit
+        // inside the 1x gain FIR delay (hf), so the latency never depends on the factor
+        osP = std::clamp (hf - 2 - hlMax - Oversampler::kDB, 8, Oversampler::kMaxP); osP -= osP & 1;
+        osDelay = osP + Oversampler::kDB;
+        for (int k = 1; k < Oversampler::kNumF; ++k) tailOs = std::max (tailOs, osDelay + 2 * gfirOs[(size_t) k].half / Oversampler::kFactors[k]);
         limTail = std::max (TruePeak::kDelay + 2 * hf, tailOs);
         specUp.prepare (fs);
         latencySamples = hf + lookMax + limTail + TiltEq::latency() + specUp.latency();
@@ -681,6 +846,9 @@ public:
             wetKw[(size_t) c].prepare (fs); outKw[(size_t) c].prepare (fs); inKw[(size_t) c].prepare (fs);
             limDelay[(size_t) c].reserve ((lookMax + 1) * Oversampler::kMaxF + 2 * hf + hoMax + 16);
             xDelay[(size_t) c].reserve (hf + 1); xDelay[(size_t) c].setLength (hf);
+            dynXDelay[(size_t) c].reserve (hf + 1); dynGDelay[(size_t) c].reserve (hf + 16); dynTDelay[(size_t) c].reserve (hf + 16); dynADelay[(size_t) c].reserve (hf + 16);
+            for (auto* g : { &dynGm[(size_t) c], &dynGt[(size_t) c], &dynGa[(size_t) c] }) g->kq.reserve (72 * Oversampler::kMaxF);
+           
             firMain[(size_t) c].prepare (gfir.N, 1.0); firAmbC[(size_t) c].prepare (gfir.N, 0.0); firTr[(size_t) c].prepare (gfir.N, 0.0);
             limFir[(size_t) c].reserve (nMax); limFir[(size_t) c].prepare (gfir.N, 1.0);
             spDelay[(size_t) c].reserve (TruePeak::kDelay + 1); spDelay[(size_t) c].setLength (TruePeak::kDelay);
@@ -760,7 +928,9 @@ public:
         if (p.centreFilter != lastCentreFilter || (p.sideLowCut > 0) != lastLowCutOn || p.sideSlope != lastSlope)
         { centreEq.reset(); sideHp1.reset(); sideHp2.reset(); lastCentreFilter = p.centreFilter; lastLowCutOn = p.sideLowCut > 0; lastSlope = p.sideSlope; }
         cLoud = co (8000.0); cMakeup = co (1500.0); cSmooth = co (20.0);
-        const int f = p.os <= 1 ? 1 : p.os <= 2 ? 2 : p.os <= 4 ? 4 : 8;
+        // oversampling factor, kept under ~2 MHz (40x at 48 kHz, 16x at 96 kHz, 4x at 384 kHz)
+        int f = Oversampler::kFactors[Oversampler::index (p.os)];
+        while (f > 1 && f * fs > 1.93e6) f = Oversampler::kFactors[Oversampler::index (f) - 1];
         cLimRel = std::exp (-1.0 / (std::max (p.limRel, 0.1) * 0.001 * fs * f));
         ceiling = dbToLin (std::min (0.0, p.ceiling));
         wantOs = f;
@@ -824,6 +994,11 @@ public:
         const int C = std::min (numCh, nch);
         const double cs = (double) C;
         if (wantOs != curOs || wantLook != curLook) configureLimiter();
+        else if (curOs > 1 && (p.osCut != curCut || p.osSteep != curSteep || p.osPre != curPre))
+        {   // filter knobs moved: redesign at most every 80 ms
+            if (osWait <= 0) { designOs(); osWait = (int) (0.08 * fs); }
+        }
+        osWait -= n;
         const double mixT = std::clamp (p.mix, 0.0, 1.0), outT = dbToLin (p.outGainDb);
         double mRev = 0, mT = 0, mA = 0, mB = 0, mC = 0, mD = 0, mL = 1, mDen = 0, mAmb = 0, lvlC = -100;
         const int F = curOs;
@@ -976,33 +1151,28 @@ public:
             // every stage, the density, the makeup, the mix and the output gain (a product of separately filtered
             // gains would widen the band again). The ambiance is a second, additive band-limited term.
             double xd[kMaxCh] {}, y[kMaxCh] {};
-            const bool same = C == 2 && p.link >= 1.0;
-            double G[kMaxCh] {};
+            const bool same = C == 2 && p.link >= 1.0 && ! dynOn;
+            // the gain streams (not yet band-limited): main, transients on Mid/Side, ambiance
+            double rawM[kMaxCh] {}, rawT[kMaxCh] {}, rawA[kMaxCh] {};
+            for (int c = 0; c < C; ++c)
+            {
+                rawM[c] = outS * ((1.0 - mixS) + mixS * mk * (gPre[c] * gPost[c] + dk[c]));
+                rawT[c] = outS * mixS * mk * gPre[c] * gPost[c] * kT;
+            }
+            double xa[kMaxCh] {};
             for (int c = 0; c < C; ++c)
             {
                 xd[c] = xDelay[(size_t) c].process (x[c]);
-                if (same && c == 1) { G[1] = G[0]; continue; }
-                G[c] = firMain[(size_t) c].process (outS * ((1.0 - mixS) + mixS * mk * (gPre[c] * gPost[c] + dk[c])), gfir.h);
+                if (dynOn) xa[c] = dynXDelay[(size_t) c].process (x[c]);
             }
-            for (int c = 0; c < C; ++c) y[c] = xd[c] * G[c];
-            if (C == 2)
-            {   // transients on Mid / Side: y += fir (rest of the gain x (g - 1)) x M (or +-S)
-                double q[kMaxCh] {};
-                for (int c = 0; c < 2; ++c)
-                {
-                    if (same && c == 1) { q[1] = q[0]; continue; }
-                    q[c] = firTr[(size_t) c].process (outS * mixS * mk * gPre[c] * gPost[c] * kT, gfir.h);
-                }
-                const double um = 0.5 * (xd[0] + xd[1]), us = 0.5 * (xd[0] - xd[1]);
-                if (p.trTarget == 1) { y[0] += q[0] * um; y[1] += q[1] * um; }
-                else if (p.trTarget == 2) { y[0] += q[0] * us; y[1] -= q[1] * us; }
-            }
+            double e = 0;
             if (C == 2)
             {
                 // decorrelated side of the (unprocessed) input, pre-delayed like the control path; the gain applied
-                // before the ambiance on the control path is delayed by the same pre-delay
+                // before the ambiance on the control path is delayed by the same pre-delay. Oversampled: taken from
+                // the earlier audio (xa) so it meets the oversampled gain.
                 const size_t R = ambRingA.size(), rd = (ambWA + R - (size_t) ambD) % R;
-                ambRingA[ambWA] = ambHpA.process (0.5 * (xd[0] - xd[1]));
+                ambRingA[ambWA] = ambHpA.process (dynOn ? 0.5 * (xa[0] - xa[1]) : 0.5 * (xd[0] - xd[1]));
                 ambRingG[ambWA] = 0.5 * (gPre[0] + gPre[1]);
                 ambRingT[ambWA] = trDb;
                 const double del = ambRingA[rd], gDel = ambRingG[rd];
@@ -1012,14 +1182,73 @@ public:
                 ambDuck = tAhead > ambDuck ? tAhead : tAhead + cAmbDuck * (ambDuck - tAhead);
                 const double kDuck = dbToLin (-p.ambTr * 2.5 * ambDuck);
                 ambWA = (ambWA + 1) % R;
-                const double e = ap2A.process (ap1A.process (del));
-                double ka[kMaxCh] {};
-                for (int c = 0; c < 2; ++c)
+                e = ap2A.process (ap1A.process (del));
+                for (int c = 0; c < 2; ++c) rawA[c] = outS * mixS * mk * gDel * ambK * kDuck * gPost[c];
+            }
+
+            if (dynOn)
+            {   // OVERSAMPLING (compressor and limiter): every gain is band-limited at F x fs (up to fs/2 wide instead
+                // of a few hundred Hz), so attacks are followed far more precisely in time; the products above fs/2
+                // are removed on the way down. Audio and gains meet P/2 base samples after xa.
+                const int F = curOs;
+                double hiA[kMaxCh][Oversampler::kMaxF] {}, hiE[Oversampler::kMaxF] {};
+                for (int c = 0; c < C; ++c) dynOs[(size_t) c].up (xa[c], hiA[c]);
+                if (C == 2 && (rawA[0] != 0.0 || rawA[1] != 0.0 || dynZeroA[0] < dynGa[0].E + osDelay)) dynOsE.up (e, hiE);
+                double r[3][kMaxCh] {};
+                for (int c = 0; c < C; ++c)
                 {
-                    if (same && c == 1) { ka[1] = ka[0]; continue; }
-                    ka[c] = firAmbC[(size_t) c].process (outS * mixS * mk * gDel * ambK * kDuck * gPost[c], gfir.h);
+                    const size_t u = (size_t) c;
+                    r[0][c] = dynGDelay[u].process (rawM[c]);
+                    r[1][c] = dynTDelay[u].process (rawT[c]);
+                    r[2][c] = dynADelay[u].process (rawA[c]);
                 }
-                y[0] += ka[0] * e; y[1] -= ka[1] * e;
+                const bool msT = C == 2 && p.trTarget > 0;
+                double hiY[kMaxCh][Oversampler::kMaxF] {};
+                for (int c = 0; c < C; ++c)
+                {
+                    const size_t u = (size_t) c;
+                    double gm[Oversampler::kMaxF], gt[Oversampler::kMaxF], ga[Oversampler::kMaxF];
+                    dynGm[u].process (r[0][c], gm);
+                    // the Mid/Side transient and ambiance streams cost nothing while they stay at zero
+                    const bool tOn = C == 2 && (r[1][c] != 0.0 || dynZeroT[u] < dynGt[u].E); dynZeroT[u] = r[1][c] != 0.0 ? 0 : dynZeroT[u] + 1;
+                    const bool aOn = C == 2 && (r[2][c] != 0.0 || dynZeroA[u] < dynGa[u].E); dynZeroA[u] = r[2][c] != 0.0 ? 0 : dynZeroA[u] + 1;
+                    if (tOn) dynGt[u].process (r[1][c], gt);
+                    if (aOn) dynGa[u].process (r[2][c], ga);
+                    for (int q = 0; q < F; ++q)
+                    {
+                        double v = hiA[c][q] * gm[q];
+                        if (tOn && msT) v += gt[q] * (p.trTarget == 1 ? 0.5 * (hiA[0][q] + hiA[1][q]) : (c == 0 ? 0.5 : -0.5) * (hiA[0][q] - hiA[1][q]));
+                        if (aOn) v += (c == 0 ? ga[q] : -ga[q]) * hiE[q];
+                        hiY[c][q] = v;
+                    }
+                }
+                for (int c = 0; c < C; ++c) y[c] = dynOs[(size_t) c].down (hiY[c]);
+                // keep the 1x gain FIRs running, so going back to OFF is seamless
+                for (int c = 0; c < C; ++c) { firMain[(size_t) c].process (rawM[c], gfir.h); if (C == 2) { firTr[(size_t) c].process (rawT[c], gfir.h); firAmbC[(size_t) c].process (rawA[c], gfir.h); } }
+            }
+            else
+            {
+                double G[kMaxCh] {};
+                for (int c = 0; c < C; ++c)
+                {
+                    if (same && c == 1) { G[1] = G[0]; continue; }
+                    G[c] = firMain[(size_t) c].process (rawM[c], gfir.h);
+                }
+                for (int c = 0; c < C; ++c) y[c] = xd[c] * G[c];
+                if (C == 2)
+                {   // transients on Mid / Side: y += fir (rest of the gain x (g - 1)) x M (or +-S)
+                    double q[kMaxCh] {}, ka[kMaxCh] {};
+                    for (int c = 0; c < 2; ++c)
+                    {
+                        if (same && c == 1) { q[1] = q[0]; ka[1] = ka[0]; continue; }
+                        q[c] = firTr[(size_t) c].process (rawT[c], gfir.h);
+                        ka[c] = firAmbC[(size_t) c].process (rawA[c], gfir.h);
+                    }
+                    const double um = 0.5 * (xd[0] + xd[1]), us = 0.5 * (xd[0] - xd[1]);
+                    if (p.trTarget == 1) { y[0] += q[0] * um; y[1] += q[1] * um; }
+                    else if (p.trTarget == 2) { y[0] += q[0] * us; y[1] -= q[1] * us; }
+                    y[0] += ka[0] * e; y[1] -= ka[1] * e;   // ambiance
+                }
             }
 
             // M/S end section: width, centre level / filter, side low cut
@@ -1259,18 +1488,47 @@ private:
         }
     }
 
+    // oversampling filter (cutoff, steepness, pre-ringing), shared by every up / down sampler
+    void designOs()
+    {
+        const int F = std::max (2, curOs);
+        Oversampler::design (2, osP, fs, p.osCut, p.osSteep, p.osPre, osTaps, osLo, osHi, osWork);
+        Oversampler::designB (F / 2, fs, osTapsB, osLoB, osHiB);
+        for (auto& o : os) o.setTaps (F, osP, osTaps, osLo, osHi, osTapsB, osLoB, osHiB);
+        for (auto& o : dynOs) o.setTaps (F, osP, osTaps, osLo, osHi, osTapsB, osLoB, osHiB);
+        dynOsE.setTaps (F, osP, osTaps, osLo, osHi, osTapsB, osLoB, osHiB);
+        curCut = p.osCut; curSteep = p.osSteep; curPre = p.osPre;
+        if (osUiLock.try_lock())
+        {
+            osUiTaps.assign (osTaps.begin(), osTaps.end()); osUiF = curOs > 1 ? 2 : 1; osUiP = osP; osUiFs = fs; ++osUiVersion;
+            osUiLock.unlock();
+        }
+    }
+public:
+    // a copy of the current oversampling filter for the display (message thread)
+    bool osFilter (std::vector<double>& taps, int& F, int& P, double& rate, int& version)
+    {
+        std::lock_guard<std::mutex> l (osUiLock);
+        if (version == osUiVersion) return false;
+        taps = osUiTaps; F = osUiF; P = osUiP; rate = osUiFs; version = osUiVersion; return true;
+    }
+private:
+    std::mutex osUiLock; std::vector<double> osUiTaps; int osUiF = 1, osUiP = 16, osUiVersion = 0; double osUiFs = 48000;
+    std::vector<double> osTaps, osTapsB; std::vector<std::complex<double>> osWork; int osLo = 0, osHi = 1, osLoB = 0, osHiB = 1, osWait = 0;
+    double curCut = -1, curSteep = -1, curPre = -1;
+
     void configureLimiter()
     {
         curOs = wantOs; curLook = wantLook;
         const int Lh = curLook * curOs;
         const int hf = gfir.half, tail = limTail;
-        const GainFir& lf = curOs > 1 ? gfirOs[(size_t) (curOs == 2 ? 1 : curOs == 4 ? 2 : 3)] : gfir;
+        const GainFir& lf = curOs > 1 ? gfirOs[(size_t) Oversampler::index (curOs)] : gfir;
         const int hl = lf.half;   // limiter gain FIR half length, at the limiter's rate
-        const int padLen = curOs > 1 ? lookMax - curLook + tail - Oversampler::kDelayBase - 2 * hl / curOs
+        const int padLen = curOs > 1 ? lookMax - curLook + tail - osDelay - 2 * hl / curOs
                                      : lookMax - curLook + tail - TruePeak::kDelay - 2 * hf;
+        designOs();
         for (size_t c = 0; c < (size_t) kMaxCh; ++c)
         {
-            os[c].setFactor (curOs);
             // the gain goes through a band-limiting FIR (window 2 * hl); at 1x detection is also TruePeak::kDelay late
             limDelay[c].setLength (curOs > 1 ? Lh + 2 * hl : curLook + TruePeak::kDelay + 2 * hl);
             hold[c].setLength ((curOs > 1 ? Lh : curLook) + 2 * hl + 1);
@@ -1278,10 +1536,20 @@ private:
             box[c].setLength (curOs > 1 ? Lh : curLook);
             pad[c].setLength (padLen);
             limEnv[c] = 1; tpLim[c].reset(); spDelay[c].reset();
+            // dynamics gain at the oversampled rate (see process): audio delayed hf - 16 then up / x gain / down,
+            // gain delayed so both meet: D_a + P/2 = D_g + 1 + hl / F (up filter P/2, linear interpolation 1, gain FIR)
+            dynOn = curOs > 1 && hf >= osDelay + 1 + hl / curOs;
+            if (dynOn)
+            {
+                const int da = hf - osDelay, dg = da + osDelay / 2 - 1 - hl / curOs;
+                dynXDelay[c].setLength (da);
+                dynGDelay[c].setLength (dg); dynGDelay[c].fill (1.0); dynTDelay[c].setLength (dg); dynADelay[c].setLength (dg);
+                dynGm[c].prepare (curOs, lf.h, 1.0); dynGt[c].prepare (curOs, lf.h, 0.0); dynGa[c].prepare (curOs, lf.h, 0.0); dynZeroT[c] = dynZeroA[c] = 1 << 20;
+            }
         }
     }
 
-    const std::vector<double>& limH() const { return curOs > 1 ? gfirOs[(size_t) (curOs == 2 ? 1 : curOs == 4 ? 2 : 3)].h : gfir.h; }
+    const std::vector<double>& limH() const { return curOs > 1 ? gfirOs[(size_t) Oversampler::index (curOs)].h : gfir.h; }
 
     // one limiter step at the current rate: a = detected peak per channel (already aligned), v = audio in / out
     void limitSample (const double* a, double* v, int C, double& meterMin)
@@ -1368,8 +1636,9 @@ private:
     std::array<Box, kMaxCh> box;
     Biquad ambHp; Allpass ap1, ap2; KWeighting ambKw;
     // audio path (the gains computed on the control path, band-limited by the gain FIR, applied to the delayed input)
-    GainFir gfir; std::array<GainFir, 4> gfirOs; int limTail = 16; std::array<FirLine, kMaxCh> firMain, firAmbC, firTr, limFir; FirLine firRev;
-    std::array<Delay, kMaxCh> xDelay;
+    GainFir gfir; std::array<GainFir, Oversampler::kNumF> gfirOs; int limTail = 16; std::array<FirLine, kMaxCh> firMain, firAmbC, firTr, limFir; FirLine firRev;
+    std::array<Delay, kMaxCh> xDelay, dynXDelay, dynGDelay, dynTDelay, dynADelay;
+    std::array<Oversampler, kMaxCh> dynOs; int osP = 16, osDelay = 26; std::array<GainUp, kMaxCh> dynGm, dynGt, dynGa; std::array<int, kMaxCh> dynZeroT {}, dynZeroA {}; Oversampler dynOsE; bool dynOn = false;
     Biquad ambHpA; Allpass ap1A, ap2A; std::vector<double> ambRingA, ambRingG, ambRingT; size_t ambWA = 0;
     double trDb = 0, ambDuck = 0, laAmb = 96, cAmbDuck = 0.9997;
     static constexpr int kChunk = 256;

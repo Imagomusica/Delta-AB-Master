@@ -120,7 +120,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     fl ("ceiling", "Plafond",           -6.f,   0.f,  -1.f, 0.1f, 0,     "dBTP", 1);
     fl ("limRel",  "Limiteur release",   1.f, 1000.f, 60.f, 1.f, 60.f,   "ms", 0);
     fl ("look",    "Lookahead",        0.1f,   5.f,   2.f, 0.01f, 0,     "ms", 2);
-    ch ("os",      "Oversampling",     { "OFF", "2X", "4X", "8X" }, 0);
+    ch ("os",      "Oversampling",     { "OFF", "2X", "4X", "8X", "16X", "32X", "40X" }, 0);
+    fl ("osCut",   "OS coupure",        16.f,  96.f,  96.f, 0.01f, 30.f,  "kHz", 2);   // above fs/2 = fs/2
+    fl ("osSteep", "OS pente",           0.f, 100.f,  85.f, 1.f, 0,       "%", 0);
+    fl ("osPre",   "OS pre-ringing",     0.f, 100.f, 100.f, 1.f, 0,       "%", 0);
     bo ("truePeak","True peak",        true);
     fl ("linkT",   "Lien transitoires",  0.f, 100.f, 100.f, 1.f, 0,      "%", 0);
     fl ("linkR",   "Lien release",       0.f, 100.f, 100.f, 1.f, 0,      "%", 0);
@@ -151,7 +154,7 @@ dcomp::Params DeltaCompProcessor::currentParams() const
     p.sideLowCut = pv ("sideLowCut"); p.sideSlope = pi ("sideSlope") == 0 ? 6 : pi ("sideSlope") == 1 ? 12 : 24;
     p.revOn = pb ("revOn"); p.revTarget = pi ("revTarget");
     p.limOn = pb ("limOn"); p.ceiling = pv ("ceiling"); p.limRel = pv ("limRel"); p.lookMs = pv ("look");
-    p.os = 1 << pi ("os"); p.truePeak = pb ("truePeak"); p.linkT = pv ("linkT") * 0.01; p.linkR = pv ("linkR") * 0.01;
+    p.os = dcomp::Oversampler::kFactors[std::clamp (pi ("os"), 0, dcomp::Oversampler::kNumF - 1)]; p.truePeak = pb ("truePeak"); p.osCut = pv ("osCut") * 1000.0; p.osSteep = pv ("osSteep") * 0.01; p.osPre = pv ("osPre") * 0.01; p.linkT = pv ("linkT") * 0.01; p.linkR = pv ("linkR") * 0.01;
     return p;
 }
 

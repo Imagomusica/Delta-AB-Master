@@ -370,7 +370,7 @@ Rectangle<int> Section::cell (int i) const
 
 void Section::resized()
 {
-    if (extra != nullptr) extra->setBounds (cell (extraCell).getUnion (cell (extraCell + extraSpan - 1)).reduced (4, 6));
+    if (extra != nullptr) extra->setBounds (cell (extraCell).getUnion (cell (extraCell + extraSpan - 1)).reduced (4, 6).withTrimmedTop (extraTop));
     if (on) on->setBounds (getWidth() - 54, 2, 50, 20);
     auto r = getLocalBounds().reduced (4, 0).withTrimmedTop (38).withTrimmedBottom (4);
     const int rows = ((int) controls.size() + cols - 1) / cols;
@@ -1037,6 +1037,87 @@ Array<File> installedPlugins()
 
 namespace ui
 {
+void OsView::poll()
+{
+    if (! proc.engine.osFilter (taps, F, P, fs, version)) return;
+    magDb.clear(); info.clear();
+    if (F > 1 && taps.size() > 1)
+    {
+        const int N = (int) taps.size(); int M = 1; while (M < 4 * N) M <<= 1; M = std::max (M, 8192);
+        std::vector<std::complex<double>> w ((size_t) M);
+        for (int i = 0; i < N; ++i) w[(size_t) i] = taps[(size_t) i];
+        dcomp::fftInPlace (w.data(), M, false);
+        // 0 .. fs (base rate) over 256 points
+        const double Fh = F * fs; magDb.resize (256);
+        for (int i = 0; i < 256; ++i)
+        {
+            const double f = fs * i / 255.0; const int k = std::min (M / 2, (int) std::lround (f / Fh * M));
+            magDb[(size_t) i] = (float) (20.0 * std::log10 (std::abs (w[(size_t) k]) + 1e-12));
+        }
+        double f01 = 0;   // where it is down 0.1 dB
+        for (int k = 1; k < M / 2; ++k) if (20.0 * std::log10 (std::abs (w[(size_t) k]) + 1e-12) < -0.1) { f01 = (double) k / M * Fh; break; }
+        const int c = (N - 1) / 2; double mx = 0; for (double v : taps) mx = std::max (mx, std::abs (v));
+        int first = c, last = c;
+        for (int i = 0; i < N; ++i) if (std::abs (taps[(size_t) i]) > 1e-3 * mx) { first = std::min (first, i); last = std::max (last, i); }
+        double f6 = 0;   // -6 dB point
+        for (int k = 1; k < M / 2; ++k) if (std::abs (w[(size_t) k]) < 0.5) { f6 = (double) k / M * Fh; break; }
+        info = "-6 dB " + String (f6 / 1000.0, 1) + " kHz   -0.1 dB " + String (f01 / 1000.0, 1) + " kHz\n" + u8 ("PRÉ-ÉCHO ") + String ((c - first) / Fh * 1000.0, 2) + " ms   POST "
+               + String ((last - c) / Fh * 1000.0, 2) + " ms";
+    }
+    repaint();
+}
+
+void OsView::paint (Graphics& g)
+{
+    auto r = getLocalBounds().toFloat();
+    g.setColour (kBg); g.fillRect (r); g.setColour (kDim); g.drawRect (r, 1.0f);
+    g.setFont (mono (9.0f, false));
+    if (F <= 1 || magDb.empty())
+    {
+        g.setColour (kGrey); g.drawText ("OFF  1x : PAS DE FILTRE", r, Justification::centred); return;
+    }
+    auto text = r.removeFromBottom (24.0f);
+    g.setColour (kFg); g.drawFittedText (info, text.reduced (4, 0).toNearestInt(), Justification::centredLeft, 2);
+    auto mag = r.removeFromLeft (r.getWidth() * 0.55f).reduced (4, 4), imp = r.reduced (4, 4);
+    // magnitude: 0 .. fs, 0 .. -130 dB; the band above fs/2 (folds back) shaded, 20 kHz marked
+    const float nyq = mag.getX() + mag.getWidth() * 0.5f;
+    g.setColour (Colour (0xff161616)); g.fillRect (Rectangle<float> (nyq, mag.getY(), mag.getRight() - nyq, mag.getHeight()));
+    const float x20 = mag.getX() + mag.getWidth() * (float) std::min (1.0, 20000.0 / fs);
+    g.setColour (kDim); g.drawVerticalLine ((int) x20, mag.getY(), mag.getBottom());
+    for (float db : { -40.0f, -80.0f, -120.0f }) g.drawHorizontalLine ((int) (mag.getY() - db / 130.0f * mag.getHeight()), mag.getX(), mag.getRight());
+    Path pm;
+    for (size_t i = 0; i < magDb.size(); ++i)
+    {
+        const float x = mag.getX() + mag.getWidth() * (float) i / (float) (magDb.size() - 1);
+        const float y = mag.getY() + jlimit (0.0f, 1.0f, -magDb[i] / 130.0f) * mag.getHeight();
+        if (i == 0) pm.startNewSubPath (x, y); else pm.lineTo (x, y);
+    }
+    g.setColour (kFg); g.strokePath (pm, PathStrokeType (1.2f));
+    g.setColour (kGrey); g.drawText ("20k", Rectangle<float> (x20 + 2, mag.getY(), 30, 10), Justification::left);
+    g.drawText ("fs/2", Rectangle<float> (nyq + 2, mag.getBottom() - 10, 30, 10), Justification::left);
+    // impulse: the span around the centre (+-1 ms or the whole filter), centre line = where the sound is
+    const int N = (int) taps.size(), c = (N - 1) / 2; const double Fh = F * fs;
+    const int half = std::min (c, (int) (0.0012 * Fh));
+    double mx = 1e-12; for (int i = c - half; i <= c + half; ++i) mx = std::max (mx, std::abs (taps[(size_t) i]));
+    g.setColour (kDim); g.drawHorizontalLine ((int) imp.getCentreY(), imp.getX(), imp.getRight());
+    g.drawVerticalLine ((int) imp.getCentreX(), imp.getY(), imp.getBottom());
+    Path pi; const int step = std::max (1, (2 * half) / 400);
+    for (int i = c - half; i <= c + half; i += step)
+    {
+        const float x = imp.getX() + imp.getWidth() * (float) (i - (c - half)) / (float) (2 * half);
+        // amplitude shown with a soft compression so the small ringing stays visible
+        const double v = taps[(size_t) i] / mx, sv = (v >= 0 ? 1 : -1) * std::pow (std::abs (v), 0.5);
+        const float y = imp.getCentreY() - (float) sv * imp.getHeight() * 0.48f;
+        if (i == c - half) pi.startNewSubPath (x, y); else pi.lineTo (x, y);
+    }
+    g.setColour (kFg); g.strokePath (pi, PathStrokeType (1.0f));
+    g.setColour (kGrey); g.drawText (u8 ("PRÉ"), Rectangle<float> (imp.getX() + 2, imp.getY(), 30, 10), Justification::left);
+    g.drawText ("POST", Rectangle<float> (imp.getRight() - 30, imp.getY(), 28, 10), Justification::right);
+}
+} // namespace ui
+
+namespace ui
+{
 InsertSlot::InsertSlot (DeltaCompProcessor& p) : proc (p)
 {
     addAndMakeVisible (pick); addAndMakeVisible (edit);
@@ -1122,7 +1203,7 @@ void InsertSlot::paint (Graphics& g)
 }
 }
 
-DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor (p), sand (p), meter (p), insertSlot (p), proc (p)
+DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor (p), sand (p), meter (p), insertSlot (p), osView (p), proc (p)
 {
     setLookAndFeel (&look);
     addAndMakeVisible (content);
@@ -1174,13 +1255,22 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
                                                        { K::choice, "sideSlope", "PENTE dB/oct" } }),
          [] { return String ("CENTRE / LARGEUR"); });
     add (row2, new ui::Section (s, "LIMITEUR", "limOn", 3, { { K::knob, "ceiling", "PLAFOND" }, { K::knob, "limRel", "RELEASE" }, { K::knob, "look", "LOOKAHEAD" },
-                                                            { K::knob, "linkT", "LIEN TRANS." }, { K::knob, "linkR", "LIEN REL." }, { K::choice, "os", "OVERSAMPLING" },
+                                                            { K::knob, "linkT", "LIEN TRANS." }, { K::knob, "linkR", "LIEN REL." },
                                                             { K::choice, "truePeak", "TRUE PEAK" } }),
          [&e, db] { return db (e.meterLim.load()); });
     row2.getLast()->hairpin = [&e] { const float i = e.meterIn.load(), o = e.meterOut.load(); return i > -70.0f && o > -70.0f ? o - i : 0.0f; };
     add (row1, new ui::Section (s, "TILT", "tiltOn", 2, { { K::knob, "tilt", "GRAVE / AIGU" }, { K::knob, "tiltPivot", "PIVOT" },
                                                          { K::choice, "tiltPhase", "PHASE" }, { K::choice, "tiltTarget", "SUR" }, { K::choice, "tiltPos", "POSITION" } }),
          [this] { return ui::u8 (proc.apvts.getRawParameterValue ("tiltPhase")->load() > 0.5f ? "MIN PHASE" : "LINÉAIRE"); });
+    // OVERSAMPLING: one factor for the whole compressor and the limiter, with its filter set by hand
+    add (row2, new ui::Section (s, "OVERSAMPLING", nullptr, 4, { { K::choice, "os", "FACTEUR" }, { K::knob, "osCut", "COUPURE" },
+                                                                 { K::knob, "osSteep", "PENTE" }, { K::knob, "osPre", "PRÉ-RINGING" } }),
+         [this] { return proc.apvts.getRawParameterValue ("os")->load() < 0.5f ? String ("OFF") : String ("COMP + LIMITEUR"); });
+    {
+        auto* o = row2.getLast();
+        o->extra = &osView; o->extraCell = 4; o->extraSpan = 8; o->extraTop = 22;   // the two lower rows, under the four knobs
+        o->addAndMakeVisible (osView);
+    }
     add (row2, new ui::Section (s, "GLOBAL", "active", 4, { { K::knob, "in", "ENTRÉE" }, { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
                                                           { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::choice, "autoGain", "GAIN AUTO" }, { K::choice, "meterLook", "AVANCE NAGRA" } }),
          [&e, db] { return "GAIN AUTO " + db (e.meterMakeup.load()) + "  DENSITY " + db (e.meterDensity.load()); });
@@ -1223,7 +1313,7 @@ void DeltaCompEditor::timerCallback()
     const double now = Time::getMillisecondCounterHiRes();
     const float dt = lastMs > 0 ? (float) jlimit (0.005, 0.5, (now - lastMs) / 1000.0) : 1.0f / 30.0f;
     lastMs = now;
-    sand.push(); sand.repaint();
+    sand.push(); sand.repaint(); osView.poll();
     meter.tick (dt);
     for (auto* row : { &row1, &row2 })
         for (auto* s : *row)

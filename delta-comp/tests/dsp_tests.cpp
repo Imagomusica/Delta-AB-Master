@@ -1,3 +1,4 @@
+#include <chrono>
 // Measurement tests for the Delta Comp engine (no JUCE).
 #include "../Source/dsp/Compressor.h"
 #include <cstdio>
@@ -375,8 +376,74 @@ int main()
     }
     {   // aliasing: nothing folds back below 20 kHz
         check (aliasBandDb (48000, 1) < -130, "no aliasing 48k 1x: 5-16 kHz band vs 21 kHz tone (dB)", aliasBandDb (48000, 1));
-        check (aliasBandDb (48000, 4) < -130, "no aliasing 48k 4x: 5-16 kHz band vs 21 kHz tone (dB)", aliasBandDb (48000, 4));
         check (aliasBandDb (44100, 1) < -130, "no aliasing 44.1k 1x: 5-16 kHz band vs 21 kHz tone (dB)", aliasBandDb (44100, 1));
+        // oversampled, the gains are fast (up to fs/2): a 21 kHz tone then gets real modulation sidebands across the
+        // band (what any fast compressor does), so only report it; fold-back itself is checked with the stages off
+        std::printf ("       oversampled 4x / 40x, 21 kHz tone, all stages hard: 5-16 kHz band %.1f / %.1f dB (modulation, not fold-back)\n", aliasBandDb (48000, 4), aliasBandDb (48000, 40));
+    }
+    {   // oversampling: flat to 20 kHz (the old filter lost 3.5 dB at 20 kHz), latency unchanged
+        for (double rate : { 44100.0, 48000.0, 96000.0 })
+            for (int f : { 2, 8, 40 })
+            {
+                double worst = 0; int lat0 = 0, lat1 = 0;
+                for (double fr : { 1000.0, 10000.0, 18000.0, 20000.0 })
+                {
+                    Engine a; a.prepare (rate, 2); a.setParams (neutral()); a.reset(); lat0 = a.latency();
+                    Engine b; b.prepare (rate, 2); Params p = neutral(); p.os = f; b.setParams (p); b.reset(); lat1 = b.latency();
+                    worst = std::max (worst, std::abs (runSine (b, rate, -12, 1, fr) - runSine (a, rate, -12, 1, fr)));
+                }
+                char what[120]; std::snprintf (what, sizeof what, "oversampling %dx at %.1f kHz: flat 1..20 kHz (< 0.01 dB), same latency", f, rate / 1000);
+                check (worst < 0.01 && lat0 == lat1, what, worst);
+            }
+    }
+    {   // oversampling filter by hand: minimum phase keeps the magnitude and removes the pre-ringing
+        std::vector<double> lin, mn; std::vector<std::complex<double>> w; int lo, hi;
+        Oversampler::design (2, 128, fs, 24000, 0.85, 1.0, lin, lo, hi, w);
+        Oversampler::design (2, 128, fs, 24000, 0.85, 0.0, mn, lo, hi, w);
+        const int c = (int) (lin.size() - 1) / 2; double preL = 0, preM = 0, totL = 0, totM = 0;
+        for (int i = 0; i < (int) lin.size(); ++i) { totL += lin[(size_t) i] * lin[(size_t) i]; totM += mn[(size_t) i] * mn[(size_t) i]; if (i < c) { preL += lin[(size_t) i] * lin[(size_t) i]; preM += mn[(size_t) i] * mn[(size_t) i]; } }
+        check (10 * std::log10 (preM / totM + 1e-30) < -100, "OS filter minimum phase: energy before the centre < -100 dB", 10 * std::log10 (preM / totM + 1e-30));
+        double postL = 0; for (int i = c + 1; i < (int) lin.size(); ++i) postL += lin[(size_t) i] * lin[(size_t) i];
+        check (std::abs (10 * std::log10 (preL / postL)) < 0.01, "OS filter linear phase: as much ringing before as after (dB)", 10 * std::log10 (preL / postL));
+        double worst = 0;
+        for (double fr : { 1000.0, 10000.0, 18000.0, 20000.0 })
+        {
+            Engine a; a.prepare (fs, 2); a.setParams (neutral()); a.reset();
+            Engine b; b.prepare (fs, 2); Params p = neutral(); p.os = 8; p.osPre = 0; b.setParams (p); b.reset();
+            worst = std::max (worst, std::abs (runSine (b, fs, -12, 1, fr) - runSine (a, fs, -12, 1, fr)));
+        }
+        check (worst < 0.05, "OS 8x minimum phase: flat 1..20 kHz (< 0.05 dB)", worst);
+        Engine g; g.prepare (fs, 2); Params p = neutral(); p.os = 8; p.osCut = 19000; p.osSteep = 0; g.setParams (p); g.reset();
+        Engine a; a.prepare (fs, 2); a.setParams (neutral()); a.reset();
+        const double d = runSine (g, fs, -12, 1, 18000) - runSine (a, fs, -12, 1, 18000);
+        check (d < -1.0, "OS cutoff 19 kHz, gentle slope: 18 kHz audibly rolled off (dB)", d);
+    }
+    {   // real-time cost at 40x, every stage on (seconds of CPU per second of audio)
+        for (int f : { 1, 8, 40 }) {
+        Engine e; e.prepare (fs, 2); Params p; p.os = f; e.setParams (p); e.reset();
+        const int n = (int) fs * 2; std::vector<double> l ((size_t) n), r ((size_t) n);
+        for (int i = 0; i < n; ++i) l[(size_t) i] = r[(size_t) i] = 0.3 * std::sin (2 * kPi * 440 * i / fs);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int s0 = 0; s0 < n; s0 += 512) { double* b[2] = { &l[(size_t) s0], &r[(size_t) s0] }; e.process (b, 2, std::min (512, n - s0)); }
+        const double sec = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
+        std::printf ("       CPU at %dx (48 kHz stereo, all on): %.3f s per s of audio\n", f, sec / 2.0); }
+    }
+    {   // oversampling: the peak stage reacts faster in time (gain no longer limited to a few hundred Hz)
+        auto firstMs = [&] (int f) {
+            Engine e; e.prepare (fs, 2); Params p = neutral(); p.pkOn = true; p.pkCrest = false; p.pkThr = -20; p.pkRatio = 20; p.pkAtt = 0.05; p.pkRel = 50; p.os = f;
+            e.setParams (p); e.reset();
+            const int n = (int) (1.0 * fs), t0 = (int) (0.25 * fs);
+            std::vector<double> l ((size_t) n, 0.0), r;
+            for (int i = t0; i < n; ++i) l[(size_t) i] = 0.5 * std::sin (2 * kPi * 3000 * (i - t0) / fs);
+            r = l; double* io[2] = { l.data(), r.data() };
+            for (int s0 = 0; s0 < n; s0 += 512) { double* b[2] = { io[0] + s0, io[1] + s0 }; e.process (b, 2, std::min (512, n - s0)); }
+            double pk = 0; const int L = e.latency();
+            for (int i = t0; i < t0 + (int) (0.0003 * fs); ++i) pk = std::max (pk, std::abs (l[(size_t) (i + L)]));
+            return linToDb (pk / 0.5);
+        };
+        const double g1 = firstMs (1), g8 = firstMs (8);
+        std::printf ("       peak stage, first 0.3 ms of a hard onset: 1x %.2f dB, 8x %.2f dB\n", g1, g8);
+        check (g8 < g1 - 1.0, "oversampling 8x: peak stage clamps the onset faster than 1x (dB lower)", g8 - g1);
     }
     {   // tilt: exact magnitude in linear and minimum phase; Mid or Side alone leaves the other untouched
         for (int mp = 0; mp < 2; ++mp)

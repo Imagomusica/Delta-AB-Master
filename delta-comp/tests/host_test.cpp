@@ -56,9 +56,9 @@ int main (int argc, char** argv)
         p->releaseResources();
     }
     // every oversampling setting keeps the latency
-    for (int os = 0; os < 4; ++os)
+    for (int os = 0; os < 7; ++os)
     {
-        if (auto* r = find ("Oversampling")) r->setValueNotifyingHost ((float) os / 3.0f);
+        if (auto* r = find ("Oversampling")) r->setValueNotifyingHost ((float) os / 6.0f);
         p->prepareToPlay (48000, 512);
         check (p->getLatencySamples() == 13452, "latency constant for each oversampling setting", os);
         p->releaseResources();

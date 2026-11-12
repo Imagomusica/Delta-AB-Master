@@ -52,12 +52,24 @@ struct Section : juce::Component
     juce::OwnedArray<Control> controls;
     std::function<juce::String()> readout;
     juce::String shown;
-    juce::Component* extra = nullptr; int extraCell = 0, extraSpan = 1;
+    juce::Component* extra = nullptr; int extraCell = 0, extraSpan = 1, extraTop = 0;
     // one-line gain meter in the header: GR (0 at the right, reduction grows left) or bipolar expansion (0 centred)
     std::function<float()> hairpin; float hairShown = 0;   // crescendo / diminuendo: output louder or quieter than input (dB)
     std::function<float()> gain; bool bipolar = false, expand = false; float range = 20.0f, shownGain = 0, holdGain = 0, holdTime = 0;
     void tickGain (float dt);   // a free component placed on grid cells
     juce::Rectangle<int> cell (int i) const;
+};
+
+// Oversampling filter view: magnitude response (0 .. fs, image region shaded) and impulse (pre-ringing left of
+// the centre line), recomputed when the engine designs a new filter.
+struct OsView : juce::Component
+{
+    explicit OsView (DeltaCompProcessor& p) : proc (p) {}
+    void paint (juce::Graphics&) override;
+    void poll();
+    DeltaCompProcessor& proc;
+    std::vector<double> taps; int F = 1, P = 16, version = -1; double fs = 48000;
+    std::vector<float> magDb; juce::String info;
 };
 
 // Insert slot: pick a VST3 / AU (e.g. Altiverb) from the installed ones, open its own editor, remove it.
@@ -161,6 +173,7 @@ public:
     ui::Meter meter;
     juce::OwnedArray<ui::Section> row1, row2;
     ui::InsertSlot insertSlot;
+    ui::OsView osView;
 private:
     DeltaCompProcessor& proc;
     ui::Look look;

@@ -11,6 +11,8 @@ int main (int argc, char** argv)
     std::unique_ptr<juce::AudioProcessor> p (createPluginFilter());
     auto& proc = static_cast<DeltaCompProcessor&> (*p);
     for (auto* id : { "ambOn", "revOn", "llOn" }) proc.apvts.getParameter (id)->setValueNotifyingHost (1.0f);
+    proc.apvts.getParameter ("os")->setValueNotifyingHost (0.5f);       // 8x, filter view visible
+    proc.apvts.getParameter ("osPre")->setValueNotifyingHost (0.4f);
     std::unique_ptr<juce::AudioProcessorEditor> ed (p->createEditor());
     auto* ded = static_cast<DeltaCompEditor*> (ed.get());
     ed->setSize (DeltaCompEditor::kW, DeltaCompEditor::kH);
