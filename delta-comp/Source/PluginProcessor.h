@@ -64,7 +64,7 @@ private:
     double inGain = 1.0;
     // meter lookahead: the audio leaves this much later than the meters, sand and lanes see it,
     // so the needles (VU 300 ms ballistics) are on time with what is heard
-    std::array<std::vector<double>, 2> lookRing; int lookW = 0, meterLook = 0;
+    std::array<std::vector<double>, 2> lookRing; int lookW = 0, meterLook = 0, lookFadeState = 0; double lookFade = 1.0;
     int wantedMeterLook() const { static const int ms[] = { 0, 25, 50, 75, 100, 150, 200 }; return (int) std::lround (ms[juce::jlimit (0, 6, pi ("meterLook"))] * 0.001 * sr); }
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();

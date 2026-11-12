@@ -163,7 +163,7 @@ void DeltaCompProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     sr = sampleRate; blockSize = juce::jmax (samplesPerBlock, dcomp::Engine::maxInsertBlock());
     for (auto& r : dryRing) r.assign ((size_t) (6 * sampleRate) + (size_t) samplesPerBlock + 16, 0.0);
     for (auto& r : lookRing) r.assign ((size_t) (0.25 * sampleRate) + 16, 0.0);
-    lookW = 0; meterLook = wantedMeterLook();
+    lookW = 0; meterLook = wantedMeterLook(); lookFadeState = 0; lookFade = 1.0;
     dryW = 0; bypassMix = pb ("active") ? 0.0 : 1.0; bypassK = std::exp (-1.0 / (0.02 * sampleRate));
     engine.prepare (sampleRate, juce::jmax (1, getTotalNumInputChannels()));
     engine.setParams (currentParams());
@@ -256,6 +256,7 @@ template <typename T>
 void DeltaCompProcessor::processAny (juce::AudioBuffer<T>& b)
 {
     juce::ScopedNoDenormals nd;
+    engine.setRealtime (! isNonRealtime());
     engine.setParams (currentParams());
     {   // the hosted plugin may change its latency (e.g. a convolution reverb's settings)
         const juce::SpinLock::ScopedTryLockType l (insertLock);
@@ -263,11 +264,14 @@ void DeltaCompProcessor::processAny (juce::AudioBuffer<T>& b)
     }
     const int ch = juce::jmin (b.getNumChannels(), getTotalNumInputChannels());
     // dry copy for the general bypass, delayed by the full latency so switching is seamless
-    if (wantedMeterLook() != meterLook)
+    // the meter lookahead moves the read point of the delay ring: fade out (10 ms), move it, fade back in, so the
+    // jump in time is never heard as a crack (the ring always holds the recent output, so no refill is needed)
+    if (wantedMeterLook() != meterLook && lookFadeState == 0) lookFadeState = 1;
+    if (lookFadeState == 1 && lookFade <= 0.0)
     {
         meterLook = wantedMeterLook();
-        for (auto& r : lookRing) std::fill (r.begin(), r.end(), 0.0);
         updateLatency();
+        lookFadeState = 2;
     }
     const int total = getLatencySamples() - meterLook, R = (int) dryRing[0].size();
     for (int c = 0; c < juce::jmin (ch, 2); ++c)
@@ -300,16 +304,19 @@ void DeltaCompProcessor::processAny (juce::AudioBuffer<T>& b)
         scope[(size_t) (w & (kScopeSize - 1))] = (float) m; scopeS[(size_t) (w & (kScopeSize - 1))] = (float) sd; ++w;
     }
     scopeWrite.store (w, std::memory_order_release);
-    if (meterLook > 0)
     {
         const int LR = (int) lookRing[0].size();
+        const double step = 1.0 / (0.01 * sr);
         for (int i = 0; i < b.getNumSamples(); ++i)
         {
-            const int wr = (lookW + i) % LR, rd = ((lookW + i - meterLook) % LR + LR) % LR;
+            const int wr = (lookW + i) % LR, rd = ((lookW + i - juce::jmin (meterLook, LR - 1)) % LR + LR) % LR;
+            if (lookFadeState == 1) lookFade = juce::jmax (0.0, lookFade - step);
+            else if (lookFadeState == 2) { lookFade = juce::jmin (1.0, lookFade + step); if (lookFade >= 1.0) lookFadeState = 0; }
+            const double g = lookFade >= 1.0 ? 1.0 : 0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * lookFade);
             for (int c = 0; c < juce::jmin (ch, 2); ++c)
             {
                 lookRing[(size_t) c][(size_t) wr] = (double) b.getSample (c, i);
-                b.setSample (c, i, (T) lookRing[(size_t) c][(size_t) rd]);
+                if (meterLook > 0 || g < 1.0) b.setSample (c, i, (T) (lookRing[(size_t) c][(size_t) rd] * g));
             }
         }
         lookW = (lookW + b.getNumSamples()) % LR;

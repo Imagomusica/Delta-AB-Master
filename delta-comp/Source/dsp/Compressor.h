@@ -24,6 +24,9 @@
 #include <atomic>
 #include <cmath>
 #include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <chrono>
 #include <vector>
 #include <complex>
 
@@ -581,11 +584,15 @@ struct TiltEq
     // Minimum phase: same magnitude through the real cepstrum (folded), placed at the same centre so the latency
     // never changes and switching only crossfades.
     void design (std::vector<cd>& Hd, double slope, double pivot, bool minPhase)
+    { designWith (Hd, slope, pivot, minPhase, big, work, inNewScratch); }
+    void designWith (std::vector<cd>& Hd, double slope, double pivot, bool minPhase,
+                     std::vector<cd>& big, std::vector<cd>& work, std::vector<double>& h) const
     {
         const int M = 4 * N;
         const int half = (N - 2) / 2; const double beta = 10.0;
         auto i0 = [] (double x) { double sum = 1, t = 1; for (int k = 1; k < 60; ++k) { t *= (x / (2 * k)) * (x / (2 * k)); sum += t; if (t < 1e-18 * sum) break; } return sum; };
-        std::vector<double>& h = inNewScratch; h.assign ((size_t) N, 0.0);
+        big.resize ((size_t) M); work.resize ((size_t) F); Hd.resize ((size_t) (P * F));
+        h.assign ((size_t) N, 0.0);
         if (! minPhase)
         {
             for (int k = 0; k <= M / 2; ++k)
@@ -656,7 +663,24 @@ struct TiltEq
             inPrev[c] = inCur[c];
         }
         const bool change = std::abs (wantSlope - curSlope) > 1e-9 || std::abs (wantPivot - curPivot) > 1e-9 || wantMin != curMin;
-        if (change) { design (H[1], wantSlope, wantPivot, wantMin); fading = true; }
+        if (change)
+        {
+            if (! async) { design (H[1], wantSlope, wantPivot, wantMin); fading = true; }
+            else
+            {
+                // the 4N-point design takes several ms: never on the audio thread while playing
+                if (ready.load (std::memory_order_acquire))
+                {
+                    std::swap (H[1], Hready); readyUsed (fading);
+                }
+                if (! fading && (wantSlope != postSlope || wantPivot != postPivot || wantMin != postMin) && mtx.try_lock())
+                {
+                    rqSlope = wantSlope; rqPivot = wantPivot; rqMin = wantMin; reqPending = true;
+                    postSlope = wantSlope; postPivot = wantPivot; postMin = wantMin;
+                    mtx.unlock(); cv.notify_one();
+                }
+            }
+        }
         for (int c = 0; c < C; ++c)
         {
             convolve (c, H[0], outCur[c]);
@@ -666,7 +690,66 @@ struct TiltEq
                 for (int i = 0; i < B; ++i) { const double r = (i + 0.5) / B; outCur[c][(size_t) i] = (1 - r) * outCur[c][(size_t) i] + r * outNew[c][(size_t) i]; }
             }
         }
-        if (fading) { std::swap (H[0], H[1]); curSlope = wantSlope; curPivot = wantPivot; curMin = wantMin; fading = false; }
+        if (fading)
+        {
+            std::swap (H[0], H[1]);
+            if (async) { curSlope = nextSlope; curPivot = nextPivot; curMin = nextMin; }
+            else { curSlope = wantSlope; curPivot = wantPivot; curMin = wantMin; }
+            fading = false;
+        }
+    }
+    // ---- background design (realtime playback) ----
+    bool async = false;
+    std::thread th; std::mutex mtx; std::condition_variable cv; bool quit = false, reqPending = false;
+    double rqSlope = 0, rqPivot = 1000; bool rqMin = false;
+    double postSlope = 0, postPivot = 1000; bool postMin = false;          // last request sent (audio thread)
+    double rdSlope = 0, rdPivot = 1000; bool rdMin = false;                // describes Hready
+    double nextSlope = 0, nextPivot = 1000; bool nextMin = false;          // describes H[1] while fading
+    std::vector<cd> Hready, wkH, wkBig, wkWork; std::vector<double> wkTaps;
+    std::atomic<bool> ready { false };
+    void readyUsed (bool& fade)
+    {
+        nextSlope = rdSlope; nextPivot = rdPivot; nextMin = rdMin;
+        ready.store (false, std::memory_order_release); fade = true;
+    }
+    void setAsync (bool on)
+    {
+        if (on == async) return;
+        if (on && ! th.joinable())
+        {
+            quit = false;
+            th = std::thread ([this]
+            {
+                for (;;)
+                {
+                    double s, pv; bool mn;
+                    {
+                        std::unique_lock<std::mutex> lk (mtx);
+                        cv.wait (lk, [this] { return quit || reqPending; });
+                        if (quit) return;
+                        s = rqSlope; pv = rqPivot; mn = rqMin; reqPending = false;
+                    }
+                    designWith (wkH, s, pv, mn, wkBig, wkWork, wkTaps);
+                    while (ready.load (std::memory_order_acquire))   // previous result not yet taken
+                    {
+                        { std::lock_guard<std::mutex> lk (mtx); if (quit) return; }
+                        std::this_thread::sleep_for (std::chrono::milliseconds (1));
+                    }
+                    std::swap (Hready, wkH); rdSlope = s; rdPivot = pv; rdMin = mn;
+                    ready.store (true, std::memory_order_release);
+                }
+            });
+        }
+        // switching mode happens between blocks (same thread as process): forget pending results
+        postSlope = curSlope; postPivot = curPivot; postMin = curMin;
+        async = on;
+    }
+    TiltEq() = default;
+    TiltEq (const TiltEq&) = delete;
+    TiltEq& operator= (const TiltEq&) = delete;
+    ~TiltEq()
+    {
+        if (th.joinable()) { { std::lock_guard<std::mutex> lk (mtx); quit = true; } cv.notify_one(); th.join(); }
     }
     // one sample per channel in, one out (latency() samples later)
     // works on Mid and Side (same filter on both = same as on L and R), so Mid or Side alone can be left out
@@ -809,6 +892,8 @@ public:
     static constexpr double kMaxLookMs = 5.0;
     static constexpr double kSilenceLufs = -100.0;   // upward gain fades out between -90 and -100 LUFS
 
+    // realtime playback: heavy filter redesigns (tilt) run on a worker thread; offline/tests stay synchronous
+    void setRealtime (bool on) { tiltEq.setAsync (on); }
     void prepare (double sampleRate, int numChannels)
     {
         fs = sampleRate; nch = std::clamp (numChannels, 1, kMaxCh);
@@ -867,7 +952,7 @@ public:
         frameLen = std::max (1, (int) std::lround (0.001 * fs));
         ap1.prepare ((int) std::lround (0.0053 * fs), 0.6); ap2.prepare ((int) std::lround (0.0079 * fs), 0.55);
         blockLen = std::max (1, (int) std::lround (0.1 * fs));
-        curOs = -1; curLook = -1;
+        curOs = -1; curLook = -1; rcState = 0; rcGain = 1.0; rcStep = 1.0 / std::max (1.0, 0.01 * fs);
         setParams (p);
         reset();
     }
@@ -876,6 +961,7 @@ public:
     {
         erMs = 20; meterEr.store (20); backAvg = -100; sinceOnset = 100000; recLeft = 0; frameAcc = 0; frameCount = 0;
         pkRms = 0; pkRmsDb = -100; specUp.reset();
+        rcState = 0; rcGain = 1.0; if (curOs >= 0) { configureLimiter(); curTiltPos = p.tiltPos; }
         for (size_t c = 0; c < (size_t) kMaxCh; ++c)
         {
             for (auto& k : kw[c]) k.reset();
@@ -891,7 +977,7 @@ public:
         ambRms = 1e-10; gAmb = 0; frameAcc = 0; frameCount = 0; frameIdx = 0; recLeft = 0; sinceOnset = 100000;
         frames.fill (-120); erMs = 20; meterEr.store ((float) erMs);
         wetLoud = lufsToPow (p.target); makeupDb = 0;
-        mixS = std::clamp (p.mix, 0.0, 1.0); outS = dbToLin (p.outGainDb); denS = p.density; ambS = p.ambiance; kstS = p.kstOn ? p.kStereo : 0.0; trS = p.trOn ? p.transient : 0.0; trFast = trSlow = 0;
+        mixS = std::clamp (p.mix, 0.0, 1.0); outS = dbToLin (p.outGainDb); denS = p.density; ambS = p.ambiance; kstS = p.kstOn ? p.kStereo : 0.0; trS = p.trOn ? p.transient : 0.0; trFast = trSlow = 0; trG = 0;
         acc = {};
         resetLoudness();
     }
@@ -913,7 +999,7 @@ public:
         cDa = co (p.pkAtt); cDr = co (p.pkRel); cPkDet = co (5.0);
         cDenA = co (3.0); cDenR = co (120.0);
         cOptoUp = co (400.0); cOptoDn = co (3000.0);
-        cTrFa = co (0.5); cTrFr = co (p.trDurMs); cTrSa = co (p.trDurMs * 0.7); cTrSr = 0;
+        cTrFa = co (1.0); cTrFr = co (p.trDurMs); cTrSa = co (p.trDurMs * 1.2); cTrSr = 0; cTrG = co (2.0);
         cRevSend = co (150.0); cFast = co (50.0);
         cAmbA = co (p.ambAtt); cAmbR = co (p.ambRel); cAmbWin = co (50.0);
         verb.setDecay (p.revDecay);
@@ -993,7 +1079,21 @@ public:
     {
         const int C = std::min (numCh, nch);
         const double cs = (double) C;
-        if (wantOs != curOs || wantLook != curLook) configureLimiter();
+        // switching the oversampling factor, the lookahead or the tilt position rebuilds delay lines: the output
+        // fades out (4 ms), the change is made at the next block, then it stays muted while the lines refill and fades in
+        if (curOs < 0) { configureLimiter(); curTiltPos = p.tiltPos; }
+        const bool limChange = wantOs != curOs || wantLook != curLook, tiltChange = p.tiltPos != curTiltPos;
+        if ((limChange || tiltChange) && rcState == 0) rcState = 1;
+        if (rcState == 1 && rcGain <= 0.0)
+        {
+            if (limChange) configureLimiter();
+            curTiltPos = p.tiltPos;
+            // every line downstream of the change still holds the old topology's signal: stay muted for the whole
+            // latency, so the fade-in starts on audio that went through the new chain only (no jump, no crack)
+            tiltEq.reset();
+            rcHold = latencySamples; rcState = 2;
+        }
+        if (rcState != 0) {}
         else if (curOs > 1 && (p.osCut != curCut || p.osSteep != curSteep || p.osPre != curPre))
         {   // filter knobs moved: redesign at most every 80 ms
             if (osWait <= 0) { designOs(); osWait = (int) (0.08 * fs); }
@@ -1009,8 +1109,11 @@ public:
         {
             mixS = mixT + cSmooth * (mixS - mixT); outS = outT + cSmooth * (outS - outT);
             { const double tt = p.trOn ? p.transient : 0.0; trS = tt + cSmooth * (trS - tt); }
-            widthS = dbToLin (p.widthDb) + cSmooth * (widthS - dbToLin (p.widthDb));
-            centreS = dbToLin (p.centreDb) + cSmooth * (centreS - dbToLin (p.centreDb));
+            {   // M/S: everything glides, including the lever (no jump when a value comes back to 0 or the section is switched)
+                const double wt = p.msOn ? dbToLin (p.widthDb) : 1.0, ct = p.msOn ? dbToLin (p.centreDb) : 1.0;
+                widthS = wt + cSmooth * (widthS - wt); centreS = ct + cSmooth * (centreS - ct);
+                const double mt = p.msOn ? 1.0 : 0.0; msMix = mt + cSmooth * (msMix - mt);
+            }
             denS = p.density + cSmooth * (denS - p.density); ambS = p.ambiance + cSmooth * (ambS - p.ambiance);
             { const double kt = p.kstOn ? p.kStereo : 0.0; kstS = kt + cSmooth * (kstS - kt); }
             double x[kMaxCh] {}, s[kMaxCh] {}, gPre[kMaxCh] { 1, 1 }, gPost[kMaxCh] { 1, 1 }, dk[kMaxCh] {};
@@ -1036,13 +1139,18 @@ public:
 
             // T: transients = fast envelope over slow envelope (linked), turned into a gain
             {
+                // power (not the rectified peak, whose ripple would wobble the gain at audio rate and roughen the sound)
                 double a = 0;
-                for (int c = 0; c < C; ++c) a = std::max (a, std::abs (s[c]));
+                for (int c = 0; c < C; ++c) a += s[c] * s[c];
+                a /= cs;
                 trFast = a > trFast ? a + cTrFa * (trFast - a) : a + cTrFr * (trFast - a);
-                trSlow = trFast + cTrSa * (trSlow - trFast);   // slow = fast envelope smoothed: equal on steady tones
-                const double tr = std::clamp (linToDb (trFast + 1e-9) - linToDb (trSlow + 1e-9), 0.0, 12.0);
+                trSlow = trFast < trSlow ? trFast : trFast + cTrSa * (trSlow - trFast);   // lags only on the way up
+                const double tr = std::clamp (10.0 * std::log10 ((trFast + 1e-18) / (trSlow + 1e-18)), 0.0, 24.0);
                 trDb = tr;
-                const double g = std::clamp (trS * (trS < 0 ? 3.5 : 2.0) * tr, -24.0, 18.0);   // softening goes deeper (up to -24 dB): rounding must be clearly heard at -100 %
+                // soft-limited curve (Bittersweet-like): fine at small settings, never a hard edge
+                const double gt = trS < 0 ? -12.0 * std::tanh (2.0 * tr * -trS / 12.0) : 9.0 * std::tanh (1.5 * tr * trS / 9.0);
+                trG = gt + cTrG * (trG - gt);   // 2 ms glide: the gain moves smoothly, no grain
+                const double g = trG;
                 mT = std::abs (g) > std::abs (mT) ? g : mT;
                 kT = 0.0;
                 if (std::abs (g) > 1e-6)
@@ -1171,11 +1279,11 @@ public:
                 // decorrelated side of the (unprocessed) input, pre-delayed like the control path; the gain applied
                 // before the ambiance on the control path is delayed by the same pre-delay. Oversampled: taken from
                 // the earlier audio (xa) so it meets the oversampled gain.
-                const size_t R = ambRingA.size(), rd = (ambWA + R - (size_t) ambD) % R;
+                const size_t R = ambRingA.size();
                 ambRingA[ambWA] = ambHpA.process (dynOn ? 0.5 * (xa[0] - xa[1]) : 0.5 * (xd[0] - xd[1]));
                 ambRingG[ambWA] = 0.5 * (gPre[0] + gPre[1]);
                 ambRingT[ambWA] = trDb;
-                const double del = ambRingA[rd], gDel = ambRingG[rd];
+                const double del = readFrac (ambRingA, ambWA, ambD), gDel = readFrac (ambRingG, ambWA, ambD);
                 // transients out of the lifted ambiance: the transient measure, read 2 ms ahead of the pre-delayed
                 // ambiance, holds a fast-attack / 60 ms release duck (smeared attacks of the decorrelator included)
                 const double tAhead = ambRingT[(ambWA + R - (size_t) std::max (0.0, ambD - laAmb)) % R];
@@ -1252,12 +1360,12 @@ public:
             }
 
             // M/S end section: width, centre level / filter, side low cut
-            if (C == 2 && p.msOn && (std::abs (p.widthDb) > 1e-6 || std::abs (p.centreDb) > 1e-6 || p.sideLowCut > 0))
+            if (C == 2 && (msMix > 1e-9 || std::abs (widthS - 1.0) > 1e-9 || std::abs (centreS - 1.0) > 1e-9))
             {
                 double m = 0.5 * (y[0] + y[1]), sd = 0.5 * (y[0] - y[1]);
                 sd *= widthS;
-                if (p.centreFilter == 0) m *= centreS; else m = centreEq.process (m);
-                if (p.sideLowCut > 0) sd = sideHp2.process (sideHp1.process (sd));
+                if (p.centreFilter == 0) m *= centreS; else m += msMix * (centreEq.process (m) - m);
+                if (p.sideLowCut > 0) sd += msMix * (sideHp2.process (sideHp1.process (sd)) - sd);
                 y[0] = m + sd; y[1] = m - sd;
             }
 
@@ -1265,7 +1373,7 @@ public:
         }
 
         tiltEq.setTarget (p.tiltOn ? p.tilt : 0.0, p.tiltPivot, p.tiltMin, p.tiltTarget);
-        if (p.tiltPos == 0)
+        if (curTiltPos == 0)
             for (int j = 0; j < nb; ++j)
             {
                 double y[kMaxCh] {}; for (int c = 0; c < C; ++c) y[c] = yBuf[(size_t) c][(size_t) j];
@@ -1315,7 +1423,7 @@ public:
             double y[kMaxCh] {};
             for (int c = 0; c < C; ++c) y[c] = yBuf[(size_t) c][(size_t) (i - i0)];
             // tilt after the insert (always running at one of its three places: constant latency, crossfaded changes)
-            if (p.tiltPos == 1) tiltEq.process (y, C);
+            if (curTiltPos == 1) tiltEq.process (y, C);
             // E: limiter
             double o[kMaxCh] {};
             if (F > 1)
@@ -1343,12 +1451,14 @@ public:
                 for (int c = 0; c < C; ++c) o[c] = v[c];
             }
 
-            if (p.tiltPos == 2) tiltEq.process (o, C);   // after the limiter: the ceiling is no longer guaranteed
+            if (curTiltPos == 2) tiltEq.process (o, C);   // after the limiter: the ceiling is no longer guaranteed
+            if (rcState == 1) rcGain = std::max (0.0, rcGain - rcStep);
+            else if (rcState == 2) { if (rcHold > 0) --rcHold; else { rcGain = std::min (1.0, rcGain + rcStep); if (rcGain >= 1.0) rcState = 0; } }
             // constant latency padding, write out, meter
             double op = 0;
             for (int c = 0; c < C; ++c)
             {
-                const double out = pad[(size_t) c].process (o[c]);
+                const double out = pad[(size_t) c].process (o[c]) * (rcGain >= 1.0 ? 1.0 : 0.5 - 0.5 * std::cos (kPi * rcGain));   // raised-cosine fade
                 io[c][i] = (T) out;
                 const double ko = outKw[(size_t) c].process (out);
                 op += ko * ko;
@@ -1405,6 +1515,13 @@ public:
         return 12.0 * std::tanh (up / 12.0) * std::clamp ((L - kSilenceLufs) / 10.0, 0.0, 1.0);
     }
 private:
+    // value d samples (fractional) before the one just written at w, linear interpolation
+    static double readFrac (const std::vector<double>& v, size_t w, double d)
+    {
+        const size_t R = v.size(), i = (size_t) d; const double f = d - (double) i;
+        const double a = v[(w + R - i) % R], b = v[(w + R - i - 1) % R];
+        return a + f * (b - a);
+    }
     void ambiance (double* s, int C, double& meter)
     {
         if (C < 2) return;
@@ -1416,12 +1533,13 @@ private:
         smooth (gAmb, p.ambOn ? curveAmb (L) : 0.0, cAmbA, cAmbR);
         meter = std::max (meter, gAmb);
         if (p.ambAuto) analyseReflections (m);
-        // pre-delay glides one sample at a time towards its target (no clicks when auto moves it)
-        const double want = std::clamp ((p.ambAuto ? erMs : p.ambPreMs) * 0.001 * fs, 1.0, (double) ambRing.size() - 2);
-        if (std::abs (want - ambD) >= 1.0) ambD += want > ambD ? 1.0 : -1.0;
+        // pre-delay glides slowly towards its target (5 % speed, read between samples): no click, no audible pitch
+        // bend when AUTO moves it or the switch changes
+        const double want = std::clamp ((p.ambAuto ? erMs : p.ambPreMs) * 0.001 * fs, 1.0, (double) ambRing.size() - 3);
+        ambD += std::clamp (want - ambD, -0.05, 0.05);
         const size_t R = ambRing.size();
         ambRing[ambW] = ambHp.process (sd);
-        const double delayed = ambRing[(ambW + R - (size_t) ambD) % R];
+        const double delayed = readFrac (ambRing, ambW, ambD);
         ambW = (ambW + 1) % R;
         const double e = ap2.process (ap1.process (delayed));
         // K-Stereo: a constant amount of the decorrelated, pre-delayed ambience, plus the dynamic lift of the tails
@@ -1615,14 +1733,14 @@ private:
     Params p;
     SpectralUp specUp;
     double fs = 48000; int nch = 2, lookMax = 240, latencySamples = 0;
-    int wantOs = 1, curOs = -1, wantLook = 96, curLook = -1;
+    int wantOs = 1, curOs = -1, wantLook = 96, curLook = -1, curTiltPos = 1, rcState = 0, rcHold = 0; double rcGain = 1.0, rcStep = 1.0 / 192;
     double pkRms = 0, cPkRms = 0;
     double cWin = 0, cAa = 0, cAr = 0, cBa = 0, cBr = 0, cC1a = 0, cC1r = 0, cC2a = 0, cC2r = 0, cDa = 0, cDr = 0, cPkDet = 0;
     double cDenA = 0, cDenR = 0, cOptoUp = 0, cOptoDn = 0, cLoud = 0, cMakeup = 0, cSmooth = 0, cLimRel = 0, ceiling = 1;
-    double mixS = 1, outS = 1, denS = 0, ambS = 0, trS = 0, trFast = 0, trSlow = 0;
+    double mixS = 1, outS = 1, denS = 0, ambS = 0, trS = 0, trFast = 0, trSlow = 0, trG = 0, cTrG = 0;
     Biquad centreEq, sideHp1, sideHp2; int lastCentreFilter = -1, lastSlope = -1; bool lastLowCutOn = false; double centreS = 1;
     std::array<KWeighting, kMaxCh> inKw; double inFast = 0, outFast = 0, cFast = 0;
-    double widthS = 1, revSendS = 0, cRevSend = 0, lvlA = -100; TailVerb verb;
+    double widthS = 1, msMix = 1, revSendS = 0, cRevSend = 0, lvlA = -100; TailVerb verb;
     double cTrFa = 0, cTrFr = 0, cTrSa = 0, cTrSr = 0;
     std::array<std::array<KWeighting, 4>, kMaxCh> kw;
     std::array<std::array<double, 4>, kMaxCh> rms {};
