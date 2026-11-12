@@ -337,7 +337,7 @@ struct Params
     // T transient shaper (Bittersweet spirit): -1 rounds the attacks off, +1 accentuates them
     double transient = 0.0; double trDurMs = 30.0; int trTarget = 0;   // 0 stereo, 1 mid, 2 side
     // A upward low level
-    bool upOn = true;  double upThr = -14, upRatio = 1.5, upRange = 4, upAtt = 50, upRel = 600;
+    bool upOn = true;  bool upSpectral = true;  double upThr = -14, upRatio = 1.5, upRange = 4, upAtt = 50, upRel = 600;
     // B downward low level (gentle, capped by range)
     bool llOn = false; double llThr = -24, llRatio = 1.5, llRange = 3, llAtt = 30, llRel = 400;
     // C downward, double threshold
@@ -535,6 +535,118 @@ struct TiltEq
     }
 };
 
+// Spectral upward (pp): the signal is split in 30 third-octave bands (25 Hz .. 20 kHz) by an STFT (sqrt-Hann,
+// 75 % overlap, N = 4096 at 48 kHz, scaled with the rate). Each band has its own level detector, so a quiet
+// instrument (cellos under the brass) is lifted even while the overall RMS stays high. Gains are linked L/R,
+// smoothed in time (attack/release) and interpolated in log-frequency across bins, so the filter stays short
+// and smooth (no ringing, no smearing). With all gains at 0 dB it is an exact delay of N samples.
+struct SpectralUp
+{
+    using cd = std::complex<double>;
+    static constexpr int kBands = 30;
+    int N = 4096, hop = 1024, pos = 0, ip = 0;
+    double fs = 48000;
+    std::vector<double> win, inRing[2], outBuf[2], acc[2];
+    std::vector<cd> z;
+    std::vector<int> binLo; std::vector<double> binFr;      // per bin: lower band index + fraction (log f)
+    std::vector<int> bandOf;                                // per bin: detector band (-1 = none)
+    std::array<double, kBands> gDb {}, lvl {}; std::array<int, kBands> used {};
+    std::vector<double> gLin;
+    double maxGain = 0;
+    static int sizeFor (double rate) { int n = 4096; while (n * 48000.0 < rate * 4096.0 * 0.75 && n < 65536) n *= 2; return n; }
+    int latency() const { return N; }
+    void prepare (double rate)
+    {
+        fs = rate; N = sizeFor (fs); hop = N / 4;
+        win.resize ((size_t) N);
+        for (int n = 0; n < N; ++n) win[(size_t) n] = std::sqrt (0.5 - 0.5 * std::cos (2.0 * kPi * n / N));
+        for (int c = 0; c < 2; ++c) { inRing[c].assign ((size_t) N, 0.0); outBuf[c].assign ((size_t) hop, 0.0); acc[c].assign ((size_t) N, 0.0); }
+        z.assign ((size_t) N, cd (0)); gLin.assign ((size_t) (N / 2 + 1), 1.0);
+        bandOf.assign ((size_t) (N / 2 + 1), -1); used.fill (0);
+        for (int k = 1; k < N / 2; ++k)
+        {
+            const double f = k * fs / N;
+            if (f < 22.0 || f > 22400.0) continue;
+            const int b = std::clamp ((int) std::floor (3.0 * std::log2 (f / 25.0) + 0.5), 0, kBands - 1);
+            bandOf[(size_t) k] = b; used[(size_t) b]++;
+        }
+        // interpolation between populated band centres, in log-frequency
+        std::vector<int> pop; for (int b = 0; b < kBands; ++b) if (used[(size_t) b]) pop.push_back (b);
+        binLo.assign ((size_t) (N / 2 + 1), 0); hiOf.assign ((size_t) (N / 2 + 1), 0); binFr.assign ((size_t) (N / 2 + 1), 0.0);
+        for (int k = 0; k <= N / 2; ++k)
+        {
+            const double pb = k == 0 ? -10.0 : 3.0 * std::log2 (std::max (k * fs / N, 1.0) / 25.0);   // band position
+            int lo = pop.front(), hi = pop.front(); double fr = 0;
+            if (pb >= pop.back()) { lo = hi = pop.back(); }
+            else if (pb > pop.front())
+                for (size_t i = 0; i + 1 < pop.size(); ++i)
+                    if (pb <= pop[i + 1]) { lo = pop[i]; hi = pop[i + 1]; fr = (pb - lo) / (double) (hi - lo); break; }
+            // flat over the middle of each band, smooth (raised cosine) across the band edges only
+            const double t = std::clamp ((fr - 0.25) / 0.5, 0.0, 1.0);
+            binLo[(size_t) k] = lo; binFr[(size_t) k] = hi == lo ? 0.0 : t * t * (3.0 - 2.0 * t);
+            hiOf[(size_t) k] = hi;
+        }
+        reset();
+    }
+    std::vector<int> hiOf;
+    void reset()
+    {
+        for (int c = 0; c < 2; ++c) { std::fill (inRing[c].begin(), inRing[c].end(), 0.0); std::fill (outBuf[c].begin(), outBuf[c].end(), 0.0); std::fill (acc[c].begin(), acc[c].end(), 0.0); }
+        gDb.fill (0); lvl.fill (-200); pos = 0; ip = 0; maxGain = 0;
+    }
+    // curve: band level (LUFS-like) -> wanted gain dB. mix: 0 = dry .. 1 = full effect
+    template <typename Curve>
+    void frame (int C, Curve&& curve, double att, double rel, double mix)
+    {
+        for (int n = 0; n < N; ++n)
+        {
+            const size_t r = (size_t) ((ip + n) % N);   // oldest first
+            z[(size_t) n] = cd (inRing[0][r] * win[(size_t) n], C == 2 ? inRing[1][r] * win[(size_t) n] : 0.0);
+        }
+        TiltEq::fft (z.data(), N, false);
+        std::array<double, kBands> pw {};
+        const double norm = (C == 1 ? 4.0 : 2.0) / ((double) N * (N * 0.5));     // one-sided, Parseval, window power N/2 (mono counted twice, as LUFS)
+        for (int k = 1; k < N / 2; ++k)
+        {
+            const int b = bandOf[(size_t) k]; if (b < 0) continue;
+            const double e = 0.5 * (std::norm (z[(size_t) k]) + std::norm (z[(size_t) (N - k)]));   // |X|^2 + |Y|^2
+            pw[(size_t) b] += e * norm;
+        }
+        const double ca = std::exp (-hop / (std::max (att, 0.1) * 0.001 * fs)), cr = std::exp (-hop / (std::max (rel, 1.0) * 0.001 * fs));
+        maxGain = 0;
+        for (int b = 0; b < kBands; ++b)
+        {
+            if (! used[(size_t) b]) continue;
+            lvl[(size_t) b] = -0.691 + 10.0 * std::log10 (pw[(size_t) b] + 1e-30);
+            const double gt = curve (lvl[(size_t) b]);
+            gDb[(size_t) b] = gt + (gt < gDb[(size_t) b] ? ca : cr) * (gDb[(size_t) b] - gt);
+            maxGain = std::max (maxGain, gDb[(size_t) b]);
+        }
+        for (int k = 0; k <= N / 2; ++k)
+        {
+            const double fr = binFr[(size_t) k];
+            const double g = (1.0 - fr) * gDb[(size_t) binLo[(size_t) k]] + fr * gDb[(size_t) hiOf[(size_t) k]];
+            gLin[(size_t) k] = 1.0 + mix * (std::pow (10.0, g / 20.0) - 1.0);
+        }
+        for (int k = 0; k < N; ++k) z[(size_t) k] *= gLin[(size_t) (k <= N / 2 ? k : N - k)];
+        TiltEq::fft (z.data(), N, true);
+        for (int c = 0; c < C; ++c)
+        {
+            auto& a = acc[c];
+            for (int n = 0; n < N; ++n) a[(size_t) n] += 0.5 * win[(size_t) n] * (c == 0 ? z[(size_t) n].real() : z[(size_t) n].imag());
+            std::copy (a.begin(), a.begin() + hop, outBuf[c].begin());
+            std::copy (a.begin() + hop, a.end(), a.begin()); std::fill (a.end() - hop, a.end(), 0.0);
+        }
+    }
+    // one sample per channel in, out N samples later. Returns true when a frame is due (call frame()).
+    void push (double* v, int C)
+    {
+        for (int c = 0; c < C; ++c) { inRing[c][(size_t) ip] = v[c]; v[c] = outBuf[c][(size_t) pos]; }
+        ip = (ip + 1) % N;
+    }
+    bool due() { if (++pos == hop) { pos = 0; return true; } return false; }
+};
+
 class Engine
 {
 public:
@@ -560,7 +672,8 @@ public:
             nMax = std::max (nMax, gfirOs[(size_t) k].N); hoMax = std::max (hoMax, 2 * gfirOs[(size_t) k].half);
         }
         limTail = std::max (TruePeak::kDelay + 2 * hf, tailOs);
-        latencySamples = hf + lookMax + limTail + TiltEq::latency();
+        specUp.prepare (fs);
+        latencySamples = hf + lookMax + limTail + TiltEq::latency() + specUp.latency();
         tiltEq.prepare (fs);
         for (int c = 0; c < kMaxCh; ++c)
         {
@@ -594,7 +707,7 @@ public:
     void reset()
     {
         erMs = 20; meterEr.store (20); backAvg = -100; sinceOnset = 100000; recLeft = 0; frameAcc = 0; frameCount = 0;
-        pkRms = 0; pkRmsDb = -100;
+        pkRms = 0; pkRmsDb = -100; specUp.reset();
         for (size_t c = 0; c < (size_t) kMaxCh; ++c)
         {
             for (auto& k : kw[c]) k.reset();
@@ -610,7 +723,7 @@ public:
         ambRms = 1e-10; gAmb = 0; frameAcc = 0; frameCount = 0; frameIdx = 0; recLeft = 0; sinceOnset = 100000;
         frames.fill (-120); erMs = 20; meterEr.store ((float) erMs);
         wetLoud = lufsToPow (p.target); makeupDb = 0;
-        mixS = std::clamp (p.mix, 0.0, 1.0); outS = dbToLin (p.outGainDb); denS = p.density; ambS = p.ambiance; kstS = p.kStereo; trS = p.trOn ? p.transient : 0.0; trFast = trSlow = 0;
+        mixS = std::clamp (p.mix, 0.0, 1.0); outS = dbToLin (p.outGainDb); denS = p.density; ambS = p.ambiance; kstS = p.kstOn ? p.kStereo : 0.0; trS = p.trOn ? p.transient : 0.0; trFast = trSlow = 0;
         acc = {};
         resetLoudness();
     }
@@ -668,10 +781,19 @@ public:
     }
     double curveA (double L) const
     {
-        if (! p.upOn || p.upRange <= 0 || p.upRatio <= 1) return 0;
+        if (p.upSpectral || ! p.upOn || p.upRange <= 0 || p.upRatio <= 1) return 0;
         double up = (1.0 - 1.0 / p.upRatio) * shape (p.target + p.upThr - L);
         up = p.upRange * std::tanh (up / p.upRange);
         return up * std::clamp ((L - kSilenceLufs) / 10.0, 0.0, 1.0);
+    }
+    // spectral pp: one third-octave band level -> lift (the band threshold is the broadband one minus 10 log 30)
+    double curveBand (double Lb) const
+    {
+        if (! p.upOn || p.upRange <= 0 || p.upRatio <= 1) return 0;
+        const double off = 10.0 * std::log10 ((double) SpectralUp::kBands);
+        double up = (1.0 - 1.0 / p.upRatio) * shape (p.target + p.upThr - off - Lb);
+        up = p.upRange * std::tanh (up / p.upRange);
+        return up * std::clamp ((Lb - (kSilenceLufs - off)) / 10.0, 0.0, 1.0);
     }
     double curveB (double L) const
     {
@@ -720,6 +842,12 @@ public:
             bool afterAmb = false; ambUsed = false; ambK = 0;
             auto mulGain = [&] (int c, double gl) { if (afterAmb) gPost[c] *= gl; else gPre[c] *= gl; };
             for (int c = 0; c < C; ++c) s[c] = x[c] = (double) io[c][i];
+            {   // A (spectral pp): always running, constant latency
+                specUp.push (x, C);
+                if (specUp.due()) specUp.frame (C, [this] (double Lb) { return p.upSpectral ? curveBand (Lb) : 0.0; }, p.upAtt, p.upRel, mixS);
+                if (p.upSpectral) mA = std::max (mA, specUp.maxGain);
+                for (int c = 0; c < C; ++c) s[c] = x[c];
+            }
             {   // input metering (sand, crest, dynamic range)
                 double ip = 0;
                 for (int c = 0; c < C; ++c)
@@ -739,7 +867,7 @@ public:
                 trSlow = trFast + cTrSa * (trSlow - trFast);   // slow = fast envelope smoothed: equal on steady tones
                 const double tr = std::clamp (linToDb (trFast + 1e-9) - linToDb (trSlow + 1e-9), 0.0, 12.0);
                 trDb = tr;
-                const double g = std::clamp (trS * 2.0 * tr, -18.0, 18.0);   // up to +-18 dB on a sharp attack (Bittersweet-like range)
+                const double g = std::clamp (trS * (trS < 0 ? 3.5 : 2.0) * tr, -24.0, 18.0);   // softening goes deeper (up to -24 dB): rounding must be clearly heard at -100 %
                 mT = std::abs (g) > std::abs (mT) ? g : mT;
                 kT = 0.0;
                 if (std::abs (g) > 1e-6)
@@ -1069,7 +1197,7 @@ private:
         const double e = ap2.process (ap1.process (delayed));
         // K-Stereo: a constant amount of the decorrelated, pre-delayed ambience, plus the dynamic lift of the tails
         const double amt = p.ambOn ? ambS : 0.0;
-        ambUsed = true; ambK = p.ambOn ? kstS + amt * (dbToLin (gAmb) - 1.0) : 0.0;
+        ambUsed = true; ambK = kstS + amt * (dbToLin (gAmb) - 1.0);   // K-Stereo has its own switch, works without AMBIANCE
         if (ambK == 0.0) return;
         const double s2 = sd + ambK * e;
         s[0] = m + s2; s[1] = m - s2;
@@ -1217,6 +1345,7 @@ private:
     }
 
     Params p;
+    SpectralUp specUp;
     double fs = 48000; int nch = 2, lookMax = 240, latencySamples = 0;
     int wantOs = 1, curOs = -1, wantLook = 96, curLook = -1;
     double pkRms = 0, cPkRms = 0;

@@ -10,7 +10,7 @@ static void check (bool ok, const char* what, double v) { std::printf ("[%s] %-6
 
 static Params neutral()
 {
-    Params p; p.upOn = p.llOn = p.dnOn = p.pkOn = p.limOn = p.ambOn = false; p.autoGain = false; p.knee = 0; p.density = 0;
+    Params p; p.upOn = p.llOn = p.dnOn = p.pkOn = p.limOn = p.ambOn = p.kstOn = false; p.autoGain = false; p.knee = 0; p.density = 0;
     return p;
 }
 
@@ -95,7 +95,7 @@ int main()
         Engine e; e.prepare (fs, 2);
         Params p = neutral(); p.dnOn = p.upOn = p.llOn = p.pkOn = true; p.target = -14;
         p.thr1 = 0; p.ratio1 = 2; p.thr2 = 6; p.ratio2 = 4; p.upThr = -10; p.upRatio = 2; p.upRange = 100;
-        p.llThr = -30; p.llRatio = 2; p.llRange = 3; p.crest = 10; p.pkCrest = true; p.pkRatio = 4;
+        p.llThr = -30; p.llRatio = 2; p.llRange = 3; p.crest = 10; p.pkCrest = true; p.pkRatio = 4; p.upSpectral = false;
         e.setParams (p);
         check (std::abs (e.curveC1 (-10) + 2) < 1e-9, "C: 4 dB over threshold 1, 2:1 -> -2 dB", e.curveC1 (-10));
         const double tot = e.curveC1 (-4) + e.curveC2 (-4);   // 10 over thr1, 4 over thr2: -(10/2) - (1/2-1/4)*4 = -6
@@ -108,13 +108,13 @@ int main()
         check (std::abs (e.curveD (0) + 3) < 1e-9, "D: peak 4 dB over, 4:1 -> -3 dB", e.curveD (0));
     }
     {   // transparency, latency
-        Engine e; e.prepare (fs, 2); e.setParams (neutral());
+        Engine e; e.prepare (fs, 2); e.setParams (neutral()); e.reset();
         std::vector<double> l (32768, 0.0), r (32768, 0.0); l[0] = 0.5; r[0] = -0.25;
         double* io[2] = { l.data(), r.data() };
         e.process (io, 2, 32768);
         double err = 0;
         for (int i = 0; i < 32768; ++i) if (i != e.latency()) err = std::max (err, std::abs (l[(size_t) i]) + std::abs (r[(size_t) i]));
-        check (e.latency() > 256 && e.latency() < 12000, "latency at 48 kHz: look-ahead + gain FIR, constant", e.latency());
+        check (e.latency() > 256 && e.latency() < 16000, "latency at 48 kHz: look-ahead + gain FIR, constant", e.latency());
         err = std::max ({ err, std::abs (l[(size_t) e.latency()] - 0.5), std::abs (r[(size_t) e.latency()] + 0.25) });
         check (err < 1e-12, "all stages off: transparent (< -240 dB error), delayed by latency()", err);
     }
@@ -164,9 +164,35 @@ int main()
         check (e.meterC.load() > -0.1f, "hysteresis: a big drop releases fully", e.meterC.load());
     }
     {   // upward
-        Engine e; e.prepare (fs, 2); Params p = neutral(); p.upOn = true; p.target = -14; p.upThr = -6; p.upRatio = 2; p.upRange = 20; e.setParams (p);
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.upOn = true; p.upSpectral = false; p.target = -14; p.upThr = -6; p.upRatio = 2; p.upRange = 20; e.setParams (p);
         const double out = runSine (e, fs, -30, 8);
         check (std::abs (out - (-30 + 20 * std::tanh (5.0 / 20))) < 0.3, "A: -30 in, thr -20, 1:2 -> -25.1 dBFS out", out);
+    }
+    {   // spectral pp: a quiet 100 Hz "cello" under a loud 2 kHz tone is lifted, the loud tone is not
+        auto run = [&] (bool spectral, bool on, double& lo, double& hi) {
+            Engine e; e.prepare (fs, 2); Params p = neutral(); p.upOn = on; p.upSpectral = spectral; p.target = -14; p.upThr = -6;
+            p.upRatio = 2; p.upRange = 20; p.knee = 0; e.setParams (p);
+            const int n = (int) (6 * fs), blk = 512, from = n - (int) fs / 2;
+            std::vector<double> l (blk), r (blk); double* io[2] = { l.data(), r.data() };
+            std::complex<double> a1, a2; const double al = dbToLin (-60), ah = dbToLin (-20);
+            for (int s0 = 0; s0 < n; s0 += blk)
+            {
+                for (int i = 0; i < blk; ++i) { const double t = (s0 + i) / fs; l[(size_t) i] = r[(size_t) i] = al * std::sin (2 * kPi * 100 * t) + ah * std::sin (2 * kPi * 2000 * t); }
+                e.process (io, 2, blk);
+                for (int i = 0; i < blk; ++i) if (s0 + i >= from && s0 + i < n)
+                {
+                    const double t = (s0 + i) / fs;
+                    a1 += l[(size_t) i] * std::polar (1.0, -2 * kPi * 100 * t); a2 += l[(size_t) i] * std::polar (1.0, -2 * kPi * 2000 * t);
+                }
+            }
+            lo = linToDb (2 * std::abs (a1) / (fs / 2)); hi = linToDb (2 * std::abs (a2) / (fs / 2));
+        };
+        double lo0, hi0, lo1, hi1, lo2, hi2;
+        run (true, false, lo0, hi0); run (true, true, lo1, hi1); run (false, true, lo2, hi2);
+        check (std::abs (lo0 + 60) < 0.01 && std::abs (hi0 + 20) < 0.01, "pp spectral off: exact (tones at -60 / -20 dB)", lo0 + 60);
+        check (lo1 - lo0 > 8, "pp spectral: quiet 100 Hz under a loud 2 kHz lifted > 8 dB", lo1 - lo0);
+        check (std::abs (hi1 - hi0) < 0.3, "pp spectral: loud 2 kHz untouched (< 0.3 dB)", hi1 - hi0);
+        check (lo2 - lo0 < 0.5, "pp broadband: the loud tone holds the quiet one down (no lift)", lo2 - lo0);
     }
     {   // density lifts low level more than high level
         auto lift = [&] (double lvl) {
@@ -218,6 +244,28 @@ int main()
         double err = 0; for (int i = e.latency(); i < n; ++i) err = std::max (err, std::abs (r[(size_t) i] - rIn[(size_t) (i - e.latency())]));
         check (err < 1e-12, "unlinked limiter: right channel untouched by a left spike", err);
     }
+    {   // transients on a soft orchestral attack (40 ms rise, strings/brass-like), not only on drums
+        auto attack = [&] (double amount) {
+            Engine e; e.prepare (fs, 2); Params p = neutral(); p.transient = amount; e.setParams (p);
+            const int n = (int) (3 * fs), t0 = (int) fs, rise = (int) (0.04 * fs);
+            std::vector<double> l ((size_t) n, 0.0), r;
+            for (int i = t0; i < n; ++i)
+            {
+                const double env = i - t0 < rise ? 0.5 - 0.5 * std::cos (kPi * (i - t0) / rise) : 1.0;
+                const double t = i / fs;
+                l[(size_t) i] = 0.3 * env * (std::sin (2 * kPi * 196 * t) + 0.5 * std::sin (2 * kPi * 392 * t) + 0.3 * std::sin (2 * kPi * 588 * t));
+            }
+            r = l; double* io[2] = { l.data(), r.data() };
+            for (int s0 = 0; s0 < n; s0 += 512) { double* b[2] = { io[0] + s0, io[1] + s0 }; e.process (b, 2, std::min (512, n - s0)); }
+            const int L = e.latency(); double a = 0, b = 0;   // energy in the first 60 ms vs 0.5..1 s later
+            for (int i = t0; i < t0 + (int) (0.06 * fs); ++i) a += l[(size_t) (i + L)] * l[(size_t) (i + L)];
+            for (int i = t0 + (int) (0.5 * fs); i < t0 + (int) fs; ++i) b += l[(size_t) (i + L)] * l[(size_t) (i + L)];
+            return 10 * std::log10 ((a / 0.06) / (b / 0.5));
+        };
+        const double a0 = attack (0), am = attack (-1), ap = attack (1);
+        check (am - a0 < -4, "transients -100%: soft 40 ms attack softened by more than 4 dB", am - a0);
+        check (ap - a0 > 4, "transients +100%: soft 40 ms attack accentuated by more than 4 dB", ap - a0);
+    }
     {   // ambiance: mono compatible, lifts the side in quiet passages, auto finds early reflections
         Engine e; e.prepare (fs, 2); Params p = neutral(); p.ambOn = true; p.ambiance = 1; p.ambThr = -8; p.ambRatio = 3; p.ambAuto = true; p.ambStage = 3;
         e.setParams (p);
@@ -261,7 +309,7 @@ int main()
         for (int target : { 0, 1 })
         {
             Fake fk; Engine e; e.prepare (fs, 2); e.setInsert (&Fake::run, &fk);
-            Params p = neutral(); p.revOn = true; p.revTarget = target; e.setParams (p);
+            Params p = neutral(); p.revOn = true; p.revTarget = target; e.setParams (p); e.reset();
             std::mt19937 rng (5); std::normal_distribution<double> nd (0, 1);
             const int n = (int) fs;
             std::vector<double> l ((size_t) n), r ((size_t) n), mono ((size_t) n), side ((size_t) n);

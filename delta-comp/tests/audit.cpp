@@ -161,6 +161,23 @@ int main (int argc, char** argv)
     std::unique_ptr<juce::AudioProcessor> ap (createPluginFilter());
     auto& p = static_cast<DeltaCompProcessor&> (*ap);
     p.setProcessingPrecision (juce::AudioProcessor::doublePrecision);
+    if (std::getenv ("AUDIT_TILT"))
+    {   // tilt check: sine level out at 100 Hz and 10 kHz, tilt at 0 and at +1.5 dB/oct, everything else default
+        for (float t : { 0.0f, 3.0f, -3.0f })
+        {
+            auto* tp = p.apvts.getParameter ("tilt"); tp->setValueNotifyingHost (tp->convertTo0to1 (t));
+            std::printf ("tilt %+.1f:", t);
+            for (double f : { 100.0, 1000.0, 10000.0 })
+            {
+                std::vector<double> sn ((size_t) (2 * n));
+                for (int i = 0; i < n; ++i) sn[(size_t) i] = sn[(size_t) (n + i)] = 0.05 * std::sin (2 * M_PI * f * i / fs);
+                const Result r = render (p, sn, n);
+                std::printf ("  %g Hz %.2f dB", f, rmsDb (r, n / 2));
+            }
+            std::printf ("\n");
+        }
+        return 0;
+    }
     // base: defaults with every module switched on
     const char* ons[] = { "trOn", "upOn", "llOn", "dnOn", "pkOn", "ambOn", "msOn", "tiltOn", "limOn", "active" };
     for (auto* id : ons) p.apvts.getParameter (id)->setValueNotifyingHost (1.0f);
@@ -202,7 +219,7 @@ int main (int argc, char** argv)
         // a few controls only matter once their parent control is away from neutral
         static const std::map<juce::String, std::vector<std::pair<const char*, float>>> ctx = {
             { "trDur", { { "transient", -60 } } }, { "trTarget", { { "transient", -60 } } }, { "trOn", { { "transient", -60 } } },
-            { "msOn", { { "width", 3 } } }, { "tiltOn", { { "tilt", 1 } } }, { "tiltPivot", { { "tilt", 1 } } }, { "tiltPhase", { { "tilt", 1 } } }, { "tiltPos", { { "tilt", 1 } } }, { "tiltTarget", { { "tilt", 1 } } },
+            { "msOn", { { "width", 3 } } }, { "tiltOn", { { "tilt", 3 } } }, { "tiltPivot", { { "tilt", 3 } } }, { "tiltPhase", { { "tilt", 3 } } }, { "tiltPos", { { "tilt", 3 } } }, { "tiltTarget", { { "tilt", 3 } } },
             { "centreFilter", { { "centre", 3 } } }, { "centreFreq", { { "centre", 3 }, { "centreFilter", 3 } } },
             { "sideSlope", { { "sideLowCut", 150 } } }, { "ambPre", { { "ambAuto", 0 } } }, { "crest", { { "pkMode", 1 } } },
             { "pkThr", { { "pkMode", 0 } } },

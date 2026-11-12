@@ -53,6 +53,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     fl ("trDur",   "Durée",              5.f, 200.f,  30.f, 1.f, 30.f,   "ms", 0);
     // A upward low level
     bo ("upOn",    "Upward actif",     true);
+    ch ("upMode",  "Upward mode",      { "SPECTRAL", "LARGE" }, 0);
     fl ("upThr",   "Upward seuil",     -74.f,   0.f, -22.f, 0.1f, 0,     "LU", 1);
     fl ("upRatio", "Upward ratio",       1.f,   4.f,  2.0f, 0.01f, 1.8f, ":1", 2);
     fl ("upRange", "Upward plage",       0.f,  18.f,   6.f, 0.1f, 0,     "dB", 1);
@@ -102,18 +103,18 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     bo ("msOn",    "M/S actif",        true);
     fl ("width",   "Largeur",           -6.f,   6.f,   0.f, 0.1f, 0,     "dB", 1);
     bo ("tiltOn",  "Tilt actif",       true);
-    fl ("tilt",    "Tilt",              -1.5f,  1.5f,  0.f, 0.01f, 0,    "dB/oct", 2);
+    fl ("tilt",    "Tilt",              -6.f,   6.f,   0.f, 0.1f, 0,     "dB", 1);   // + = brighter: +dB at 20 kHz end, -dB at the 20 Hz end, straight line
     fl ("tiltPivot","Tilt pivot",       100.f, 10000.f, 1000.f, 1.f, 1000.f, "Hz", 0);
     ch ("tiltPhase","Tilt phase",      { "LINÉAIRE", "MIN" }, 0);
-    ch ("tiltPos", "Tilt position",    { "APRÈS COMP", "APRÈS REVERB", "APRÈS LIMITEUR" }, 1);
+    ch ("tiltPos", "Tilt position",    { "APRÈS COMP", "APRÈS INSERT", "APRÈS LIMITEUR" }, 1);
     ch ("tiltTarget","Tilt sur",       { "ST", "MID", "SIDE" }, 0);
     fl ("centre",  "Centre",            -6.f,   6.f,   0.f, 0.1f, 0,     "dB", 1);
     ch ("centreFilter", "Filtre centre", { "LARGE", "GRAVE", "AIGU", "CLOCHE" }, 0);
     fl ("centreFreq", "Fréquence centre", 20.f, 20000.f, 1000.f, 1.f, 1000.f, "Hz", 0);
     fl ("sideLowCut", "Low cut side",    0.f, 300.f,   0.f, 1.f, 0,      "Hz", -1);   // 0 = OFF
     ch ("sideSlope", "Pente",          { "6", "12", "24" }, 1);
-    bo ("revOn",   "Reverb insert actif",     false);
-    ch ("revTarget","Reverb sur",      { "MID", "SIDE", "M+S" }, 1);
+    bo ("revOn",   "Insert actif",            false);
+    ch ("revTarget","Insert sur",      { "MID", "SIDE", "L+R" }, 1);
     // E limiter
     bo ("limOn",   "Limiteur actif",   true);
     fl ("ceiling", "Plafond",           -6.f,   0.f,  -1.f, 0.1f, 0,     "dBTP", 1);
@@ -132,14 +133,18 @@ dcomp::Params DeltaCompProcessor::currentParams() const
     p.target = pv ("target"); p.autoGain = pb ("autoGain"); p.windowMs = pv ("window"); p.link = pv ("link") * 0.01;
     p.knee = pv ("knee"); p.density = pv ("density") * 0.01; p.mix = pv ("mix") * 0.01; p.outGainDb = pv ("out");
     p.trOn = pb ("trOn"); p.trTarget = pi ("trTarget"); p.transient = pv ("transient") * 0.01; p.trDurMs = pv ("trDur");
-    p.upOn = pb ("upOn"); p.upThr = pv ("upThr"); p.upRatio = pv ("upRatio"); p.upRange = pv ("upRange"); p.upAtt = pv ("upAtt"); p.upRel = pv ("upRel");
+    p.upOn = pb ("upOn"); p.upSpectral = pi ("upMode") == 0; p.upThr = pv ("upThr"); p.upRatio = pv ("upRatio"); p.upRange = pv ("upRange"); p.upAtt = pv ("upAtt"); p.upRel = pv ("upRel");
     p.llOn = pb ("llOn"); p.llThr = pv ("llThr"); p.llRatio = pv ("llRatio"); p.llRange = pv ("llRange"); p.llAtt = pv ("llAtt"); p.llRel = pv ("llRel");
     p.dnOn = pb ("dnOn"); p.opto = pi ("opto") == 1; p.variMu = pi ("opto") == 2;
     p.thr1 = pv ("thr1"); p.ratio1 = pv ("ratio1"); p.att1 = pv ("att1"); p.rel1 = pv ("rel1");
     p.thr2 = pv ("thr2"); p.ratio2 = pv ("ratio2"); p.att2 = pv ("att2"); p.rel2 = pv ("rel2"); p.hyst = pv ("hyst");
     p.pkOn = pb ("pkOn"); p.crest = pv ("crest"); p.pkThr = pv ("pkThr"); p.pkCrest = pi ("pkMode") == 1;
-    // K-Stereo: 100 % = 3x the side ambience (about +12 dB of extracted room)
-    p.kStereo = pv ("kStereo") * 0.03; p.kstOn = pb ("kstOn"); p.msOn = pb ("msOn"); p.tiltOn = pb ("tiltOn"); p.tilt = pv ("tilt"); p.tiltPivot = pv ("tiltPivot"); p.tiltPos = pi ("tiltPos"); p.tiltTarget = pi ("tiltTarget"); p.tiltMin = pi ("tiltPhase") == 1; p.pkRatio = pv ("pkRatio"); p.pkAtt = pv ("pkAtt"); p.pkRel = pv ("pkRel");
+    // K-Stereo: the knob is the room lift in dB on the side (100 % = +9 dB of decorrelated, pre-delayed ambience):
+    // power 1 + k^2 = 10^(dB/10), so 30 % already gives +2.7 dB of room
+    { const double kdb = pv ("kStereo") * 0.09; p.kStereo = std::sqrt (std::pow (10.0, kdb / 10.0) - 1.0); }
+    p.kstOn = pb ("kstOn"); p.msOn = pb ("msOn"); p.tiltOn = pb ("tiltOn"); p.tilt = pv ("tilt") / (0.5 * std::log2 (1000.0));
+    // tilt: dB at 100 Hz / 10 kHz (each end of 1000x around the pivot) -> dB/oct
+    p.tiltPivot = pv ("tiltPivot"); p.tiltPos = pi ("tiltPos"); p.tiltTarget = pi ("tiltTarget"); p.tiltMin = pi ("tiltPhase") == 1; p.pkRatio = pv ("pkRatio"); p.pkAtt = pv ("pkAtt"); p.pkRel = pv ("pkRel");
     p.ambOn = pb ("ambOn"); p.ambiance = pv ("ambiance") * 0.01; p.ambThr = pv ("ambThr"); p.ambRatio = pv ("ambRatio");
     p.ambAtt = pv ("ambAtt"); p.ambRel = pv ("ambRel"); p.ambAuto = pb ("ambAuto"); p.ambPreMs = pv ("ambPre"); p.ambTr = pv ("ambTr") * 0.01; p.ambStage = pi ("ambStage") + 1;
     p.widthDb = pv ("width"); p.centreDb = pv ("centre"); p.centreFilter = pi ("centreFilter"); p.centreFreq = pv ("centreFreq");

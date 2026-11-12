@@ -41,7 +41,7 @@ int main (int argc, char** argv)
     {
         p->setProcessingPrecision (dbl ? juce::AudioProcessor::doublePrecision : juce::AudioProcessor::singlePrecision);
         p->prepareToPlay (48000, 512);
-        check (p->getLatencySamples() == 9356, dbl ? "latency 9356 samples at 48 kHz (double)" : "latency 9356 samples at 48 kHz (float)", p->getLatencySamples());
+        check (p->getLatencySamples() == 13452, dbl ? "latency 13452 samples at 48 kHz (double)" : "latency 13452 samples at 48 kHz (float)", p->getLatencySamples());
         juce::MidiBuffer midi; double acc = 0; int cnt = 0;
         for (int blk = 0; blk < 400; ++blk)
         {
@@ -60,7 +60,7 @@ int main (int argc, char** argv)
     {
         if (auto* r = find ("Oversampling")) r->setValueNotifyingHost ((float) os / 3.0f);
         p->prepareToPlay (48000, 512);
-        check (p->getLatencySamples() == 9356, "latency constant for each oversampling setting", os);
+        check (p->getLatencySamples() == 13452, "latency constant for each oversampling setting", os);
         p->releaseResources();
     }
 
@@ -73,6 +73,37 @@ int main (int argc, char** argv)
     if (p->hasEditor()) { std::unique_ptr<juce::AudioProcessorEditor> ed (p->createEditorIfNeeded()); check (ed != nullptr && ed->getWidth() > 0, "editor opens", ed ? ed->getWidth() : 0); if (ed) p->editorBeingDeleted (ed.get()); }
 
     p.reset();
+    // default settings, as opened in a DAW: the transient knob must clearly soften / accentuate a soft attack
+    auto softAttack = [&] (float amount) {
+        auto q = fmt.createInstanceFromDescription (*descs[0], 48000, 512, err);
+        for (auto* prm : q->getParameters()) if (prm->getName (128) == "Transitoires") prm->setValueNotifyingHost (prm->getValueForText (juce::String (amount)));
+        q->setProcessingPrecision (juce::AudioProcessor::doublePrecision);
+        q->prepareToPlay (48000, 512);
+        const int L = q->getLatencySamples(), n = 48000 * 4, t0 = 48000 * 2, rise = 1920;
+        std::vector<double> out ((size_t) n);
+        juce::MidiBuffer midi;
+        for (int s0 = 0; s0 < n; s0 += 512)
+        {
+            juce::AudioBuffer<double> b (2, 512);
+            for (int i = 0; i < 512; ++i)
+            {
+                const int k = s0 + i; const double t = k / 48000.0, pi2 = 2 * juce::MathConstants<double>::pi;
+                const double env = k < t0 ? 0.0 : k - t0 < rise ? 0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * (k - t0) / rise) : 1.0;
+                const double x = 0.15 * env * (std::sin (pi2 * 196 * t) + 0.5 * std::sin (pi2 * 392 * t) + 0.3 * std::sin (pi2 * 588 * t));
+                b.setSample (0, i, x); b.setSample (1, i, x);
+            }
+            q->processBlock (b, midi);
+            for (int i = 0; i < 512; ++i) out[(size_t) (s0 + i)] = b.getSample (0, i);
+        }
+        double a = 0, c = 0;
+        for (int i = t0; i < t0 + 2880; ++i) a += out[(size_t) (i + L)] * out[(size_t) (i + L)];
+        for (int i = t0 + 24000; i < t0 + 48000 && i + L < n; ++i) c += out[(size_t) (i + L)] * out[(size_t) (i + L)];
+        q->releaseResources();
+        return 10 * std::log10 ((a / 2880) / (c / 24000));
+    };
+    const double t0 = softAttack (0), tm = softAttack (-100), tp = softAttack (100);
+    check (tm - t0 < -4, "defaults: Transitoires -100 softens a 40 ms attack > 4 dB", tm - t0);
+    check (tp - t0 > 4, "defaults: Transitoires +100 accentuates a 40 ms attack > 4 dB", tp - t0);
     std::printf (fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails ? 1 : 0;
 }
