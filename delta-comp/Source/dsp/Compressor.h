@@ -1036,8 +1036,8 @@ public:
         for (int k = 1; k < Oversampler::kNumF; ++k) tailOs = std::max (tailOs, osDelay + 2 * gfirOs[(size_t) k].half / Oversampler::kFactors[k]);
         limTail = std::max (TruePeak::kDelay + 2 * hf, tailOs);
         specUp.prepare (fs);
-        latencySamples = hf + lookMax + limTail + FirEq::latencyFor (256, 64, fs, false) + FirEq::latencyFor (1024, 64, fs, true) + specUp.latency();
-        tiltEq.prepare (fs); msEq.prepare (fs);
+        latencySamples = hf + (hf + (int) std::round (0.001 * fs)) + lookMax + limTail + FirEq::latencyFor (256, 64, fs, false) + FirEq::latencyFor (1024, 64, fs, true) + specUp.latency();
+        tiltEq.prepare (fs); msEq.prepare (fs); trEndFir.prepare (gfir.N, 0.0);
         for (int c = 0; c < kMaxCh; ++c)
         {
             for (auto& k : kw[(size_t) c]) k.prepare (fs);
@@ -1048,6 +1048,7 @@ public:
             for (auto* g : { &dynGm[(size_t) c], &dynGt[(size_t) c], &dynGa[(size_t) c] }) g->kq.reserve (72 * Oversampler::kMaxF);
            
             firMain[(size_t) c].prepare (gfir.N, 1.0); firAmbC[(size_t) c].prepare (gfir.N, 0.0); firTr[(size_t) c].prepare (gfir.N, 0.0);
+            trLook = (int) std::round (0.001 * fs); trEndDelay[(size_t) c].reserve (hf + trLook + 1); trEndDelay[(size_t) c].setLength (hf + trLook);
             limFir[(size_t) c].reserve (nMax); limFir[(size_t) c].prepare (gfir.N, 1.0);
             spDelay[(size_t) c].reserve (TruePeak::kDelay + 1); spDelay[(size_t) c].setLength (TruePeak::kDelay);
             hold[(size_t) c].reserve ((lookMax + 2) * Oversampler::kMaxF + 2 * hf + hoMax);
@@ -1084,13 +1085,14 @@ public:
             pkEnv[c] = 0; pkRms = 0;
             gA[c] = gB[c] = gC1[c] = gC2[c] = gD[c] = gDen[c] = 0; relC1[c] = relC2[c] = relD[c] = false; optoMem[c] = 0;
         }
-        for (size_t c = 0; c < (size_t) kMaxCh; ++c) { xDelay[c].reset(); firMain[c].reset (1.0); firAmbC[c].reset (0.0); firTr[c].reset (0.0); limFir[c].reset (1.0); }
+        trEndFir.reset (0.0);
+        for (size_t c = 0; c < (size_t) kMaxCh; ++c) { xDelay[c].reset(); trEndDelay[c].reset(); firMain[c].reset (1.0); firAmbC[c].reset (0.0); firTr[c].reset (0.0); limFir[c].reset (1.0); }
         firRev.reset (0.0); ambHpA.reset(); ap1A.reset(); ap2A.reset(); std::fill (ambRingA.begin(), ambRingA.end(), 0.0); std::fill (ambRingG.begin(), ambRingG.end(), 1.0); std::fill (ambRingT.begin(), ambRingT.end(), 0.0); for (auto& v : insRing) std::fill (v.begin(), v.end(), 0.0); ambDuck = 0; ambWA = 0;
         ambHp.reset(); std::fill (ambRing.begin(), ambRing.end(), 0.0); ap1.reset(); ap2.reset(); ambKw.reset(); verb.reset(); lvlA = -100;
         ambRms = 1e-10; gAmb = 0; frameAcc = 0; frameCount = 0; frameIdx = 0; recLeft = 0; sinceOnset = 100000;
         frames.fill (-120); erMs = 20; meterEr.store ((float) erMs);
         wetLoud = lufsToPow (p.target); makeupDb = 0;
-        mixS = std::clamp (p.mix, 0.0, 1.0); outS = dbToLin (p.outGainDb); denS = p.density; ambS = p.ambiance; kstS = p.kstOn ? p.kStereo : 0.0; trS = p.trOn ? p.transient : 0.0; trFast = trSlow = 0; trG = 0;
+        mixS = std::clamp (p.mix, 0.0, 1.0); outS = dbToLin (p.outGainDb); denS = p.density; ambS = p.ambiance; kstS = p.kstOn ? p.kStereo : 0.0; trS = p.trOn ? p.transient : 0.0; trFast = trSlow = 0; trG = 0; eFast = eSlow = 0; eG = 0;
         acc = {};
         resetLoudness();
     }
@@ -1117,6 +1119,7 @@ public:
         cDenA = co (3.0); cDenR = co (120.0);
         cOptoUp = co (400.0); cOptoDn = co (3000.0);
         cTrFa = co (1.0); cTrFr = co (p.trDurMs); cTrSa = co (p.trDurMs * 1.2); cTrSr = 0; cTrG = co (2.0);
+        cEFa = co (0.2); cEFr = co (p.trDurMs); cESa = co (2.0 * p.trDurMs); cEG = co (0.5);
         cRevSend = co (150.0); cFast = co (50.0);
         cAmbA = co (p.ambAtt); cAmbR = co (p.ambRel); cAmbWin = co (50.0);
         verb.setDecay (p.revDecay);
@@ -1253,33 +1256,16 @@ public:
                 inFast = ip + cFast * (inFast - ip);
             }
 
-            // T: transients = fast envelope over slow envelope (linked), turned into a gain
+            // transient level at the input (fast over slow envelope): used by the ambiance to keep attacks out of the
+            // lifted tails. The transient SHAPER itself is at the end of the chain (after K-Stereo), see below.
             {
-                // power (not the rectified peak, whose ripple would wobble the gain at audio rate and roughen the sound)
                 double a = 0;
                 for (int c = 0; c < C; ++c) a += s[c] * s[c];
                 a /= cs;
                 trFast = a > trFast ? a + cTrFa * (trFast - a) : a + cTrFr * (trFast - a);
-                trSlow = trFast < trSlow ? trFast : trFast + cTrSa * (trSlow - trFast);   // lags only on the way up
-                const double tr = std::clamp (10.0 * std::log10 ((trFast + 1e-18) / (trSlow + 1e-18)), 0.0, 24.0);
-                trDb = tr;
-                // soft-limited curve (Bittersweet-like): fine at small settings, never a hard edge
-                const double gt = trS < 0 ? -12.0 * std::tanh (2.0 * tr * -trS / 12.0) : 9.0 * std::tanh (1.5 * tr * trS / 9.0);
-                trG = gt + cTrG * (trG - gt);   // 2 ms glide: the gain moves smoothly, no grain
-                const double g = trG;
-                mT = std::abs (g) > std::abs (mT) ? g : mT;
+                trSlow = trFast < trSlow ? trFast : trFast + cTrSa * (trSlow - trFast);
+                trDb = std::clamp (10.0 * std::log10 ((trFast + 1e-18) / (trSlow + 1e-18)), 0.0, 24.0);
                 kT = 0.0;
-                if (std::abs (g) > 1e-6)
-                {
-                    const double gl = dbToLin (g);
-                    if (C == 2 && p.trTarget > 0)
-                    {   // on Mid or Side only: an additive term (gl - 1) * M (or S), band-limited separately
-                        const double m = 0.5 * (s[0] + s[1]), sd = 0.5 * (s[0] - s[1]);
-                        const double m2 = p.trTarget == 1 ? m * gl : m, s2 = p.trTarget == 2 ? sd * gl : sd;
-                        s[0] = m2 + s2; s[1] = m2 - s2; kT = gl - 1.0;
-                    }
-                    else for (int c = 0; c < C; ++c) { s[c] *= gl; mulGain (c, gl); }
-                }
             }
 
             // A, B, C: RMS stages in series, each detects its own input
@@ -1472,6 +1458,32 @@ public:
                     if (p.trTarget == 1) { y[0] += q[0] * um; y[1] += q[1] * um; }
                     else if (p.trTarget == 2) { y[0] += q[0] * us; y[1] -= q[1] * us; }
                     y[0] += ka[0] * e; y[1] -= ka[1] * e;   // ambiance
+                }
+            }
+
+            // TRANSIENT SHAPER, at the end (after the dynamics and K-Stereo), on stereo, Mid or Side.
+            // Fast envelope (0.2 ms attack) over a slow one (lags by DURÉE): the attack edge in dB. ROND takes the edge
+            // off (up to -24 dB), ATT. pushes it (up to +12 dB). The gain is band-limited like every gain here (no
+            // aliasing), the audio waits 1 ms more so the very first edge is caught.
+            {
+                const int tg = C == 2 ? p.trTarget : 0;
+                const double m = 0.5 * (y[0] + (C == 2 ? y[1] : y[0])), sd = C == 2 ? 0.5 * (y[0] - y[1]) : 0.0;
+                const double pw = tg == 1 ? m * m : tg == 2 ? sd * sd : (C == 2 ? 0.5 * (y[0] * y[0] + y[1] * y[1]) : y[0] * y[0]);
+                eFast = pw > eFast ? pw + cEFa * (eFast - pw) : pw + cEFr * (eFast - pw);
+                eSlow = eFast < eSlow ? eFast : eFast + cESa * (eSlow - eFast);
+                const double tr = std::clamp (10.0 * std::log10 ((eFast + 1e-18) / (eSlow + 1e-18)), 0.0, 30.0);
+                const double gt = trS < 0 ? -24.0 * std::tanh (tr * -trS / 24.0) : 12.0 * std::tanh (0.8 * tr * trS / 12.0);
+                eG = gt + cEG * (eG - gt);
+                mT = std::abs (eG) > std::abs (mT) ? eG : mT;
+                const double q = trEndFir.process (std::abs (eG) > 1e-9 ? dbToLin (eG) - 1.0 : 0.0, gfir.h);   // 0 when idle: exact delay
+                double yd[kMaxCh] {};
+                for (int c = 0; c < C; ++c) yd[c] = trEndDelay[(size_t) c].process (y[c]);
+                if (tg == 0) for (int c = 0; c < C; ++c) y[c] = yd[c] * (1.0 + q);
+                else
+                {
+                    double md = 0.5 * (yd[0] + yd[1]), sdd = 0.5 * (yd[0] - yd[1]);
+                    if (tg == 1) md *= 1.0 + q; else sdd *= 1.0 + q;
+                    y[0] = md + sdd; y[1] = md - sdd;
                 }
             }
 
@@ -1858,7 +1870,8 @@ private:
     std::array<ScFilter, kMaxCh> scFilt;
     std::array<KWeighting, kMaxCh> inKw; double inFast = 0, outFast = 0, cFast = 0;
     double widthS = 1, msMix = 1, revSendS = 0, cRevSend = 0, lvlA = -100; TailVerb verb;
-    double cTrFa = 0, cTrFr = 0, cTrSa = 0, cTrSr = 0;
+    double cTrFa = 0, cTrFr = 0, cTrSa = 0, cTrSr = 0, cEFa = 0, cEFr = 0, cESa = 0, cEG = 0, eFast = 0, eSlow = 0, eG = 0;
+    FirLine trEndFir; std::array<Delay, kMaxCh> trEndDelay; int trLook = 48;
     std::array<std::array<KWeighting, 4>, kMaxCh> kw;
     std::array<std::array<double, 4>, kMaxCh> rms {};
     std::array<KWeighting, kMaxCh> wetKw, outKw;

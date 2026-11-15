@@ -537,6 +537,39 @@ int main()
         const double b = runSine (e2, fs, -6, 2);
         check (a - b > 2, "COMP/LIM 100 %: more reduction than 2:1 (dB)", a - b);
     }
+    {   // transient shaper on real-like material: plucked notes (1 ms rise) over a held background 14 dB lower
+        auto run = [&] (double amt, int target, double& edge, double& body, double& sideEdge) {
+            Engine e; e.prepare (fs, 2); Params p = neutral(); p.transient = amt; p.trTarget = target; e.setParams (p); e.reset();
+            const int L = e.latency(), n = (int) (3 * fs) + L;
+            std::vector<double> l ((size_t) n), r ((size_t) n);
+            std::mt19937 rng (9); std::normal_distribution<double> nd (0, 1);
+            double bg = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                bg = 0.98 * bg + 0.02 * nd (rng);
+                const int ph = i % 12000;
+                const double env = ph < 48 ? ph / 48.0 : std::exp (-(ph - 48) / 2400.0);
+                const double note = 0.3 * env * std::sin (2 * kPi * 330 * i / fs) + 0.15 * env * std::sin (2 * kPi * 990 * i / fs);
+                l[(size_t) i] = 0.25 * bg + note; r[(size_t) i] = 0.25 * bg + note;
+            }
+            for (int s0 = 0; s0 < n; s0 += 512) { double* io[2] = { &l[(size_t) s0], &r[(size_t) s0] }; e.process (io, 2, std::min (512, n - s0)); }
+            edge = body = sideEdge = 0;
+            for (int t0 = 4 * 12000; t0 + 12000 + L < n; t0 += 12000)
+            {
+                for (int i = 0; i < 240; ++i) { const double v = l[(size_t) (t0 + i + L)]; edge += v * v; sideEdge += std::pow (l[(size_t) (t0 + i + L)] - r[(size_t) (t0 + i + L)], 2); }
+                for (int i = 2400; i < 4800; ++i) { const double v = l[(size_t) (t0 + i + L)]; body += v * v; }
+            }
+        };
+        double e0, b0, s0, e1, b1, s1, e2, b2, s2;
+        run (0, 0, e0, b0, s0); run (-1, 0, e1, b1, s1); run (1, 0, e2, b2, s2);
+        const double dEdge = 10 * std::log10 (e1 / e0), dBody = 10 * std::log10 (b1 / b0), dPush = 10 * std::log10 (e2 / e0);
+        std::printf ("       transient shaper, notes over a held background: ROND -100 edge %.1f dB body %.1f dB, ATT +100 edge %+.1f dB\n", dEdge, dBody, dPush);
+        check (dEdge < -6, "transient ROND -100: first 5 ms of each note down > 6 dB (background 14 dB under)", dEdge);
+        check (std::abs (dBody) < 1.5, "transient ROND -100: body (50..100 ms) within 1.5 dB", dBody);
+        check (dPush > 3, "transient ATT +100: first 5 ms up > 3 dB", dPush);
+        double e3, b3, s3; run (-1, 2, e3, b3, s3);   // on Side only: a mono signal is untouched
+        check (std::abs (10 * std::log10 (e3 / e0)) < 0.01, "transient on SIDE: mono material untouched", 10 * std::log10 (e3 / e0));
+    }
     std::printf (fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails ? 1 : 0;
 }

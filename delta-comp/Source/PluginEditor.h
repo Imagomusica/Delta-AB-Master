@@ -132,6 +132,23 @@ struct Sand : juce::Component
     void renderPlate();
     juce::Point<float> project (float x, float y, float z) const;
     juce::Rectangle<float> plateArea;
+    // per-band dynamics (the main view): 30 third-octave bands across, time in depth (8 s, now in front), height =
+    // level of each band at the input (grey grains) and at the output (white grains); a trace between them shows
+    // what the processing does to that band (red: reduced, blue: lifted); the thresholds as planes; under it, each
+    // band's dynamic range over 30 s, input against output. The old Chladni sand stays behind it, in grey.
+    static constexpr int kB = 30, kRows = 120, kStat = 900;
+    std::array<std::array<float, kB>, kRows> histIn {}, histOut {};
+    std::array<std::array<float, kB>, kStat> statIn {}, statOut {};
+    std::array<float, kB> p10In {}, p95In {}, p10Out {}, p95Out {}, nowIn {}, nowOut {};
+    int rowHead = 0, statHead = 0, statFill = 0; unsigned rowCount = 0;
+    std::vector<std::complex<double>> fb; std::vector<double> hann;
+    juce::Image field;
+    juce::Rectangle<float> fieldArea, rangeArea;
+    void analyseBands();
+    void renderField();
+    juce::Point<float> projF (float x, float y, float z) const;
+    static float zOfDb (float db) { return juce::jlimit (0.0f, 1.0f, (db + 78.0f) / 66.0f); }
+    float planeDb (int k) const;
     // dynamic range spread (10th..95th percentile of the 400 ms loudness over the last 30 s), set by the meter
     float inLo = -200, inHi = -200, outLo = -200, outHi = -200;
 };

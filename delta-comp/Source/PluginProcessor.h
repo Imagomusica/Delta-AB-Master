@@ -35,9 +35,14 @@ public:
     juce::AudioProcessorValueTreeState apvts;
     dcomp::Engine engine;
     // output (mid) for the sand view's spectrum, written by the audio thread
-    static constexpr int kScopeSize = 8192;
+    static constexpr int kScopeSize = 1 << 16;
     std::array<float, kScopeSize> scope {}, scopeS {};   // output mid and side, for the sand and the phase scope
     std::atomic<int> scopeWrite { 0 };
+    // input (mid, after the input gain) for the per-band dynamics view; the view reads it scopeLag samples back so
+    // input and output line up in time (the plugin's latency)
+    static constexpr int kInScope = 1 << 20;
+    std::vector<float> scopeIn = std::vector<float> ((size_t) kInScope, 0.0f);
+    std::atomic<int> scopeInWrite { 0 }, scopeLag { 0 };
     dcomp::Params currentParams() const;
 
     // External insert (VST3, e.g. a reverb) on Mid / Side / L-R, before the limiter.

@@ -296,6 +296,13 @@ void DeltaCompProcessor::processAny (juce::AudioBuffer<T>& b)
                 for (int c = 0; c < ch; ++c) b.setSample (c, i, (T) ((double) b.getSample (c, i) * inGain));
             }
     }
+    {
+        int wi = scopeInWrite.load (std::memory_order_relaxed);
+        for (int i = 0; i < b.getNumSamples(); ++i, ++wi)
+            scopeIn[(size_t) (wi & (kInScope - 1))] = (float) (ch > 1 ? 0.5 * ((double) b.getSample (0, i) + (double) b.getSample (1, i)) : (double) b.getSample (0, i));
+        scopeLag.store (total, std::memory_order_relaxed);
+        scopeInWrite.store (wi, std::memory_order_release);
+    }
     engine.process (b.getArrayOfWritePointers(), ch, b.getNumSamples());
     {   // DIFFÉRENCE: only what the processing changes (input, level-matched by the input gain, minus output), 20 ms glide
         const double lt = pi ("listen") == 1 ? 1.0 : 0.0;

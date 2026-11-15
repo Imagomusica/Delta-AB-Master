@@ -402,6 +402,10 @@ void Sand::resized()
     const float W = (float) getWidth(), H = (float) getHeight();
     plateArea = { 8.0f, 24.0f, W - 150.0f - 8.0f, H - 24.0f - (float) kBand - 4.0f };
     plate = Image (Image::ARGB, jmax (1, (int) plateArea.getWidth()), jmax (1, (int) plateArea.getHeight()), true);
+    // the band field takes the top of the plate, the per-band dynamic range strip the bottom
+    fieldArea = plateArea.withTrimmedLeft (70.0f).withTrimmedRight (10.0f).withHeight (plateArea.getHeight() * 0.64f);
+    rangeArea = Rectangle<float> (fieldArea.getX(), fieldArea.getBottom() + 18.0f, fieldArea.getWidth(), plateArea.getBottom() - fieldArea.getBottom() - 34.0f);
+    field = Image (Image::ARGB, jmax (1, (int) fieldArea.getWidth()), jmax (1, (int) fieldArea.getHeight()), true);
 }
 
 // plate coordinates: x 0..1 across, y 0 (far) .. 1 (near), z height above the plate (plate widths)
@@ -588,6 +592,138 @@ void Sand::push()
     }
     head = (head + 1) % kCols; ++frame;
     stepPlate(); renderPlate();
+    analyseBands(); renderField();
+}
+
+// field coordinates: x 0..1 = bands (25 Hz .. 20 kHz), y 0 (8 s ago, far) .. 1 (now, near), z 0..1 = band level
+Point<float> Sand::projF (float x, float y, float z) const
+{
+    const float W = fieldArea.getWidth(), H = fieldArea.getHeight();
+    // little depth, a lot of height: the levels are what must be read
+    const float Zd = 1.5f + (1.0f - y) * 0.8f, near = 1.5f, camH = 1.0f;
+    const float fx = 0.47f * W * near, horizon = -0.6f * H, fy = (H - 4.0f - horizon) * near / camH;
+    return { W * 0.5f + fx * (x - 0.5f) * 2.0f / Zd, horizon + fy * (camH - 0.5f * z) / Zd };
+}
+
+// thresholds brought down to one band (the same -10 log10 (30) as the spectral pp uses): pp, p, mp, mf
+float Sand::planeDb (int k) const
+{
+    const auto& e = proc.engine; const auto& p = e.params();
+    const double off = 10.0 * std::log10 ((double) kB);
+    const double v = k == 0 ? p.target + p.upThr : k == 1 ? p.target + p.llThr : k == 2 ? e.thr1Abs() : e.thr2Abs();
+    return (float) (v - off);
+}
+
+void Sand::analyseBands()
+{
+    const double fs = proc.getSampleRate() > 0 ? proc.getSampleRate() : 48000.0;
+    int n = 16384; while (n < 65536 && n * 48000.0 < 16384.0 * fs * 0.75) n *= 2;
+    if ((int) hann.size() != n)
+    {
+        hann.resize ((size_t) n); fb.resize ((size_t) n);
+        for (int i = 0; i < n; ++i) hann[(size_t) i] = 0.5 - 0.5 * std::cos (2 * MathConstants<double>::pi * i / n);
+    }
+    auto fft = [&] (std::vector<std::complex<double>>& a)
+    {
+        const size_t m = a.size();
+        for (size_t i = 1, j = 0; i < m; ++i) { size_t bit = m >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) std::swap (a[i], a[j]); }
+        for (size_t len = 2; len <= m; len <<= 1)
+        {
+            const std::complex<double> wl (std::cos (-2 * MathConstants<double>::pi / (double) len), std::sin (-2 * MathConstants<double>::pi / (double) len));
+            for (size_t i = 0; i < m; i += len) { std::complex<double> wv (1); for (size_t j = 0; j < len / 2; ++j) { auto u = a[i + j], v = a[i + j + len / 2] * wv; a[i + j] = u + v; a[i + j + len / 2] = u - v; wv *= wl; } }
+        }
+    };
+    // mean square of each band (Hann, Parseval), in dB: a band holding a full-scale sine reads -3 dB
+    auto bands = [&] (std::array<float, kB>& out)
+    {
+        fft (fb);
+        const double norm = 2.0 / ((double) n * (double) n * 0.375);
+        for (int b = 0; b < kB; ++b)
+        {
+            const double fc = 25.0 * std::pow (2.0, b / 3.0), lo = fc * std::pow (2.0, -1.0 / 6.0), hi = fc * std::pow (2.0, 1.0 / 6.0);
+            const int k0 = jmax (1, (int) std::ceil (lo * n / fs)), k1 = jmin (n / 2 - 1, (int) std::floor (hi * n / fs));
+            double sum = 0; for (int k = k0; k <= k1; ++k) sum += std::norm (fb[(size_t) k]);
+            out[(size_t) b] = (float) (10.0 * std::log10 (sum * norm + 1e-14));
+        }
+    };
+    {   // output (what leaves the plugin)
+        const int w = proc.scopeWrite.load (std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) fb[(size_t) i] = proc.scope[(size_t) ((w - n + i) & (DeltaCompProcessor::kScopeSize - 1))] * hann[(size_t) i];
+        bands (nowOut);
+    }
+    {   // input, read back by the latency so it lines up with the output
+        const int w = proc.scopeInWrite.load (std::memory_order_acquire) - jlimit (0, DeltaCompProcessor::kInScope - n - 1, proc.scopeLag.load());
+        for (int i = 0; i < n; ++i) fb[(size_t) i] = proc.scopeIn[(size_t) ((w - n + i) & (DeltaCompProcessor::kInScope - 1))] * hann[(size_t) i];
+        bands (nowIn);
+    }
+    // 8 s of history (every 2nd frame), 30 s for the statistics
+    if ((frame & 1) == 0) { histIn[(size_t) rowHead] = nowIn; histOut[(size_t) rowHead] = nowOut; rowHead = (rowHead + 1) % kRows; ++rowCount; }
+    statIn[(size_t) statHead] = nowIn; statOut[(size_t) statHead] = nowOut; statHead = (statHead + 1) % kStat; statFill = jmin (statFill + 1, kStat);
+    if (frame % 15 == 0 && statFill > 30)
+    {
+        std::vector<float> a ((size_t) statFill), c ((size_t) statFill);
+        for (int b = 0; b < kB; ++b)
+        {
+            int m = 0;
+            for (int i = 0; i < statFill; ++i) if (statIn[(size_t) i][(size_t) b] > -100.0f) { a[(size_t) m] = statIn[(size_t) i][(size_t) b]; c[(size_t) m] = statOut[(size_t) i][(size_t) b]; ++m; }
+            if (m < 10) { p10In[(size_t) b] = p95In[(size_t) b] = p10Out[(size_t) b] = p95Out[(size_t) b] = -200.0f; continue; }
+            auto pct = [&] (std::vector<float>& v, double q) { const auto k = (size_t) jlimit (0, m - 1, (int) (q * (m - 1))); std::nth_element (v.begin(), v.begin() + (long) k, v.begin() + m); return v[k]; };
+            p10In[(size_t) b] = pct (a, 0.10); p95In[(size_t) b] = pct (a, 0.95);
+            p10Out[(size_t) b] = pct (c, 0.10); p95Out[(size_t) b] = pct (c, 0.95);
+        }
+    }
+}
+
+void Sand::renderField()
+{
+    const int W = field.getWidth(), H = field.getHeight();
+    field.clear (field.getBounds());
+    Image::BitmapData bd (field, Image::BitmapData::readWrite);
+    auto put = [&] (int px, int py, PixelARGB c) {
+        if (px < 0 || py < 0 || px >= W || py >= H) return;
+        auto* q = (PixelARGB*) bd.getPixelPointer (px, py);
+        if (c.getAlpha() >= q->getAlpha()) *q = c;
+    };
+    auto hash = [] (unsigned a) { a ^= a >> 16; a *= 0x7feb352dU; a ^= a >> 15; a *= 0x846ca68bU; a ^= a >> 16; return (float) (a & 0xffff) / 65535.0f; };
+    for (int age = kRows - 1; age >= 0; --age)   // far (old) first
+    {
+        const int row = ((rowHead - 1 - age) % kRows + kRows) % kRows;
+        const unsigned id = rowCount - (unsigned) age;
+        const float y = 1.0f - (float) age / (kRows - 1), depth = 0.3f + 0.7f * y;
+        for (int b = 0; b < kB; ++b)
+        {
+            const float li = histIn[(size_t) row][(size_t) b], lo = histOut[(size_t) row][(size_t) b];
+            if (li < -95.0f && lo < -95.0f) continue;
+            const float x = (b + 0.5f) / kB, zi = zOfDb (li), zo = zOfDb (lo);
+            const unsigned key = id * 977u + (unsigned) b * 131u;
+            // the trace: what the processing does to this band right now
+            if (std::abs (lo - li) > 0.5f)
+            {
+                const auto a = projF (x, y, zi), c = projF (x, y, zo);
+                const bool red = lo < li;
+                PixelARGB pc;
+                const uint8 al = (uint8) (150 * depth);
+                pc.setARGB (al, red ? (uint8) 255 : (uint8) 90, red ? (uint8) 70 : (uint8) 170, red ? (uint8) 50 : (uint8) 255);
+                pc.premultiply();
+                const int y0 = (int) jmin (a.y, c.y), y1 = (int) jmax (a.y, c.y);
+                for (int py = y0; py <= y1; ++py) put ((int) a.x, py, pc);
+            }
+            for (int k = 0; k < 3; ++k)   // input: grey grains
+            {
+                const auto p = projF (x + (hash (key + (unsigned) k) - 0.5f) * 0.022f, y, zi + (hash (key + 50u + (unsigned) k) - 0.5f) * 0.012f);
+                PixelARGB c; c.setARGB (255, 95, 95, 95); put ((int) p.x, (int) p.y, c);
+            }
+            for (int k = 0; k < 7; ++k)   // output: white grains, brighter in front
+            {
+                const auto p = projF (x + (hash (key + 100u + (unsigned) k) - 0.5f) * 0.026f, y, zo + (hash (key + 200u + (unsigned) k) - 0.5f) * 0.012f);
+                const uint8 v = (uint8) (140 + 115 * depth);
+                PixelARGB c; c.setARGB (255, v, v, v);
+                put ((int) p.x, (int) p.y, c);
+                if (y > 0.6f) put ((int) p.x + 1, (int) p.y, c);
+                if (y > 0.85f) { put ((int) p.x, (int) p.y + 1, c); put ((int) p.x + 1, (int) p.y + 1, c); }
+            }
+        }
+    }
 }
 
 void Sand::paint (Graphics& g)
@@ -597,44 +733,87 @@ void Sand::paint (Graphics& g)
     g.setColour (kDim); g.drawRect (getLocalBounds().toFloat(), 1.0f);
     const float x0 = 38.0f, xr = W - 150.0f;
 
-    // the plate in perspective: edge, a faint grid, then the sand
+    // behind: the Chladni sand of before, in grey, still reacting to the music
     {
         Graphics::ScopedSaveState ss (g);
-        g.addTransform (AffineTransform::translation (plateArea.getX(), plateArea.getY()));
-        static const char* names[kTiers] = { "pp", "p", "mp mf", "f ff" };
-        for (int t = 0; t < kTiers; ++t)
+        g.setOpacity (0.28f);
+        g.drawImageAt (plate, (int) plateArea.getX(), (int) plateArea.getY(), false);
+    }
+    // the band field: floor grid, threshold planes, then the grains
+    {
+        Graphics::ScopedSaveState ss (g);
+        g.addTransform (AffineTransform::translation (fieldArea.getX(), fieldArea.getY()));
+        g.reduceClipRegion (Rectangle<int> (-70, 0, (int) fieldArea.getWidth() + 80, (int) fieldArea.getHeight() + 30));
+        g.setColour (kFg.withAlpha (0.10f));
+        for (int b = 0; b <= kB; b += 3) g.drawLine (Line<float> (projF ((float) b / kB, 0, 0), projF ((float) b / kB, 1, 0)), 0.6f);
+        for (int j = 0; j <= 8; ++j) g.drawLine (Line<float> (projF (0, j / 8.0f, 0), projF (1, j / 8.0f, 0)), 0.6f);
+        static const char* names[4] = { "pp", "p", "mp", "mf" };
+        for (int k = 0; k < 4; ++k)
         {
-            const float y0 = (float) t / kTiers, y1 = (float) (t + 1) / kTiers, zb = (float) (kTiers - 1 - t) * kStep;
-            Path top; top.startNewSubPath (project (0, y0, zb)); top.lineTo (project (1, y0, zb)); top.lineTo (project (1, y1, zb)); top.lineTo (project (0, y1, zb)); top.closeSubPath();
-            g.setColour (Colour (0xff070707)); g.fillPath (top);
-            g.setColour (kFg.withAlpha (0.05f));
-            for (int k = 1; k < 8; ++k) { const float u = (float) k / 8.0f; g.drawLine (Line<float> (project (u, y0, zb), project (u, y1, zb)), 0.6f); }
-            g.setColour (kFg.withAlpha (0.25f)); g.strokePath (top, PathStrokeType (1.0f));
-            // riser: the front face down to the next terrace (or a slab under the last one)
-            const float zn = t < kTiers - 1 ? zb - kStep : -0.02f;
-            Path face; face.startNewSubPath (project (0, y1, zb)); face.lineTo (project (1, y1, zb)); face.lineTo (project (1, y1, zn)); face.lineTo (project (0, y1, zn)); face.closeSubPath();
-            g.setColour (Colour (0xff1e1e1e)); g.fillPath (face);
-            g.setColour (kFg.withAlpha (0.18f)); g.strokePath (face, PathStrokeType (0.8f));
-            g.setColour (kFg.withAlpha (0.8f));
-            g.setFont (Font (FontOptions (Font::getDefaultSerifFontName(), 16.0f, Font::bold | Font::italic)));
-            const auto lp = project (0, 0.5f * (y0 + y1), zb);
-            g.drawText (names[t], Rectangle<float> (lp.x - 64.0f, lp.y - 9.0f, 58.0f, 18.0f), Justification::centredRight);
+            const float z = zOfDb (planeDb (k));
+            Path pl; pl.startNewSubPath (projF (0, 0, z)); pl.lineTo (projF (1, 0, z)); pl.lineTo (projF (1, 1, z)); pl.lineTo (projF (0, 1, z)); pl.closeSubPath();
+            g.setColour (kFg.withAlpha (0.035f)); g.fillPath (pl);
+            g.setColour (kFg.withAlpha (0.35f)); g.strokePath (pl, PathStrokeType (0.8f));
+            const bool left = (k % 2) == 0;   // labels alternate sides so close thresholds stay readable
+            const auto lp = projF (left ? 0.0f : 1.0f, 1, z);
+            const Rectangle<float> lr (left ? lp.x - 66.0f : lp.x + 8.0f, lp.y - 16.0f, 58.0f, 18.0f);
+            g.setColour (kFg.withAlpha (0.85f));
+            g.setFont (Font (FontOptions (Font::getDefaultSerifFontName(), 17.0f, Font::bold | Font::italic)));
+            g.drawText (names[k], lr, left ? Justification::centredRight : Justification::centredLeft);
+            g.setFont (mono (8.5f)); g.setColour (kGrey);
+            g.drawText (String ((int) std::round (planeDb (k))) + " dB", lr.translated (0, 17).withHeight (11), left ? Justification::centredRight : Justification::centredLeft);
         }
-        // the ceilings, mirror of each terrace: pressed down by gain reduction, lifted by expansion
-        for (int t = 0; t < kTiers; ++t)
+        g.drawImageAt (field, 0, 0, false);
+        g.setFont (mono (8.5f)); g.setColour (kGrey);
+        for (int b = 1; b < kB; b += 3)
         {
-            const float y0 = (float) t / kTiers, y1 = (float) (t + 1) / kTiers, zc = (float) (kTiers - 1 - t) * kStep + ceilH (t);
-            const float gdb = ceilDb[(size_t) t];
-            Path c; c.startNewSubPath (project (0, y0, zc)); c.lineTo (project (1, y0, zc)); c.lineTo (project (1, y1, zc)); c.lineTo (project (0, y1, zc)); c.closeSubPath();
-            g.setColour (kFg.withAlpha (0.035f + 0.05f * jmin (1.0f, std::abs (gdb) / 6.0f))); g.fillPath (c);
-            g.setColour (kFg.withAlpha (std::abs (gdb) > 0.2f ? 0.75f : 0.3f));
-            g.drawLine (Line<float> (project (0, y1, zc), project (1, y1, zc)), std::abs (gdb) > 0.2f ? 1.4f : 0.8f);
-            const auto rp = project (1, y1, zc);
-            g.setFont (mono (9.5f, true));
-            g.drawText ((gdb > 0.05f ? "GE +" : gdb < -0.05f ? "GR " : "") + String (std::abs (gdb) < 0.05f ? 0.0f : gdb, 1), Rectangle<float> (rp.x + 6.0f, rp.y - 7.0f, 64.0f, 14.0f), Justification::centredLeft);
+            static const char* nominal[kB] = { "25", "31", "40", "50", "63", "80", "100", "125", "160", "200", "250", "315", "400", "500", "630", "800",
+                                                "1k", "1.25k", "1.6k", "2k", "2.5k", "3.15k", "4k", "5k", "6.3k", "8k", "10k", "12.5k", "16k", "20k" };
+            const auto p = projF ((b + 0.5f) / kB, 1, 0);
+            g.drawText (nominal[b], Rectangle<float> (p.x - 20, p.y + 2, 40, 11), Justification::centred);
         }
-        g.setColour (kFg);
-        g.drawImageAt (plate, 0, 0, true);
+        const auto pn = projF (1, 1, 0), po = projF (1, 0, 0);
+        g.setFont (mono (8.5f, true)); g.setColour (kFg.withAlpha (0.8f));
+        g.drawText ("MAINTENANT", Rectangle<float> (pn.x - 80, pn.y + 13, 80, 11), Justification::centredRight);
+        g.setColour (kGrey); g.drawText (u8 ("8 s AVANT"), Rectangle<float> (po.x + 4, po.y - 6, 70, 11), Justification::centredLeft);
+        g.setColour (kFg.withAlpha (0.55f)); g.setFont (mono (8.5f));
+        g.drawText (u8 ("GRIS ENTRÉE   BLANC SORTIE   ROUGE RÉDUIT   BLEU REMONTÉ"), Rectangle<float> (0, fieldArea.getHeight() - 12.0f, fieldArea.getWidth(), 11), Justification::centredLeft);
+    }
+    // per-band dynamic range over 30 s (10 % .. 95 %): grey input, white output, dB under every 3rd band
+    {
+        const auto r = rangeArea;
+        auto yb = [&] (float db) { return r.getBottom() - 14.0f - zOfDb (db) * (r.getHeight() - 16.0f); };
+        g.setColour (Colour (0xff050505)); g.fillRect (r.withTrimmedBottom (14.0f));
+        static const char* names[4] = { "pp", "p", "mp", "mf" };
+        for (int k = 0; k < 4; ++k)
+        {
+            const float yy = yb (planeDb (k));
+            g.setColour (kFg.withAlpha (0.18f)); g.drawHorizontalLine ((int) yy, r.getX(), r.getRight());
+            g.setColour (kFg.withAlpha (0.7f));
+            g.setFont (Font (FontOptions (Font::getDefaultSerifFontName(), 12.0f, Font::bold | Font::italic)));
+            if (k % 2 == 0) g.drawText (names[k], Rectangle<float> (r.getX() - 40.0f, yy - 7.0f, 34.0f, 14.0f), Justification::centredRight);
+            else            g.drawText (names[k], Rectangle<float> (r.getRight() + 4.0f, yy - 7.0f, 34.0f, 14.0f), Justification::centredLeft);
+        }
+        const float bw = r.getWidth() / kB;
+        for (int b = 0; b < kB; ++b)
+        {
+            const float cx = r.getX() + bw * (b + 0.5f);
+            if (p95In[(size_t) b] > -150.0f)
+            {
+                g.setColour (Colour (0xff5a5a5a));
+                g.fillRect (Rectangle<float>::leftTopRightBottom (cx - bw * 0.34f, yb (p95In[(size_t) b]), cx - bw * 0.04f, jmax (yb (p95In[(size_t) b]) + 1.0f, yb (p10In[(size_t) b]))));
+                g.setColour (kFg);
+                g.fillRect (Rectangle<float>::leftTopRightBottom (cx + bw * 0.04f, yb (p95Out[(size_t) b]), cx + bw * 0.34f, jmax (yb (p95Out[(size_t) b]) + 1.0f, yb (p10Out[(size_t) b]))));
+                if (b % 3 == 1)
+                {
+                    g.setFont (mono (8.5f, true)); g.setColour (kFg.withAlpha (0.8f));
+                    g.drawText (String ((int) std::round (p95In[(size_t) b] - p10In[(size_t) b])) + ">" + String ((int) std::round (p95Out[(size_t) b] - p10Out[(size_t) b])),
+                                Rectangle<float> (cx - 30, r.getBottom() - 12.0f, 60, 11), Justification::centred);
+                }
+            }
+        }
+        g.setFont (mono (8.5f, true)); g.setColour (kFg.withAlpha (0.6f));
+        g.drawText (u8 ("PLAGE DYNAMIQUE PAR BANDE, 30 s (dB, entrée > sortie)"), Rectangle<float> (r.getX(), r.getY() - 13.0f, r.getWidth(), 11), Justification::centredLeft);
     }
     g.setColour (kFg); g.setFont (mono (12.0f, true));
     g.drawText ("DELTA COMP", 12, 5, 200, 16, Justification::centredLeft);
@@ -1215,8 +1394,6 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
     auto db = [] (float v) { return (v > 0.05f ? "+" : "") + String (v, 1) + " dB"; };
     auto& e = p.engine;
 
-    add (row1, new ui::Section (s, "TRANSITOIRES", "trOn", 2, { { K::knob, "transient", "ROND / ATT." }, { K::knob, "trDur", "DURÉE" }, { K::choice, "trTarget", "SUR" } }),
-         [&e, db] { return db (e.meterT.load()); });
     add (row1, new ui::Section (s, "UPWARD", "upOn", 2, { { K::knob, "upThr", "SEUIL" }, { K::knob, "upRatio", "RATIO" }, { K::knob, "upRange", "PLAGE" },
                                                                   { K::knob, "upAtt", "ATTAQUE" }, { K::knob, "upRel", "RELEASE" }, { K::choice, "upMode", "MODE" } }),
          [&e, db] { return db (e.meterA.load()); });
@@ -1243,6 +1420,9 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
                                                             { K::knob, "ambTr", "TRANSITOIRES" }, { K::choice, "ambAuto", "AUTO RÉFL." }, { K::choice, "ambStage", "APRÈS" },
                                                             { K::toggle, "kstOn", "K-STEREO" } }),
          [&e, db] { return db (e.meterAmb.load()) + ui::u8 ("  réfl. ") + String (roundToInt (e.meterEr.load())) + " ms"; });
+    // transient shaper: at the end of the dynamics, after K-Stereo (as in the signal path)
+    add (row2, new ui::Section (s, "TRANSITOIRES", "trOn", 3, { { K::knob, "transient", "ROND / ATT." }, { K::knob, "trDur", "DURÉE" }, { K::choice, "trTarget", "SUR" } }),
+         [&e, db] { return db (e.meterT.load()); });
     // INSERT: a plain VST3/AU insert (Altiverb or anything), independent of the ambiance, on Mid, Side or L/R
     add (row2, new ui::Section (s, "INSERT", "revOn", 2, { { K::choice, "revTarget", "SUR" } }),
          [this] { auto n = proc.insertName(); return n.isEmpty() ? String ("VIDE") : n.toUpperCase(); });
@@ -1280,7 +1460,7 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
                                                           { K::choice, "listen", "ÉCOUTE" } }),
          [&e, db] { return "GAIN AUTO " + db (e.meterMakeup.load()) + "  DENSITY " + db (e.meterDensity.load()); });
 
-    row1[1]->marking = "pp"; row1[2]->marking = "p"; row1[3]->marking = "mp mf"; row1[4]->marking = "f ff";
+    row1[0]->marking = "pp"; row1[1]->marking = "p"; row1[2]->marking = "mp mf"; row1[3]->marking = "f ff";
     setResizable (true, true);
     setResizeLimits (kW / 2, kH / 2, kW * 3 / 2, kH * 3 / 2);
     if (auto* c = getConstrainer()) c->setFixedAspectRatio ((double) kW / kH);
