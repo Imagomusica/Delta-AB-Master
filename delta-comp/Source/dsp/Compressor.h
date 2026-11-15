@@ -553,7 +553,7 @@ struct Params
     // T transient shaper (Bittersweet spirit): -1 rounds the attacks off, +1 accentuates them
     double transient = 0.0; double trDurMs = 30.0; int trTarget = 0;   // 0 stereo, 1 mid, 2 side
     // A upward low level
-    bool upOn = true;  bool upSpectral = true;  double upThr = -14, upRatio = 1.5, upRange = 4, upAtt = 50, upRel = 600;
+    bool upOn = true;  bool upSpectral = false;  double upThr = -14, upRatio = 1.5, upRange = 4, upAtt = 50, upRel = 600;
     // B downward low level (gentle, capped by range)
     bool llOn = false; double llThr = -24, llRatio = 1.5, llRange = 3, llAtt = 30, llRel = 400;
     // C downward, double threshold

@@ -53,7 +53,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     fl ("trDur",   "Durée",              5.f, 200.f,  30.f, 1.f, 30.f,   "ms", 0);
     // A upward low level
     bo ("upOn",    "Upward actif",     true);
-    ch ("upMode",  "Upward mode",      { "SPECTRAL", "LARGE" }, 0);
+    ch ("upMode",  "Upward mode",      { "SPECTRAL", "LARGE" }, 1);   // broadband by default (purist)
     fl ("upThr",   "Upward seuil",     -74.f,   0.f, -22.f, 0.1f, 0,     "LU", 1);
     fl ("upRatio", "Upward ratio",       1.f,   4.f,  2.0f, 0.01f, 1.8f, ":1", 2);
     fl ("upRange", "Upward plage",       0.f,  18.f,   6.f, 0.1f, 0,     "dB", 1);
