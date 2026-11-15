@@ -77,6 +77,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     fl ("ratio2",  "Ratio 2",            1.f,  20.f,   4.f, 0.01f, 4.f,  ":1", 2);
     fl ("att2",    "Attaque 2",        0.1f, 500.f,  10.f, 0.1f, 30.f,   "ms", 1);
     fl ("rel2",    "Release 2",         10.f, 5000.f, 800.f, 1.f, 300.f, "ms", 0);
+    fl ("character", "Comp / Lim",       0.f, 100.f,   0.f, 1.f, 0,      "%", 0);
+    bo ("scOn",    "Sidechain filtres", false);
+    fl ("scHp",    "Sidechain passe-haut", 0.f, 1000.f, 80.f, 1.f, 150.f, "Hz", 0);   // 0 = OFF
+    fl ("scLp",    "Sidechain passe-bas", 1000.f, 20000.f, 20000.f, 1.f, 6000.f, "Hz", 0);   // 20000 = OFF
+    ch ("scSlope", "Sidechain pente",  { "6", "12", "18", "24", "36", "48" }, 1);
+    ch ("listen",  "Écoute",           { "NORM", "DIFF" }, 0);
     fl ("hyst",    "Hystérésis",         0.f,   6.f,   0.f, 0.1f, 0,     "dB", 1);
     // D peak
     bo ("pkOn",    "Peak actif",       true);
@@ -112,7 +118,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     ch ("centreFilter", "Filtre centre", { "LARGE", "GRAVE", "AIGU", "CLOCHE" }, 0);
     fl ("centreFreq", "Fréquence centre", 20.f, 20000.f, 1000.f, 1.f, 1000.f, "Hz", 0);
     fl ("sideLowCut", "Low cut side",    0.f, 300.f,   0.f, 1.f, 0,      "Hz", -1);   // 0 = OFF
-    ch ("sideSlope", "Pente",          { "6", "12", "24" }, 1);
+    ch ("sideSlope", "Pente",          { "6", "12", "18", "24", "36", "48" }, 1);
+    fl ("centreQ",  "Q centre",        0.2f, 10.f, 0.71f, 0.01f, 1.f, "", 2);
+    ch ("msPhase",  "Phase M/S",       { "LIN", "MIN" }, 0);
     bo ("revOn",   "Insert actif",            false);
     ch ("revTarget","Insert sur",      { "MID", "SIDE", "L+R" }, 1);
     // E limiter
@@ -151,7 +159,10 @@ dcomp::Params DeltaCompProcessor::currentParams() const
     p.ambOn = pb ("ambOn"); p.ambiance = pv ("ambiance") * 0.01; p.ambThr = pv ("ambThr"); p.ambRatio = pv ("ambRatio");
     p.ambAtt = pv ("ambAtt"); p.ambRel = pv ("ambRel"); p.ambAuto = pb ("ambAuto"); p.ambPreMs = pv ("ambPre"); p.ambTr = pv ("ambTr") * 0.01; p.ambStage = pi ("ambStage") + 1;
     p.widthDb = pv ("width"); p.centreDb = pv ("centre"); p.centreFilter = pi ("centreFilter"); p.centreFreq = pv ("centreFreq");
-    p.sideLowCut = pv ("sideLowCut"); p.sideSlope = pi ("sideSlope") == 0 ? 6 : pi ("sideSlope") == 1 ? 12 : 24;
+    p.sideLowCut = pv ("sideLowCut"); { static const int sl[] = { 6, 12, 18, 24, 36, 48 }; p.sideSlope = sl[juce::jlimit (0, 5, pi ("sideSlope"))]; }
+    p.character = pv ("character") * 0.01; p.scOn = pb ("scOn"); p.scHp = pv ("scHp"); p.scLp = pv ("scLp");
+    { static const int sl[] = { 6, 12, 18, 24, 36, 48 }; p.scSlope = sl[juce::jlimit (0, 5, pi ("scSlope"))]; }
+    p.centreQ = pv ("centreQ"); p.msMin = pi ("msPhase") == 1;
     p.revOn = pb ("revOn"); p.revTarget = pi ("revTarget");
     p.limOn = pb ("limOn"); p.ceiling = pv ("ceiling"); p.limRel = pv ("limRel"); p.lookMs = pv ("look");
     p.os = dcomp::Oversampler::kFactors[std::clamp (pi ("os"), 0, dcomp::Oversampler::kNumF - 1)]; p.truePeak = pb ("truePeak"); p.osCut = pv ("osCut") * 1000.0; p.osSteep = pv ("osSteep") * 0.01; p.osPre = pv ("osPre") * 0.01; p.linkT = pv ("linkT") * 0.01; p.linkR = pv ("linkR") * 0.01;
@@ -163,7 +174,7 @@ void DeltaCompProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     sr = sampleRate; blockSize = juce::jmax (samplesPerBlock, dcomp::Engine::maxInsertBlock());
     for (auto& r : dryRing) r.assign ((size_t) (6 * sampleRate) + (size_t) samplesPerBlock + 16, 0.0);
     for (auto& r : lookRing) r.assign ((size_t) (0.25 * sampleRate) + 16, 0.0);
-    lookW = 0; meterLook = wantedMeterLook(); lookFadeState = 0; lookFade = 1.0;
+    lookW = 0; meterLook = wantedMeterLook(); lookFadeState = 0; lookFade = 1.0; listenMix = 0;
     dryW = 0; bypassMix = pb ("active") ? 0.0 : 1.0; bypassK = std::exp (-1.0 / (0.02 * sampleRate));
     engine.prepare (sampleRate, juce::jmax (1, getTotalNumInputChannels()));
     engine.setParams (currentParams());
@@ -286,6 +297,20 @@ void DeltaCompProcessor::processAny (juce::AudioBuffer<T>& b)
             }
     }
     engine.process (b.getArrayOfWritePointers(), ch, b.getNumSamples());
+    {   // DIFFÉRENCE: only what the processing changes (input, level-matched by the input gain, minus output), 20 ms glide
+        const double lt = pi ("listen") == 1 ? 1.0 : 0.0;
+        if (lt > 0.0 || listenMix > 1e-9)
+            for (int i = 0; i < b.getNumSamples(); ++i)
+            {
+                listenMix = lt + bypassK * (listenMix - lt);
+                const int rd = ((dryW + i - juce::jmin (total, R - 1)) % R + R) % R;
+                for (int c = 0; c < juce::jmin (ch, 2); ++c)
+                {
+                    const double wet = (double) b.getSample (c, i), d = dryRing[(size_t) c][(size_t) rd] * inGain - wet;
+                    b.setSample (c, i, (T) (wet + listenMix * (d - wet)));
+                }
+            }
+    }
     const double want = pb ("active") ? 0.0 : 1.0;
     if (want != 0.0 || bypassMix > 1e-9)
         for (int i = 0; i < b.getNumSamples(); ++i)

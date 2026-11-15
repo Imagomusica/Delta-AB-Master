@@ -18,7 +18,7 @@ static Params neutral()
 // Stereo sine for `seconds`, returns output RMS (peak-equivalent dB) over the last 0.5 s.
 static double runSine (Engine& e, double fs, double ampDb, double seconds, double freq = 997.0)
 {
-    const int n = (int) (seconds * fs), blk = 512, tail = (int) (0.5 * fs);
+    const int n = (int) (seconds * fs) + e.latency(), blk = 512, tail = (int) (0.5 * fs);   // the latency does not eat the measured time
     std::vector<double> l (blk), r (blk);
     double* io[2] = { l.data(), r.data() };
     const double a = dbToLin (ampDb);
@@ -110,12 +110,12 @@ int main()
     }
     {   // transparency, latency
         Engine e; e.prepare (fs, 2); e.setParams (neutral()); e.reset();
-        std::vector<double> l (32768, 0.0), r (32768, 0.0); l[0] = 0.5; r[0] = -0.25;
+        std::vector<double> l (65536, 0.0), r (65536, 0.0); l[0] = 0.5; r[0] = -0.25;
         double* io[2] = { l.data(), r.data() };
-        e.process (io, 2, 32768);
+        e.process (io, 2, 65536);
         double err = 0;
-        for (int i = 0; i < 32768; ++i) if (i != e.latency()) err = std::max (err, std::abs (l[(size_t) i]) + std::abs (r[(size_t) i]));
-        check (e.latency() > 256 && e.latency() < 16000, "latency at 48 kHz: look-ahead + gain FIR, constant", e.latency());
+        for (int i = 0; i < 65536; ++i) if (i != e.latency()) err = std::max (err, std::abs (l[(size_t) i]) + std::abs (r[(size_t) i]));
+        check (e.latency() > 256 && e.latency() < 60000, "latency at 48 kHz: look-ahead + gain FIR, constant", e.latency());
         err = std::max ({ err, std::abs (l[(size_t) e.latency()] - 0.5), std::abs (r[(size_t) e.latency()] + 0.25) });
         check (err < 1e-12, "all stages off: transparent (< -240 dB error), delayed by latency()", err);
     }
@@ -125,10 +125,10 @@ int main()
         const double out = runSine (e, fs, -6, 1, 1000);
         char msg[96]; std::snprintf (msg, sizeof msg, "oversampling %dx: 1 kHz passes at unity (+-0.05 dB)", f);
         check (std::abs (out + 6) < 0.05, msg, out);
-        std::vector<double> l (32768, 0.0), r (32768, 0.0); l[0] = 1;
+        std::vector<double> l (65536, 0.0), r (65536, 0.0); l[0] = 1;
         double* io[2] = { l.data(), r.data() };
-        e.process (io, 2, 32768);
-        int pk = 0; for (int i = 0; i < 32768; ++i) if (std::abs (l[(size_t) i]) > std::abs (l[(size_t) pk])) pk = i;
+        e.process (io, 2, 65536);
+        int pk = 0; for (int i = 0; i < 65536; ++i) if (std::abs (l[(size_t) i]) > std::abs (l[(size_t) pk])) pk = i;
         std::snprintf (msg, sizeof msg, "oversampling %dx: impulse peak at latency()", f);
         check (pk == e.latency(), msg, pk);
     }
@@ -312,7 +312,7 @@ int main()
             Fake fk; Engine e; e.prepare (fs, 2); e.setInsert (&Fake::run, &fk);
             Params p = neutral(); p.revOn = true; p.revTarget = target; e.setParams (p); e.reset();
             std::mt19937 rng (5); std::normal_distribution<double> nd (0, 1);
-            const int n = (int) fs;
+            const int n = (int) fs + e.latency();
             std::vector<double> l ((size_t) n), r ((size_t) n), mono ((size_t) n), side ((size_t) n);
             for (int i = 0; i < n; ++i) { l[(size_t) i] = 0.2 * nd (rng); r[(size_t) i] = 0.2 * nd (rng); mono[(size_t) i] = l[(size_t) i] + r[(size_t) i]; side[(size_t) i] = l[(size_t) i] - r[(size_t) i]; }
             for (int s0 = 0; s0 < n; s0 += 1000) { double* io[2] = { &l[(size_t) s0], &r[(size_t) s0] }; e.process (io, 2, std::min (1000, n - s0)); }
@@ -359,10 +359,10 @@ int main()
         const double out = runSine (e, fs, -12, 1);
         check (std::abs (out + 10.5) < 0.02, "centre +1.5 dB (broadband) on a mono sine", out);
         Engine e2; e2.prepare (fs, 2); p = neutral(); p.sideLowCut = 120; p.sideSlope = 24; e2.setParams (p);
-        const int n = (int) fs; std::vector<double> l ((size_t) n), r ((size_t) n);
+        const int n = (int) fs + e2.latency(); std::vector<double> l ((size_t) n), r ((size_t) n);
         for (int i = 0; i < n; ++i) { const double s = 0.25 * std::sin (2 * kPi * 40 * i / fs); l[(size_t) i] = s; r[(size_t) i] = -s; }
         for (int s = 0; s < n; s += 512) { double* io[2] = { &l[(size_t) s], &r[(size_t) s] }; e2.process (io, 2, std::min (512, n - s)); }
-        double pk = 0; for (int i = n / 2; i < n; ++i) pk = std::max (pk, std::abs (l[(size_t) i]));
+        double pk = 0; for (int i = n - (int) (0.5 * fs); i < n; ++i) pk = std::max (pk, std::abs (l[(size_t) i]));
         check (linToDb (pk / 0.25) < -30, "side low cut 120 Hz 24 dB/oct: 40 Hz side down > 30 dB", linToDb (pk / 0.25));
         Engine e3; e3.prepare (fs, 2); p = neutral(); p.centreDb = 3; p.centreFilter = 1; p.centreFreq = 200; e3.setParams (p);
         const double lo = runSine (e3, fs, -12, 1, 50), hi = runSine (e3, fs, -12, 1, 5000);
@@ -432,7 +432,7 @@ int main()
         auto firstMs = [&] (int f) {
             Engine e; e.prepare (fs, 2); Params p = neutral(); p.pkOn = true; p.pkCrest = false; p.pkThr = -20; p.pkRatio = 20; p.pkAtt = 0.05; p.pkRel = 50; p.os = f;
             e.setParams (p); e.reset();
-            const int n = (int) (1.0 * fs), t0 = (int) (0.25 * fs);
+            const int t0 = (int) (0.25 * fs), n = t0 + (int) (0.5 * fs) + e.latency();
             std::vector<double> l ((size_t) n, 0.0), r;
             for (int i = t0; i < n; ++i) l[(size_t) i] = 0.5 * std::sin (2 * kPi * 3000 * (i - t0) / fs);
             r = l; double* io[2] = { l.data(), r.data() };
@@ -448,7 +448,7 @@ int main()
     {   // tilt: exact magnitude in linear and minimum phase; Mid or Side alone leaves the other untouched
         for (int mp = 0; mp < 2; ++mp)
         {
-            TiltEq t; t.prepare (fs); t.design (t.H[1], 1.5, 1000.0, mp == 1);
+            TiltEq t; t.prepare (fs); t.design (t.H[0][1], 1.5, 1000.0, mp == 1);
             const auto& h = t.lastTaps();
             double worst = 0;
             for (double f : { 30.0, 100.0, 440.0, 1000.0, 3000.0, 10000.0, 18000.0 })
@@ -467,9 +467,75 @@ int main()
         {
             double v[2] = { in[(size_t) i], in[(size_t) i] };   // mono: all Mid
             t.process (v, 2);
-            if (i > 20000) err = std::max (err, std::abs (v[0] - in[(size_t) (i - TiltEq::latency())]));
+            if (i > 20000) err = std::max (err, std::abs (v[0] - in[(size_t) (i - t.latency())]));
         }
         check (err < 1e-12, "tilt on SIDE: a mono (Mid) signal comes out only delayed", err);
+    }
+    {   // M/S filters (Dune quality): exact analog magnitude, linear or common minimum phase
+        auto mag = [&] (const std::vector<double>& h, double f) {
+            std::complex<double> H (0);
+            for (size_t n = 0; n < h.size(); ++n) H += h[n] * std::polar (1.0, -2 * kPi * f * (double) n / fs);
+            return std::abs (H);
+        };
+        for (int mp = 0; mp < 2; ++mp)
+        {
+            FirEq q { 1024, 64, true }; q.prepare (fs);
+            EqSpec sp; sp.kind = 1; sp.cType = 3; sp.cFreq = 2500; sp.cDb = 4; sp.cQ = 1.5; sp.hpFreq = 100; sp.hpOrder = 4; sp.minPhase = mp == 1;
+            std::vector<std::complex<double>> a, b; q.design (sp, a, b, q.sA);
+            double wm = 0, ws = 0;
+            for (double f : { 40.0, 100.0, 200.0, 1000.0, 2500.0, 6000.0, 18000.0, 22000.0 })
+            {
+                wm = std::max (wm, std::abs (linToDb (mag (q.sA.tapsM, f)) - sp.magDb (0, f)));
+                if (sp.magDb (1, f) > -24) ws = std::max (ws, std::abs (linToDb (mag (q.sA.tapsS, f)) - sp.magDb (1, f)));
+            }
+            check (wm < 0.01, mp ? "centre bell min phase: magnitude = analog within 0.01 dB up to 22 kHz" : "centre bell linear: magnitude = analog within 0.01 dB up to 22 kHz", wm);
+            check (ws < 0.01, mp ? "side low cut 100 Hz 24 dB/oct min phase: = analog within 0.01 dB (down to -24 dB)" : "side low cut 100 Hz 24 dB/oct linear: = analog within 0.01 dB (down to -24 dB)", ws);
+            check (std::abs (sp.magDb (1, 100.0) + 3.0103) < 1e-6, "side low cut: -3 dB at the cutoff (Butterworth)", sp.magDb (1, 100.0));
+            if (mp == 1)
+            {   // Mid and Side share one phase: the image does not move
+                double worst = 0;
+                for (double f : { 300.0, 1000.0, 5000.0 })
+                {
+                    std::complex<double> HM (0), HS (0);
+                    for (size_t n = 0; n < q.sA.tapsM.size(); ++n) { const auto w = std::polar (1.0, -2 * kPi * f * (double) n / fs); HM += q.sA.tapsM[n] * w; HS += q.sA.tapsS[n] * w; }
+                    double d = std::abs (std::arg (HM) - std::arg (HS)); d = std::min (d, 2 * kPi - d);
+                    worst = std::max (worst, d * 180 / kPi);
+                }
+                check (worst < 0.5, "min phase: Mid and Side phase identical (degrees) 300 Hz..5 kHz", worst);
+            }
+        }
+    }
+    {   // sidechain filters: matched magnitude, no cramping near Nyquist
+        double worst = 0;
+        for (int ord : { 1, 2, 3, 4, 8 })
+            for (double fc : { 80.0, 1000.0, 15000.0 })
+                for (int hp = 0; hp < 2; ++hp)
+                {
+                    ScFilter f; f.design (fs, hp ? fc : 0.0, hp ? 0.0 : fc, ord);
+                    for (double fr : { 0.5 * fc, fc, 2.0 * fc })
+                    {
+                        if (fr > 0.45 * fs) continue;
+                        std::complex<double> H (1);
+                        const auto z = std::polar (1.0, -2 * kPi * fr / fs);
+                        for (int i = 0; i < f.ns; ++i) { const auto& b = f.sec[(size_t) i]; H *= (b.b0 + b.b1 * z + b.b2 * z * z) / (1.0 + b.a1 * z + b.a2 * z * z); }
+                        const double w = std::pow (hp ? fr / fc : fc / fr, 2.0 * ord), want = 10 * std::log10 (w / (1 + w));
+                        if (want > -40) worst = std::max (worst, std::abs (linToDb (std::abs (H)) - want));
+                    }
+                }
+        check (worst < 0.25, "sidechain HP/LP 6..48 dB/oct: within 0.25 dB of analog (dB, down to -40 dB)", worst);
+        // a sidechain high-pass at 300 Hz stops a 50 Hz bass from pumping the double threshold
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.dnOn = true; p.thr1 = -20; p.ratio1 = 4; e.setParams (p);
+        const double a = runSine (e, fs, -10, 2, 50);
+        Engine e2; e2.prepare (fs, 2); p.scOn = true; p.scHp = 300; p.scSlope = 24; e2.setParams (p);
+        const double b = runSine (e2, fs, -10, 2, 50);
+        check (b - a > 3, "sidechain HP 300 Hz: 50 Hz bass compressed much less (dB more)", b - a);
+    }
+    {   // COMP / LIM: at 100 % the double threshold holds the level near the threshold
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.dnOn = true; p.thr1 = -20; p.ratio1 = 2; p.ratio2 = 2; p.thr2 = 18; e.setParams (p);
+        const double a = runSine (e, fs, -6, 2);
+        Engine e2; e2.prepare (fs, 2); p.character = 1.0; e2.setParams (p);
+        const double b = runSine (e2, fs, -6, 2);
+        check (a - b > 2, "COMP/LIM 100 %: more reduction than 2:1 (dB)", a - b);
     }
     std::printf (fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails ? 1 : 0;

@@ -1228,7 +1228,8 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
     add (row1, new ui::Section (s, "DOUBLE SEUIL", "dnOn", 4,
                                 { { K::knob, "thr1", "SEUIL mp" }, { K::knob, "ratio1", "RATIO 1" }, { K::knob, "att1", "ATTAQUE 1" }, { K::knob, "rel1", "RELEASE 1" },
                                   { K::knob, "thr2", "SEUIL mf" }, { K::knob, "ratio2", "RATIO 2" }, { K::knob, "att2", "ATTAQUE 2" }, { K::knob, "rel2", "RELEASE 2" },
-                                  { K::knob, "hyst", "HYSTÉRÉSIS" }, { K::knob, "knee", "GENOU" }, { K::knob, "window", "FENÊTRE" }, { K::choice, "opto", "DÉTECTION" } }),
+                                  { K::knob, "hyst", "HYSTÉRÉSIS" }, { K::knob, "knee", "GENOU" }, { K::knob, "window", "FENÊTRE" }, { K::choice, "opto", "DÉTECTION" },
+                                  { K::knob, "character", "COMP / LIM" } }),
          [&e, db] { return db (e.meterC.load()); });
     row1.getLast()->gain = [&e] { return e.meterC.load(); }; row1.getLast()->range = 20;
     add (row1, new ui::Section (s, "PEAK", "pkOn", 2, { { K::knob, "pkThr", "SEUIL" }, { K::knob, "pkRatio", "RATIO" },
@@ -1250,15 +1251,18 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
         ins->extra = &insertSlot; ins->extraCell = 2; ins->extraSpan = 2;
         ins->addAndMakeVisible (insertSlot);
     }
-    add (row2, new ui::Section (s, "M/S", "msOn", 3, { { K::knob, "centre", "CENTRE" }, { K::knob, "centreFreq", "FRÉQ." }, { K::choice, "centreFilter", "FILTRE" },
+    add (row2, new ui::Section (s, "M/S", "msOn", 4, { { K::knob, "centre", "CENTRE" }, { K::knob, "centreFreq", "FRÉQ." }, { K::knob, "centreQ", "Q" },
+                                                       { K::choice, "centreFilter", "FILTRE" },
                                                        { K::knob, "width", "LARGEUR" }, { K::knob, "sideLowCut", "LOW CUT S" },
-                                                       { K::choice, "sideSlope", "PENTE dB/oct" } }),
+                                                       { K::choice, "sideSlope", "PENTE dB/oct" }, { K::choice, "msPhase", "PHASE" } }),
          [] { return String ("CENTRE / LARGEUR"); });
     add (row2, new ui::Section (s, "LIMITEUR", "limOn", 3, { { K::knob, "ceiling", "PLAFOND" }, { K::knob, "limRel", "RELEASE" }, { K::knob, "look", "LOOKAHEAD" },
                                                             { K::knob, "linkT", "LIEN TRANS." }, { K::knob, "linkR", "LIEN REL." },
                                                             { K::choice, "truePeak", "TRUE PEAK" } }),
          [&e, db] { return db (e.meterLim.load()); });
     row2.getLast()->hairpin = [&e] { const float i = e.meterIn.load(), o = e.meterOut.load(); return i > -70.0f && o > -70.0f ? o - i : 0.0f; };
+    add (row1, new ui::Section (s, "SIDECHAIN", "scOn", 2, { { K::knob, "scHp", "PASSE-HAUT" }, { K::knob, "scLp", "PASSE-BAS" }, { K::choice, "scSlope", "PENTE dB/oct" } }),
+         [] { return String::fromUTF8 ("DÉTECTEURS"); });
     add (row1, new ui::Section (s, "TILT", "tiltOn", 2, { { K::knob, "tilt", "GRAVE / AIGU" }, { K::knob, "tiltPivot", "PIVOT" },
                                                          { K::choice, "tiltPhase", "PHASE" }, { K::choice, "tiltTarget", "SUR" }, { K::choice, "tiltPos", "POSITION" } }),
          [this] { return ui::u8 (proc.apvts.getRawParameterValue ("tiltPhase")->load() > 0.5f ? "MIN PHASE" : "LINÉAIRE"); });
@@ -1272,7 +1276,8 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
         o->addAndMakeVisible (osView);
     }
     add (row2, new ui::Section (s, "GLOBAL", "active", 4, { { K::knob, "in", "ENTRÉE" }, { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
-                                                          { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::choice, "autoGain", "GAIN AUTO" }, { K::choice, "meterLook", "AVANCE NAGRA" } }),
+                                                          { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::choice, "autoGain", "GAIN AUTO" }, { K::choice, "meterLook", "AVANCE NAGRA" },
+                                                          { K::choice, "listen", "ÉCOUTE" } }),
          [&e, db] { return "GAIN AUTO " + db (e.meterMakeup.load()) + "  DENSITY " + db (e.meterDensity.load()); });
 
     row1[1]->marking = "pp"; row1[2]->marking = "p"; row1[3]->marking = "mp mf"; row1[4]->marking = "f ff";

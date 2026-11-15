@@ -77,6 +77,64 @@ struct Biquad
     }
 };
 
+// Sidechain filter: Butterworth high-pass and low-pass of any order (6..48 dB/oct), each 2nd-order section matched
+// to the analog magnitude (Vicanek, "Matched Second Order Digital Filters", 2016), 1st-order sections matched at DC
+// and Nyquist. Zero latency: it only feeds the detectors, the audio never goes through it.
+struct ScFilter
+{
+    std::array<Biquad, 8> sec; int ns = 0;
+    double fHp = -1, fLp = -1; int ord = -1;
+    static void matched2 (Biquad& b, double fs, double f, double q, bool hp)
+    {
+        const double w0 = 2 * kPi * f / fs, z = 1 / (2 * q);
+        const double e = std::exp (-z * w0);
+        b.a1 = z <= 1 ? -2 * e * std::cos (std::sqrt (1 - z * z) * w0) : -2 * e * std::cosh (std::sqrt (z * z - 1) * w0);
+        b.a2 = std::exp (-2 * z * w0);
+        const double A0 = (1 + b.a1 + b.a2) * (1 + b.a1 + b.a2), A1 = (1 - b.a1 + b.a2) * (1 - b.a1 + b.a2), A2 = -4 * b.a2;
+        const double s2 = std::sin (w0 / 2) * std::sin (w0 / 2), p0 = 1 - s2, p1 = s2, p2 = 4 * p0 * p1;
+        if (hp)
+        {
+            b.b0 = std::sqrt (std::max (0.0, A0 * p0 + A1 * p1 + A2 * p2)) * q / (4 * p1); b.b1 = -2 * b.b0; b.b2 = b.b0;
+        }
+        else
+        {
+            const double R1 = (A0 * p0 + A1 * p1 + A2 * p2) * q * q, B0 = A0, B1 = std::max (0.0, (R1 - B0 * p0) / p1);
+            b.b0 = 0.5 * (std::sqrt (B0) + std::sqrt (B1)); b.b1 = std::sqrt (B0) - b.b0; b.b2 = 0;
+        }
+    }
+    // one pole matched (impulse invariant), zeros chosen so the magnitude is exact at DC and at the cutoff (-3 dB)
+    static void matched1 (Biquad& b, double fs, double f, bool hp)
+    {
+        const double w0 = 2 * kPi * f / fs, p = std::exp (-w0), ph = std::sin (w0 / 2) * std::sin (w0 / 2);
+        const double A2 = (1 - p) * (1 - p) + 4 * p * ph;   // |1 - p e^-jw0|^2
+        b.a1 = -p; b.a2 = 0; b.b2 = 0;
+        if (hp) { b.b0 = std::sqrt (0.5 * A2 / (4 * ph)); b.b1 = -b.b0; return; }
+        const double S = 1 - p, Pr = (S * S - 0.5 * A2) / (4 * ph), d = S * S - 4 * Pr;
+        if (d >= 0) { b.b0 = 0.5 * (S + std::sqrt (d)); b.b1 = S - b.b0; }
+        else { const double r = 0.5 * fs / f, hn = 1.0 / std::sqrt (1 + r * r), n = (1 + p) * hn; b.b0 = 0.5 * (S + n); b.b1 = 0.5 * (S - n); }
+    }
+    void design (double fs, double hpF, double lpF, int order)
+    {
+        if (hpF == fHp && lpF == fLp && order == ord) return;
+        const bool topo = (hpF > 0) != (fHp > 0) || (lpF > 0) != (fLp > 0) || order != ord;
+        fHp = hpF; fLp = lpF; ord = order; ns = 0;
+        auto add = [&] (double f, bool hp)
+        {
+            if (f <= 0) return;
+            for (int k = 1; k <= order / 2; ++k)
+            {
+                const double th = kPi * (2 * k + order - 1) / (2.0 * order);
+                matched2 (sec[(size_t) ns++], fs, f, -1.0 / (2 * std::cos (th)), hp);
+            }
+            if (order % 2) matched1 (sec[(size_t) ns++], fs, f, hp);
+        };
+        add (std::min (hpF, 0.45 * fs), true); add (std::min (lpF, 0.49 * fs), false);
+        if (topo) for (auto& b : sec) b.reset();
+    }
+    double process (double x) { for (int i = 0; i < ns; ++i) x = sec[(size_t) i].process (x); return x; }
+    void reset() { for (auto& b : sec) b.reset(); }
+};
+
 // BS.1770 K-weighting (high shelf + RLB high-pass) for any sample rate.
 struct KWeighting
 {
@@ -502,6 +560,8 @@ struct Params
     bool dnOn = true;  bool opto = false, variMu = false;
     double thr1 = 0, ratio1 = 1.5, att1 = 30, rel1 = 300;
     double thr2 = 4, ratio2 = 4,   att2 = 10, rel2 = 150;
+    double character = 0;      // COMP/LIM on the double threshold: 0 = compressor .. 1 = limiter (ratio to infinity, hard knee, faster attack)
+    bool scOn = false; double scHp = 80, scLp = 20000; int scSlope = 12;   // sidechain filters on every detector (zero latency, matched)
     double hyst = 0;           // dB: release only starts when the gain has more than this to recover (C and D)
     // D downward peak
     bool pkOn = true;  double crest = 12, pkRatio = 4, pkAtt = 0.5, pkRel = 80, pkThr = -3; bool pkCrest = false;   // threshold dBFS, or seuil 1 + crest
@@ -509,9 +569,10 @@ struct Params
     double widthDb = 0.0;          // side gain
     double centreDb = 0.0;         // centre (mid) level, 0.1 dB steps
     int centreFilter = 0;          // 0 = broadband, 1 = low shelf, 2 = high shelf, 3 = bell
-    double centreFreq = 1000.0;
+    double centreFreq = 1000.0, centreQ = 0.71;
     double sideLowCut = 0.0;       // Hz, 0 = off: the side is high-passed (bass in mono)
-    int sideSlope = 12;            // 6 / 12 / 24 dB/oct
+    int sideSlope = 12;            // 6 .. 48 dB/oct (Butterworth, exact analog magnitude)
+    bool msMin = false;            // M/S filters: linear phase, or minimum phase (one common phase for Mid and Side)
     bool revOn = false; int revTarget = 1;   // 0 = Mid, 1 = Side, 2 = both
     double revSendDb = -24, revDecay = 1.8, revPreMs = 20; bool revPreAuto = true;
     double revDyn = 1.0;           // 0 = constant send, 1 = send only when the level is low (under stage A threshold)
@@ -529,12 +590,55 @@ struct OutputMeter   // accumulated by the audio thread, taken by the editor
 };
 
 
-// Linear tilt EQ: a straight line in dB per octave through a pivot (flat beyond 20 Hz / 20 kHz), linear phase.
-// Long FIR (8191 taps, Kaiser window) from the exact target magnitude, run as a uniformly partitioned
-// overlap-save convolution (blocks of 256). Constant latency whatever the setting; changes crossfade over a block.
-struct TiltEq
+// What a FirEq does: magnitude per channel (0 = Mid, 1 = Side) as exact analog responses, no cramping up to Nyquist.
+struct EqSpec
 {
-    static constexpr int B = 256, P = 64, N = B * P, F = 2 * B;   // N - 1 taps used, centre (N - 2) / 2
+    int kind = 0;                                   // 0 = tilt (same on Mid and Side), 1 = M/S end (centre EQ on Mid, low cut on Side)
+    double slope = 0, pivot = 1000;                 // tilt, dB/oct through the pivot (flat beyond 20 Hz / 20 kHz)
+    int cType = 0; double cFreq = 1000, cDb = 0, cQ = 0.71;   // centre: 0 none, 1 low shelf, 2 high shelf, 3 bell
+    double hpFreq = 0; int hpOrder = 2;             // Side low cut (Butterworth, order x 6 dB/oct), 0 = off
+    bool minPhase = false;
+    bool operator== (const EqSpec& o) const
+    {
+        return kind == o.kind && slope == o.slope && pivot == o.pivot && cType == o.cType && cFreq == o.cFreq && cDb == o.cDb && cQ == o.cQ
+            && hpFreq == o.hpFreq && hpOrder == o.hpOrder && minPhase == o.minPhase;
+    }
+    bool operator!= (const EqSpec& o) const { return ! (*this == o); }
+    static double sq (double x) { return x * x; }
+    double magDb (int ch, double f) const
+    {
+        if (kind == 0) return slope * std::log2 (std::clamp (f, 20.0, 20000.0) / pivot);
+        if (ch == 0)
+        {
+            if (cType < 1 || cType > 3 || cDb == 0) return 0;
+            const double A = std::pow (10.0, cDb / 40.0), W = std::max (f, 1e-6) / cFreq, W2 = W * W;
+            if (cType == 3)
+            {   // analog bell (s^2 + s A/Q + 1) / (s^2 + s /(A Q) + 1)
+                const double q = cQ;
+                return 10 * std::log10 ((sq (1 - W2) + sq (W * A / q)) / (sq (1 - W2) + sq (W / (A * q))));
+            }
+            const double k = std::sqrt (A) / cQ;
+            const double lo = sq (A - W2) + sq (k * W), hi = sq (1 - A * W2) + sq (k * W);
+            return 10 * std::log10 (A * A * (cType == 1 ? lo / hi : hi / lo));   // analog RBJ shelves
+        }
+        if (hpFreq <= 0) return 0;
+        const double w2n = std::pow (f / hpFreq, 2.0 * hpOrder);
+        return std::max (-240.0, 10 * std::log10 (w2n / (1 + w2n)));
+    }
+};
+
+// Long FIR EQ on Mid and Side, built from the exact target magnitude on a 4N grid (Kaiser windowed, N - 1 taps),
+// run as a uniformly partitioned overlap-save convolution (blocks of 256). Linear phase, or minimum phase: then
+// Mid and Side share one phase (minimum phase of their geometric mean) and each keeps its exact magnitude, so the
+// stereo image never moves. Constant latency whatever the setting; changes crossfade over a block, and during
+// playback the design runs on a worker thread (never on the audio thread).
+struct FirEq
+{
+    // block B, P partitions, N = B x P taps (centre (N - 2) / 2); partitions scale with the rate when asked, so the
+    // frequency resolution (and the accuracy of a steep low cut) stays the same at 96 / 192 kHz
+    int B = 256, P = 64, N = B * P, F = 2 * B, baseP = 64; bool scaleP = false;
+    explicit FirEq (int block = 256, int partitions = 64, bool scaleWithRate = false) : B (block), P (partitions), N (block * partitions), F (2 * block), baseP (partitions), scaleP (scaleWithRate) {}
+    static int partitionsFor (int base, double rate) { int p = base; while (p * 48000.0 < base * rate * 0.75) p *= 2; return p; }
     using cd = std::complex<double>;
     static void fft (cd* a, int n, bool inv)
     {
@@ -546,23 +650,37 @@ struct TiltEq
         }
         if (inv) for (int i = 0; i < n; ++i) a[i] /= (double) n;
     }
-    static constexpr int latency() { return B + (N - 2) / 2; }
-    double fs = 48000, curSlope = 0, curPivot = 1000; bool designed = false;
+    int latency() const { return B + (N - 2) / 2; }
+    static int latencyFor (int block, int partitions, double rate, bool scale) { const int p = scale ? partitionsFor (partitions, rate) : partitions; return block + (block * p - 2) / 2; }
+    static double targetDb (double f, double slope, double pivot) { EqSpec s; s.slope = slope; s.pivot = pivot; return s.magDb (0, f); }
+
+    struct Scratch { std::vector<cd> big, big2, work; std::vector<double> magM, magS, tapsM, tapsS; };
+    double fs = 48000;
     int pos = 0, fdlIdx = 0; bool fading = false;
-    std::vector<cd> H[2];                 // P partitions x F bins, current [0] and next [1]
+    std::vector<cd> H[2][2];              // [channel][0 current, 1 next]: P partitions x F bins
     std::vector<cd> fdl[2];               // per channel: P input spectra
     std::vector<double> inPrev[2], inCur[2], outCur[2], outNew[2];
-    std::vector<cd> work, big;
+    std::vector<cd> work;                 // audio thread
+    Scratch sA;                           // synchronous design
+    EqSpec want, cur, next;
+    double wantM = 1, wantS = 1, mixM = 1, mixS = 1;
+    bool valid[2] { true, true };         // outCur holds the filtered signal (not skipped)
+    std::array<std::vector<double>, 2> dly; int dpos = 0;
+
     void prepare (double sampleRate)
     {
         fs = sampleRate;
+        P = scaleP ? partitionsFor (baseP, fs) : baseP; N = B * P; F = 2 * B;
         for (int k = 0; k < 2; ++k)
         {
-            H[k].assign ((size_t) (P * F), cd (0)); fdl[k].assign ((size_t) (P * F), cd (0));
-            inPrev[k].assign (B, 0.0); inCur[k].assign (B, 0.0); outCur[k].assign (B, 0.0); outNew[k].assign (B, 0.0);
+            for (int j = 0; j < 2; ++j) H[k][j].assign ((size_t) (P * F), cd (0));
+            fdl[k].assign ((size_t) (P * F), cd (0));
+            inPrev[k].assign ((size_t) B, 0.0); inCur[k].assign ((size_t) B, 0.0); outCur[k].assign ((size_t) B, 0.0); outNew[k].assign ((size_t) B, 0.0);
         }
-        work.assign (F, cd (0)); big.assign ((size_t) (4 * N), cd (0));
-        design (H[0], 0.0, 1000.0, false); curSlope = 0; curPivot = 1000; curMin = false; designed = true;
+        work.assign ((size_t) F, cd (0));
+        EqSpec flat; flat.kind = want.kind; flat.minPhase = false;
+        design (flat, H[0][0], H[1][0], sA); cur = flat; next = flat;
+        postSpec = cur;
         for (auto& d : dly) d.assign ((size_t) latency() + 1, 0.0);
         reset();
     }
@@ -576,70 +694,74 @@ struct TiltEq
         pos = 0; fdlIdx = 0; fading = false; dpos = 0;
         for (auto& d : dly) std::fill (d.begin(), d.end(), 0.0);
     }
-    static double targetDb (double f, double slope, double pivot)
+    void design (const EqSpec& s, std::vector<cd>& HM, std::vector<cd>& HS, Scratch& z) const
     {
-        return slope * std::log2 (std::clamp (f, 20.0, 20000.0) / pivot);
-    }
-    // Exact target magnitude sampled on a 4N grid. Linear phase: zero-phase impulse, Kaiser windowed, centred.
-    // Minimum phase: same magnitude through the real cepstrum (folded), placed at the same centre so the latency
-    // never changes and switching only crossfades.
-    void design (std::vector<cd>& Hd, double slope, double pivot, bool minPhase)
-    { designWith (Hd, slope, pivot, minPhase, big, work, inNewScratch); }
-    void designWith (std::vector<cd>& Hd, double slope, double pivot, bool minPhase,
-                     std::vector<cd>& big, std::vector<cd>& work, std::vector<double>& h) const
-    {
-        const int M = 4 * N;
-        const int half = (N - 2) / 2; const double beta = 10.0;
+        const int M = 4 * N, half = (N - 2) / 2; const double beta = 10.0;
         auto i0 = [] (double x) { double sum = 1, t = 1; for (int k = 1; k < 60; ++k) { t *= (x / (2 * k)) * (x / (2 * k)); sum += t; if (t < 1e-18 * sum) break; } return sum; };
-        big.resize ((size_t) M); work.resize ((size_t) F); Hd.resize ((size_t) (P * F));
-        h.assign ((size_t) N, 0.0);
-        if (! minPhase)
+        z.big.resize ((size_t) M); z.big2.resize ((size_t) M); z.work.resize ((size_t) F);
+        z.magM.resize ((size_t) (M / 2 + 1)); z.magS.resize ((size_t) (M / 2 + 1));
+        HM.resize ((size_t) (P * F)); HS.resize ((size_t) (P * F));
+        const bool same = s.kind == 0;
+        for (int k = 0; k <= M / 2; ++k)
         {
+            const double f = k * fs / M;
+            z.magM[(size_t) k] = s.magDb (0, f); z.magS[(size_t) k] = same ? z.magM[(size_t) k] : s.magDb (1, f);
+        }
+        if (s.minPhase)
+        {   // common minimum phase of the geometric mean magnitude (real cepstrum, folded)
+            const double l10 = std::log (10.0) / 20.0;
             for (int k = 0; k <= M / 2; ++k)
             {
-                const double g = std::pow (10.0, targetDb (k * fs / M, slope, pivot) / 20.0);
-                big[(size_t) k] = g; if (k > 0 && k < M / 2) big[(size_t) (M - k)] = g;
+                const double lg = l10 * 0.5 * (z.magM[(size_t) k] + z.magS[(size_t) k]);
+                z.big[(size_t) k] = lg; if (k > 0 && k < M / 2) z.big[(size_t) (M - k)] = lg;
             }
-            fft (big.data(), M, true);   // real, even -> zero-phase impulse
+            fft (z.big.data(), M, true);
+            for (int n = 1; n < M / 2; ++n) z.big[(size_t) n] *= 2.0;
+            for (int n = M / 2 + 1; n < M; ++n) z.big[(size_t) n] = 0.0;
+            fft (z.big.data(), M, false);   // complex log spectrum: imaginary part = minimum phase
+        }
+        auto oneChannel = [&] (const std::vector<double>& mag, std::vector<double>& h, std::vector<cd>& Hd)
+        {
+            for (int k = 0; k < M; ++k)
+            {
+                const int kk = k <= M / 2 ? k : M - k;
+                const double g = std::pow (10.0, mag[(size_t) kk] / 20.0);
+                z.big2[(size_t) k] = s.minPhase ? std::polar (g, z.big[(size_t) k].imag()) : cd (g);
+            }
+            fft (z.big2.data(), M, true);   // impulse (zero phase, or starting at 0 for minimum phase)
+            h.assign ((size_t) N, 0.0);
             for (int n = -half; n <= half; ++n)
             {
                 const double r = (double) n / (half + 1);
-                h[(size_t) (n + half)] = big[(size_t) ((n + M) % M)].real() * i0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0 (beta);
+                h[(size_t) (n + half)] = z.big2[(size_t) ((n + M) % M)].real() * i0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0 (beta);
             }
-        }
-        else
-        {
-            for (int k = 0; k <= M / 2; ++k)
+            for (int part = 0; part < P; ++part)
             {
-                const double lg = std::log (10.0) * targetDb (k * fs / M, slope, pivot) / 20.0;
-                big[(size_t) k] = lg; if (k > 0 && k < M / 2) big[(size_t) (M - k)] = lg;
+                for (int i = 0; i < F; ++i) z.work[(size_t) i] = i < B ? h[(size_t) (part * B + i)] : 0.0;
+                fft (z.work.data(), F, false);
+                std::copy (z.work.begin(), z.work.end(), Hd.begin() + part * F);
             }
-            fft (big.data(), M, true);   // real cepstrum
-            for (int n = 1; n < M / 2; ++n) big[(size_t) n] *= 2.0;
-            for (int n = M / 2 + 1; n < M; ++n) big[(size_t) n] = 0.0;
-            fft (big.data(), M, false);
-            for (int k = 0; k < M; ++k) big[(size_t) k] = std::exp (big[(size_t) k]);
-            fft (big.data(), M, true);   // minimum-phase impulse
-            for (int n = 0; n <= half; ++n)
-            {
-                const double r = (double) n / (half + 1);   // right half of the Kaiser window: the tail fades out
-                h[(size_t) (n + half)] = big[(size_t) n].real() * i0 (beta * std::sqrt (std::max (0.0, 1 - r * r))) / i0 (beta);
-            }
-        }
-        for (int part = 0; part < P; ++part)
-        {
-            for (int i = 0; i < F; ++i) work[(size_t) i] = i < B ? h[(size_t) (part * B + i)] : 0.0;
-            fft (work.data(), F, false);
-            std::copy (work.begin(), work.end(), Hd.begin() + part * F);
-        }
+        };
+        oneChannel (z.magM, z.tapsM, HM);
+        if (same) { HS = HM; z.tapsS = z.tapsM; } else oneChannel (z.magS, z.tapsS, HS);
     }
-    const std::vector<double>& lastTaps() const { return inNewScratch; }
-    std::vector<double> inNewScratch;
+    // tests: design a tilt into the "next" slot and read its taps
+    void design (std::vector<cd>& Hd, double slope, double pivot, bool minPhase)
+    { EqSpec s; s.slope = slope; s.pivot = pivot; s.minPhase = minPhase; design (s, Hd, H[1][1], sA); }
+    const std::vector<double>& lastTaps (int ch = 0) const { return ch == 0 ? sA.tapsM : sA.tapsS; }
+
     // target 0 = stereo, 1 = Mid only, 2 = Side only (the other part only delayed)
     void setTarget (double slope, double pivot, bool minPhase = false, int target = 0)
-    { wantSlope = slope; wantPivot = pivot; wantMin = minPhase; wantM = target != 2 ? 1.0 : 0.0; wantS = target != 1 ? 1.0 : 0.0; }
-    double wantSlope = 0, wantPivot = 1000, wantM = 1, wantS = 1, mixM = 1, mixS = 1; bool wantMin = false, curMin = false;
-    std::array<std::vector<double>, 2> dly; int dpos = 0;
+    {
+        want.kind = 0; want.slope = slope; want.pivot = pivot; want.minPhase = minPhase;
+        wantM = target != 2 && slope != 0 ? 1.0 : 0.0; wantS = target != 1 && slope != 0 ? 1.0 : 0.0;
+    }
+    // M/S end: centre EQ on Mid, low cut on Side; an inactive part is only delayed (no convolution)
+    void setMS (int cType, double cFreq, double cDb, double cQ, double hpFreq, int hpOrder, bool minPhase)
+    {
+        want.kind = 1; want.cType = cType; want.cFreq = cFreq; want.cDb = cDb; want.cQ = cQ; want.hpFreq = hpFreq; want.hpOrder = hpOrder; want.minPhase = minPhase;
+        wantM = cType >= 1 && cType <= 3 && cDb != 0 ? 1.0 : 0.0; wantS = hpFreq > 0 ? 1.0 : 0.0;
+    }
     void convolve (int c, const std::vector<cd>& Hd, std::vector<double>& out)
     {
         std::fill (work.begin(), work.end(), cd (0));
@@ -662,56 +784,69 @@ struct TiltEq
             std::copy (work.begin(), work.end(), fdl[c].begin() + fdlIdx * F);
             inPrev[c] = inCur[c];
         }
-        const bool change = std::abs (wantSlope - curSlope) > 1e-9 || std::abs (wantPivot - curPivot) > 1e-9 || wantMin != curMin;
-        if (change)
+        const bool anyOn = wantM > 0 || wantS > 0 || mixM > 1e-6 || mixS > 1e-6;
+        if (want != cur && anyOn && ! fading)
         {
-            if (! async) { design (H[1], wantSlope, wantPivot, wantMin); fading = true; }
+            if (! async) { design (want, H[0][1], H[1][1], sA); next = want; fading = true; }
             else
             {
-                // the 4N-point design takes several ms: never on the audio thread while playing
                 if (ready.load (std::memory_order_acquire))
                 {
-                    std::swap (H[1], Hready); readyUsed (fading);
+                    std::swap (H[0][1], readyM); std::swap (H[1][1], readyS); next = rdSpec;
+                    ready.store (false, std::memory_order_release); fading = true;
                 }
-                if (! fading && (wantSlope != postSlope || wantPivot != postPivot || wantMin != postMin) && mtx.try_lock())
+                if (! fading && want != postSpec && mtx.try_lock())
                 {
-                    rqSlope = wantSlope; rqPivot = wantPivot; rqMin = wantMin; reqPending = true;
-                    postSlope = wantSlope; postPivot = wantPivot; postMin = wantMin;
+                    rqSpec = want; reqPending = true; postSpec = want;
                     mtx.unlock(); cv.notify_one();
                 }
             }
         }
         for (int c = 0; c < C; ++c)
         {
-            convolve (c, H[0], outCur[c]);
+            const bool need = c == 0 ? (wantM > 0 || mixM > 1e-6) : (wantS > 0 || mixS > 1e-6);
+            valid[c] = need;
+            if (! need) continue;
+            convolve (c, H[c][0], outCur[c]);
             if (fading)
             {
-                convolve (c, H[1], outNew[c]);
+                convolve (c, H[c][1], outNew[c]);
                 for (int i = 0; i < B; ++i) { const double r = (i + 0.5) / B; outCur[c][(size_t) i] = (1 - r) * outCur[c][(size_t) i] + r * outNew[c][(size_t) i]; }
             }
         }
-        if (fading)
-        {
-            std::swap (H[0], H[1]);
-            if (async) { curSlope = nextSlope; curPivot = nextPivot; curMin = nextMin; }
-            else { curSlope = wantSlope; curPivot = wantPivot; curMin = wantMin; }
-            fading = false;
-        }
+        if (fading) { std::swap (H[0][0], H[0][1]); std::swap (H[1][0], H[1][1]); cur = next; fading = false; }
     }
+    // one sample per channel in, one out (latency() samples later); works on Mid and Side
+    void process (double* v, int C)
+    {
+        double x[2] = { v[0], 0.0 };
+        if (C == 2) { x[0] = 0.5 * (v[0] + v[1]); x[1] = 0.5 * (v[0] - v[1]); }
+        const int L = (int) dly[0].size();
+        double y[2];
+        for (int c = 0; c < C; ++c)
+        {
+            inCur[c][(size_t) pos] = x[c];
+            const double dl = dly[(size_t) c][(size_t) ((dpos + 1) % L)];   // input from latency() samples ago
+            dly[(size_t) c][(size_t) dpos] = x[c];
+            const double mix = c == 0 ? mixM : mixS;
+            y[c] = valid[c] && mix > 0 ? dl + mix * (outCur[c][(size_t) pos] - dl) : dl;   // skipped part: exactly the delay
+        }
+        dpos = (dpos + 1) % L;
+        // the mix only rises once the convolution output is there (it is skipped while a part is off)
+        if (valid[0] || wantM == 0) mixM = wantM + 0.9995 * (mixM - wantM);
+        if (valid[1] || wantS == 0) mixS = wantS + 0.9995 * (mixS - wantS);
+        if ((mixM < 1e-7 || ! valid[0]) && wantM == 0) mixM = 0;
+        if ((mixS < 1e-7 || ! valid[1]) && wantS == 0) mixS = 0;
+        if (C == 2) { v[0] = y[0] + y[1]; v[1] = y[0] - y[1]; } else v[0] = y[0];
+        if (++pos == B) { pos = 0; block (C); }
+    }
+
     // ---- background design (realtime playback) ----
     bool async = false;
     std::thread th; std::mutex mtx; std::condition_variable cv; bool quit = false, reqPending = false;
-    double rqSlope = 0, rqPivot = 1000; bool rqMin = false;
-    double postSlope = 0, postPivot = 1000; bool postMin = false;          // last request sent (audio thread)
-    double rdSlope = 0, rdPivot = 1000; bool rdMin = false;                // describes Hready
-    double nextSlope = 0, nextPivot = 1000; bool nextMin = false;          // describes H[1] while fading
-    std::vector<cd> Hready, wkH, wkBig, wkWork; std::vector<double> wkTaps;
+    EqSpec rqSpec, postSpec, rdSpec;
+    std::vector<cd> readyM, readyS, wkM, wkS; Scratch sW;
     std::atomic<bool> ready { false };
-    void readyUsed (bool& fade)
-    {
-        nextSlope = rdSlope; nextPivot = rdPivot; nextMin = rdMin;
-        ready.store (false, std::memory_order_release); fade = true;
-    }
     void setAsync (bool on)
     {
         if (on == async) return;
@@ -722,57 +857,35 @@ struct TiltEq
             {
                 for (;;)
                 {
-                    double s, pv; bool mn;
+                    EqSpec s;
                     {
                         std::unique_lock<std::mutex> lk (mtx);
                         cv.wait (lk, [this] { return quit || reqPending; });
                         if (quit) return;
-                        s = rqSlope; pv = rqPivot; mn = rqMin; reqPending = false;
+                        s = rqSpec; reqPending = false;
                     }
-                    designWith (wkH, s, pv, mn, wkBig, wkWork, wkTaps);
+                    design (s, wkM, wkS, sW);
                     while (ready.load (std::memory_order_acquire))   // previous result not yet taken
                     {
                         { std::lock_guard<std::mutex> lk (mtx); if (quit) return; }
                         std::this_thread::sleep_for (std::chrono::milliseconds (1));
                     }
-                    std::swap (Hready, wkH); rdSlope = s; rdPivot = pv; rdMin = mn;
+                    std::swap (readyM, wkM); std::swap (readyS, wkS); rdSpec = s;
                     ready.store (true, std::memory_order_release);
                 }
             });
         }
-        // switching mode happens between blocks (same thread as process): forget pending results
-        postSlope = curSlope; postPivot = curPivot; postMin = curMin;
+        postSpec = cur;
         async = on;
     }
-    TiltEq() = default;
-    TiltEq (const TiltEq&) = delete;
-    TiltEq& operator= (const TiltEq&) = delete;
-    ~TiltEq()
+    FirEq (const FirEq&) = delete;
+    FirEq& operator= (const FirEq&) = delete;
+    ~FirEq()
     {
         if (th.joinable()) { { std::lock_guard<std::mutex> lk (mtx); quit = true; } cv.notify_one(); th.join(); }
     }
-    // one sample per channel in, one out (latency() samples later)
-    // works on Mid and Side (same filter on both = same as on L and R), so Mid or Side alone can be left out
-    void process (double* v, int C)
-    {
-        double x[2] = { v[0], C == 2 ? v[1] : 0.0 };
-        if (C == 2) { const double m = 0.5 * (v[0] + v[1]), sd = 0.5 * (v[0] - v[1]); x[0] = m; x[1] = sd; }
-        const int L = (int) dly[0].size();
-        double y[2];
-        for (int c = 0; c < C; ++c)
-        {
-            inCur[c][(size_t) pos] = x[c];
-            const double dl = dly[(size_t) c][(size_t) ((dpos + 1) % L)];   // input from latency() samples ago
-            dly[(size_t) c][(size_t) dpos] = x[c];
-            const double mix = c == 0 ? mixM : mixS;
-            y[c] = dl + mix * (outCur[c][(size_t) pos] - dl);
-        }
-        dpos = (dpos + 1) % L;
-        mixM = wantM + 0.9995 * (mixM - wantM); mixS = wantS + 0.9995 * (mixS - wantS);
-        if (C == 2) { v[0] = y[0] + y[1]; v[1] = y[0] - y[1]; } else v[0] = y[0];
-        if (++pos == B) { pos = 0; block (C); }
-    }
 };
+using TiltEq = FirEq;
 
 // Spectral upward (pp): the signal is split in 30 third-octave bands (25 Hz .. 20 kHz) by an STFT (sqrt-Hann,
 // 75 % overlap, N = 4096 at 48 kHz, scaled with the rate). Each band has its own level detector, so a quiet
@@ -893,7 +1006,7 @@ public:
     static constexpr double kSilenceLufs = -100.0;   // upward gain fades out between -90 and -100 LUFS
 
     // realtime playback: heavy filter redesigns (tilt) run on a worker thread; offline/tests stay synchronous
-    void setRealtime (bool on) { tiltEq.setAsync (on); }
+    void setRealtime (bool on) { tiltEq.setAsync (on); msEq.setAsync (on); }
     void prepare (double sampleRate, int numChannels)
     {
         fs = sampleRate; nch = std::clamp (numChannels, 1, kMaxCh);
@@ -923,8 +1036,8 @@ public:
         for (int k = 1; k < Oversampler::kNumF; ++k) tailOs = std::max (tailOs, osDelay + 2 * gfirOs[(size_t) k].half / Oversampler::kFactors[k]);
         limTail = std::max (TruePeak::kDelay + 2 * hf, tailOs);
         specUp.prepare (fs);
-        latencySamples = hf + lookMax + limTail + TiltEq::latency() + specUp.latency();
-        tiltEq.prepare (fs);
+        latencySamples = hf + lookMax + limTail + FirEq::latencyFor (256, 64, fs, false) + FirEq::latencyFor (1024, 64, fs, true) + specUp.latency();
+        tiltEq.prepare (fs); msEq.prepare (fs);
         for (int c = 0; c < kMaxCh; ++c)
         {
             for (auto& k : kw[(size_t) c]) k.prepare (fs);
@@ -960,7 +1073,7 @@ public:
     void reset()
     {
         erMs = 20; meterEr.store (20); backAvg = -100; sinceOnset = 100000; recLeft = 0; frameAcc = 0; frameCount = 0;
-        pkRms = 0; pkRmsDb = -100; specUp.reset();
+        pkRms = 0; pkRmsDb = -100; specUp.reset(); msEq.reset();
         rcState = 0; rcGain = 1.0; if (curOs >= 0) { configureLimiter(); curTiltPos = p.tiltPos; }
         for (size_t c = 0; c < (size_t) kMaxCh; ++c)
         {
@@ -995,7 +1108,11 @@ public:
         auto co = [this] (double ms) { return std::exp (-1.0 / (std::max (ms, 0.01) * 0.001 * fs)); };
         cWin = co (p.windowMs); cPkRms = co (300.0);
         cAa = co (p.upAtt); cAr = co (p.upRel); cBa = co (p.llAtt); cBr = co (p.llRel);
-        cC1a = co (p.att1); cC1r = co (p.rel1); cC2a = co (p.att2); cC2r = co (p.rel2);
+        cC1a = co (p.att1 * (1.0 - 0.9 * charK())); cC1r = co (p.rel1); cC2a = co (p.att2 * (1.0 - 0.9 * charK())); cC2r = co (p.rel2);
+        {   // sidechain filters (Butterworth, magnitude matched to the analog response: no cramping near Nyquist)
+            const int ord = std::clamp (p.scSlope / 6, 1, 8);
+            for (auto& f : scFilt) { f.design (fs, p.scOn && p.scHp > 0 ? p.scHp : 0.0, p.scOn && p.scLp < 0.45 * fs && p.scLp < 20000 ? p.scLp : 0.0, ord); }
+        }
         cDa = co (p.pkAtt); cDr = co (p.pkRel); cPkDet = co (5.0);
         cDenA = co (3.0); cDenR = co (120.0);
         cOptoUp = co (400.0); cOptoDn = co (3000.0);
@@ -1003,16 +1120,12 @@ public:
         cRevSend = co (150.0); cFast = co (50.0);
         cAmbA = co (p.ambAtt); cAmbR = co (p.ambRel); cAmbWin = co (50.0);
         verb.setDecay (p.revDecay);
-        if (p.centreFilter >= 1 && p.centreFilter <= 3) { centreEq.eq (p.centreFilter, fs, std::clamp (p.centreFreq, 20.0, 0.45 * fs), p.centreDb, 0.8); }
-        if (p.sideLowCut > 0)
+        // M/S filters: exact analog magnitude FIR (as Dune), only active parts are convolved
         {
-            const double f = std::clamp (p.sideLowCut, 10.0, 0.45 * fs);
-            if (p.sideSlope <= 6) { sideHp1.onePoleHighpass (fs, f); sideHp2 = Biquad(); }
-            else if (p.sideSlope <= 12) { sideHp1.highpass (fs, f, 0.7071); sideHp2 = Biquad(); }
-            else { sideHp1.highpass (fs, f, 0.5412); sideHp2.highpass (fs, f, 1.3066); }
+            const bool fOn = p.msOn && p.centreFilter >= 1 && p.centreFilter <= 3;
+            msEq.setMS (fOn ? p.centreFilter : 0, std::clamp (p.centreFreq, 10.0, 0.49 * fs), p.centreDb, std::clamp (p.centreQ, 0.1, 20.0),
+                        p.msOn && p.sideLowCut > 0 ? std::clamp (p.sideLowCut, 5.0, 0.45 * fs) : 0.0, std::clamp (p.sideSlope / 6, 1, 8), p.msMin);
         }
-        if (p.centreFilter != lastCentreFilter || (p.sideLowCut > 0) != lastLowCutOn || p.sideSlope != lastSlope)
-        { centreEq.reset(); sideHp1.reset(); sideHp2.reset(); lastCentreFilter = p.centreFilter; lastLowCutOn = p.sideLowCut > 0; lastSlope = p.sideSlope; }
         cLoud = co (8000.0); cMakeup = co (1500.0); cSmooth = co (20.0);
         // oversampling factor, kept under ~2 MHz (40x at 48 kHz, 16x at 96 kHz, 4x at 384 kHz)
         int f = Oversampler::kFactors[Oversampler::index (p.os)];
@@ -1027,9 +1140,9 @@ public:
     const Params& params() const { return p; }
 
     // ---- static curves (dB), exposed for tests and the display
-    double shape (double over) const
+    double shape (double over, double kneeScale = 1.0) const
     {
-        const double k = std::max (0.0, p.knee * (p.opto ? 1.5 : p.variMu ? 2.0 : 1.0));
+        const double k = std::max (0.0, kneeScale * p.knee * (p.opto ? 1.5 : p.variMu ? 2.0 : 1.0));
         if (k <= 0) return std::max (0.0, over);
         if (over <= -k * 0.5) return 0.0;
         if (over >= k * 0.5) return over;
@@ -1058,12 +1171,15 @@ public:
         return -p.llRange * std::tanh (dn / p.llRange);
     }
     // vari-mu: the ratio grows with the depth of compression (gentle at first, the set ratio further over)
-    double shapeC (double over) const { const double s = shape (over); return p.variMu ? s * s / (s + 8.0) : s; }
-    double curveC1 (double L) const { return p.dnOn ? -(1.0 - 1.0 / std::max (1.0, p.ratio1)) * shapeC (L - thr1Abs()) : 0; }
+    double shapeC (double over) const { const double s = shape (over, 1.0 - charK()); return p.variMu ? s * s / (s + 8.0) : s; }
+    // COMP/LIM: the slope above the threshold goes from 1/ratio to (almost) flat, the knee closes
+    double charK() const { return std::clamp (p.character, 0.0, 1.0); }
+    double invRatio (double r) const { return std::max (0.0, (1.0 - charK()) / std::max (1.0, r)); }
+    double curveC1 (double L) const { return p.dnOn ? -(1.0 - invRatio (p.ratio1)) * shapeC (L - thr1Abs()) : 0; }
     double curveC2 (double L) const
     {
         if (! p.dnOn) return 0;
-        const double extra = std::max (0.0, 1.0 / std::max (1.0, p.ratio1) - 1.0 / std::max (1.0, p.ratio2));
+        const double extra = std::max (0.0, invRatio (p.ratio1) - invRatio (p.ratio2));
         return -extra * shapeC (L - thr2Abs());
     }
     double curveD (double peakDb) const { return p.pkOn ? -(1.0 - 1.0 / std::max (1.0, p.pkRatio)) * shape (peakDb - peakThr()) : 0; }
@@ -1124,7 +1240,7 @@ public:
                 specUp.push (x, C);
                 if (specUp.due()) specUp.frame (C, [this] (double Lb) { return p.upSpectral ? curveBand (Lb) : 0.0; }, p.upAtt, p.upRel, mixS);
                 if (p.upSpectral) mA = std::max (mA, specUp.maxGain);
-                for (int c = 0; c < C; ++c) s[c] = x[c];
+                for (int c = 0; c < C; ++c) s[c] = scFilt[(size_t) c].process (x[c]);   // detectors hear the sidechain-filtered signal
             }
             {   // input metering (sand, crest, dynamic range)
                 double ip = 0;
@@ -1364,10 +1480,10 @@ public:
             {
                 double m = 0.5 * (y[0] + y[1]), sd = 0.5 * (y[0] - y[1]);
                 sd *= widthS;
-                if (p.centreFilter == 0) m *= centreS; else m += msMix * (centreEq.process (m) - m);
-                if (p.sideLowCut > 0) sd += msMix * (sideHp2.process (sideHp1.process (sd)) - sd);
+                if (p.centreFilter == 0) m *= centreS;
                 y[0] = m + sd; y[1] = m - sd;
             }
+            msEq.process (y, C);   // centre EQ and side low cut (constant latency, pure delay when off)
 
             for (int c = 0; c < C; ++c) yBuf[(size_t) c][(size_t) (i - i0)] = y[c];
         }
@@ -1738,7 +1854,8 @@ private:
     double cWin = 0, cAa = 0, cAr = 0, cBa = 0, cBr = 0, cC1a = 0, cC1r = 0, cC2a = 0, cC2r = 0, cDa = 0, cDr = 0, cPkDet = 0;
     double cDenA = 0, cDenR = 0, cOptoUp = 0, cOptoDn = 0, cLoud = 0, cMakeup = 0, cSmooth = 0, cLimRel = 0, ceiling = 1;
     double mixS = 1, outS = 1, denS = 0, ambS = 0, trS = 0, trFast = 0, trSlow = 0, trG = 0, cTrG = 0;
-    Biquad centreEq, sideHp1, sideHp2; int lastCentreFilter = -1, lastSlope = -1; bool lastLowCutOn = false; double centreS = 1;
+    FirEq msEq { 1024, 64, true }; double centreS = 1;   // 65536 taps at 48 kHz: 0.01 dB accurate down to a 20 Hz low cut
+    std::array<ScFilter, kMaxCh> scFilt;
     std::array<KWeighting, kMaxCh> inKw; double inFast = 0, outFast = 0, cFast = 0;
     double widthS = 1, msMix = 1, revSendS = 0, cRevSend = 0, lvlA = -100; TailVerb verb;
     double cTrFa = 0, cTrFr = 0, cTrSa = 0, cTrSr = 0;

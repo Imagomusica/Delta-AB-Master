@@ -18,6 +18,10 @@ static R run (juce::RangedAudioParameter* prm, int blk)
     p.setProcessingPrecision (juce::AudioProcessor::doublePrecision);
     p.prepareToPlay (48000, blk);
     juce::RangedAudioParameter* q = prm ? p.apvts.getParameter (prm->paramID) : nullptr;
+    if (const char* pre = std::getenv ("CLICK_PRE"))   // e.g. centreFilter=1,centre=0.8 (normalised values)
+        for (auto kv : juce::StringArray::fromTokens (pre, ",", ""))
+            if (auto* x = p.apvts.getParameter (kv.upToFirstOccurrenceOf ("=", false, false)))
+                x->setValueNotifyingHost (kv.fromFirstOccurrenceOf ("=", false, false).getFloatValue());
     const double fs = 48000; const int n = (int) (6 * fs), sweepFrom = (int) (2 * fs), sweepTo = (int) (5 * fs);
     std::vector<double> out ((size_t) n);
     juce::AudioBuffer<double> b (2, blk); juce::MidiBuffer midi;
