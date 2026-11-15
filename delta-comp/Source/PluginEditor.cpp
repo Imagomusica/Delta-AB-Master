@@ -1457,7 +1457,7 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
     }
     add (row2, new ui::Section (s, "GLOBAL", "active", 4, { { K::knob, "in", "ENTRÉE" }, { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
                                                           { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::choice, "autoGain", "GAIN AUTO" }, { K::choice, "meterLook", "AVANCE NAGRA" },
-                                                          { K::choice, "listen", "ÉCOUTE" } }),
+                                                          { K::choice, "listen", "ÉCOUTE" }, { K::choice, "topo", "TOPOLOGIE" }, { K::choice, "relCurve", "RELEASE" } }),
          [&e, db] { return "GAIN AUTO " + db (e.meterMakeup.load()) + "  DENSITY " + db (e.meterDensity.load()); });
 
     row1[0]->marking = "pp"; row1[1]->marking = "p"; row1[2]->marking = "mp mf"; row1[3]->marking = "f ff";

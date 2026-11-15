@@ -570,6 +570,27 @@ int main()
         double e3, b3, s3; run (-1, 2, e3, b3, s3);   // on Side only: a mono signal is untouched
         check (std::abs (10 * std::log10 (e3 / e0)) < 0.01, "transient on SIDE: mono material untouched", 10 * std::log10 (e3 / e0));
     }
+    {   // feedback keeps the static ratio; release curves: same at 6 dB, linear and inverse log shapes differ
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.dnOn = true; p.thr1 = -20; p.ratio1 = 3; p.ratio2 = 3; p.thr2 = 18; p.knee = 0; e.setParams (p);
+        const double a = runSine (e, fs, -6, 3);
+        Engine e2; e2.prepare (fs, 2); p.feedback = true; e2.setParams (p);
+        const double b = runSine (e2, fs, -6, 3);
+        check (std::abs (a - b) < 1.0, "feedback 3:1: static level within 1 dB of feedforward", a - b);
+        auto recover = [&] (int curve) {   // gain 1 s after a 12 dB step down ends, release 300 ms
+            Engine x; x.prepare (fs, 2); Params q = neutral(); q.dnOn = true; q.thr1 = -30; q.ratio1 = 4; q.ratio2 = 4; q.thr2 = 18; q.rel1 = 300; q.relCurve = curve; q.knee = 0; q.windowMs = 5; x.setParams (q);
+            const int n1 = (int) (2 * fs), n2 = (int) (0.15 * fs);
+            std::vector<double> l (512), r (512); double* io[2] = { l.data(), r.data() };
+            for (int s0 = 0; s0 < n1 + n2; s0 += 512)
+            {
+                for (int i = 0; i < 512; ++i) l[(size_t) i] = r[(size_t) i] = (s0 + i < n1 ? 0.5 : 0.005) * std::sin (2 * kPi * 997 * (s0 + i) / fs);
+                x.process (io, 2, 512);
+            }
+            return (double) x.meterC.load();
+        };
+        const double r0 = recover (0), r1 = recover (1), r2 = recover (2);
+        std::printf ("       gain reduction 150 ms after the loud part: log %.1f, lin %.1f, log inv %.1f dB\n", r0, r1, r2);
+        check (std::abs (r0 - r1) > 0.3 && std::abs (r0 - r2) > 0.3, "release curves LOG / LIN / LOG INV give different recoveries", std::min (std::abs (r0 - r1), std::abs (r0 - r2)));
+    }
     std::printf (fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails ? 1 : 0;
 }
