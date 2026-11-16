@@ -1402,37 +1402,42 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
                                                                     { K::knob, "llAtt", "ATTAQUE" }, { K::knob, "llRel", "RELEASE" } }),
          [&e, db] { return db (e.meterB.load()); });
     row1.getLast()->gain = [&e] { return e.meterB.load(); }; row1.getLast()->range = 12;
-    add (row1, new ui::Section (s, "DOUBLE SEUIL", "dnOn", 4,
+    add (row1, new ui::Section (s, "DOUBLE SEUIL", "dnOn", 5,
                                 { { K::knob, "thr1", "SEUIL mp" }, { K::knob, "ratio1", "RATIO 1" }, { K::knob, "att1", "ATTAQUE 1" }, { K::knob, "rel1", "RELEASE 1" },
                                   { K::knob, "thr2", "SEUIL mf" }, { K::knob, "ratio2", "RATIO 2" }, { K::knob, "att2", "ATTAQUE 2" }, { K::knob, "rel2", "RELEASE 2" },
                                   { K::knob, "hyst", "HYSTÉRÉSIS" }, { K::knob, "knee", "GENOU" }, { K::knob, "window", "FENÊTRE" }, { K::choice, "opto", "DÉTECTION" },
                                   { K::knob, "character", "COMP / LIM" }, { K::choice, "topo", "TOPOLOGIE" }, { K::choice, "relCurve", "RELEASE" } }),
          [&e, db] { return db (e.meterC.load()); });
     row1.getLast()->gain = [&e] { return e.meterC.load(); }; row1.getLast()->range = 20;
-    add (row1, new ui::Section (s, "PEAK", "pkOn", 2, { { K::knob, "pkThr", "SEUIL" }, { K::knob, "pkRatio", "RATIO" },
+    add (row1, new ui::Section (s, "PEAK", "pkOn", 3, { { K::knob, "pkThr", "SEUIL" }, { K::knob, "pkRatio", "RATIO" },
                                                        { K::knob, "pkAtt", "ATTAQUE" }, { K::knob, "pkRel", "RELEASE" },
                                                        { K::choice, "pkMode", "MODE" }, { K::knob, "crest", "CREST" },
                                                        { K::choice, "pkTopo", "TOPOLOGIE" }, { K::choice, "pkRelCurve", "RELEASE" } }),
          [&e, &p, db] { return db (e.meterD.load()) + "  @ " + String (p.engine.peakThr(), 1); });
     row1.getLast()->gain = [&e] { return e.meterD.load(); }; row1.getLast()->range = 12;
 
-    add (row2, new ui::Section (s, "AMBIANCE · K-STEREO", "ambOn", 4, { { K::knob, "kStereo", "K-STEREO" }, { K::knob, "ambiance", "QUEUES" }, { K::knob, "ambThr", "SEUIL" }, { K::knob, "ambRatio", "RATIO" },
+    add (row2, new ui::Section (s, "SIDECHAIN", "scOn", 2, { { K::knob, "scHp", "PASSE-HAUT" }, { K::knob, "scLp", "PASSE-BAS" }, { K::choice, "scSlope", "PENTE dB/oct" } }),
+         [] { return String::fromUTF8 ("DÉTECTEURS"); });
+    add (row2, new ui::Section (s, "TILT", "tiltOn", 3, { { K::knob, "tilt", "GRAVE / AIGU" }, { K::knob, "tiltPivot", "PIVOT" },
+                                                         { K::choice, "tiltPhase", "PHASE" }, { K::choice, "tiltTarget", "SUR" }, { K::choice, "tiltPos", "POSITION" } }),
+         [this] { return ui::u8 (proc.apvts.getRawParameterValue ("tiltPhase")->load() > 0.5f ? "MIN PHASE" : "LINÉAIRE"); });
+    add (row2, new ui::Section (s, "AMBIANCE · K-STEREO", "ambOn", 6, { { K::knob, "kStereo", "K-STEREO" }, { K::knob, "ambiance", "QUEUES" }, { K::knob, "ambThr", "SEUIL" }, { K::knob, "ambRatio", "RATIO" },
                                                             { K::knob, "ambAtt", "ATTAQUE" }, { K::knob, "ambRel", "RELEASE" }, { K::knob, "ambPre", "PRÉ-DÉLAI" },
                                                             { K::knob, "ambTr", "TRANSITOIRES" }, { K::choice, "ambAuto", "AUTO RÉFL." }, { K::choice, "ambStage", "APRÈS" },
                                                             { K::toggle, "kstOn", "K-STEREO" } }),
          [&e, db] { return db (e.meterAmb.load()) + ui::u8 ("  réfl. ") + String (roundToInt (e.meterEr.load())) + " ms"; });
     // transient shaper: at the end of the dynamics, after K-Stereo (as in the signal path)
-    add (row2, new ui::Section (s, "TRANSITOIRES", "trOn", 3, { { K::knob, "transient", "ROND / ATT." }, { K::knob, "trDur", "DURÉE" }, { K::choice, "trTarget", "SUR" } }),
+    add (row2, new ui::Section (s, "TRANSITOIRES", "trOn", 2, { { K::knob, "transient", "ROND / ATT." }, { K::knob, "trDur", "DURÉE" }, { K::choice, "trTarget", "SUR" } }),
          [&e, db] { return db (e.meterT.load()); });
     // INSERT: a plain VST3/AU insert (Altiverb or anything), independent of the ambiance, on Mid, Side or L/R
-    add (row2, new ui::Section (s, "INSERT", "revOn", 2, { { K::choice, "revTarget", "SUR" } }),
+    add (row3, new ui::Section (s, "INSERT", "revOn", 2, { { K::choice, "revTarget", "SUR" } }),
          [this] { auto n = proc.insertName(); return n.isEmpty() ? String ("VIDE") : n.toUpperCase(); });
     {
-        auto* ins = row2.getLast();
+        auto* ins = row3.getLast();
         ins->extra = &insertSlot; ins->extraCell = 2; ins->extraSpan = 2;
         ins->addAndMakeVisible (insertSlot);
     }
-    add (row2, new ui::Section (s, "M/S", "msOn", 4, { { K::knob, "centre", "CENTRE" }, { K::knob, "centreFreq", "FRÉQ." }, { K::knob, "centreQ", "Q" },
+    add (row3, new ui::Section (s, "M/S", "msOn", 4, { { K::knob, "centre", "CENTRE" }, { K::knob, "centreFreq", "FRÉQ." }, { K::knob, "centreQ", "Q" },
                                                        { K::choice, "centreFilter", "FILTRE" },
                                                        { K::knob, "width", "LARGEUR" }, { K::knob, "sideLowCut", "LOW CUT S" },
                                                        { K::choice, "sideSlope", "PENTE dB/oct" }, { K::choice, "msPhase", "PHASE" } }),
@@ -1442,21 +1447,16 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
                                                             { K::choice, "truePeak", "TRUE PEAK" } }),
          [&e, db] { return db (e.meterLim.load()); });
     row2.getLast()->hairpin = [&e] { const float i = e.meterIn.load(), o = e.meterOut.load(); return i > -70.0f && o > -70.0f ? o - i : 0.0f; };
-    add (row1, new ui::Section (s, "SIDECHAIN", "scOn", 2, { { K::knob, "scHp", "PASSE-HAUT" }, { K::knob, "scLp", "PASSE-BAS" }, { K::choice, "scSlope", "PENTE dB/oct" } }),
-         [] { return String::fromUTF8 ("DÉTECTEURS"); });
-    add (row1, new ui::Section (s, "TILT", "tiltOn", 2, { { K::knob, "tilt", "GRAVE / AIGU" }, { K::knob, "tiltPivot", "PIVOT" },
-                                                         { K::choice, "tiltPhase", "PHASE" }, { K::choice, "tiltTarget", "SUR" }, { K::choice, "tiltPos", "POSITION" } }),
-         [this] { return ui::u8 (proc.apvts.getRawParameterValue ("tiltPhase")->load() > 0.5f ? "MIN PHASE" : "LINÉAIRE"); });
     // OVERSAMPLING: one factor for the whole compressor and the limiter, with its filter set by hand
-    add (row2, new ui::Section (s, "OVERSAMPLING", nullptr, 4, { { K::choice, "os", "FACTEUR" }, { K::knob, "osCut", "COUPURE" },
+    add (row3, new ui::Section (s, "OVERSAMPLING", nullptr, 4, { { K::choice, "os", "FACTEUR" }, { K::knob, "osCut", "COUPURE" },
                                                                  { K::knob, "osSteep", "PENTE" }, { K::knob, "osPre", "PRÉ-RINGING" } }),
          [this] { return proc.apvts.getRawParameterValue ("os")->load() < 0.5f ? String ("OFF") : String ("COMP + LIMITEUR"); });
     {
-        auto* o = row2.getLast();
-        o->extra = &osView; o->extraCell = 4; o->extraSpan = 8; o->extraTop = 22;   // the two lower rows, under the four knobs
+        auto* o = row3.getLast();
+        o->extra = &osView; o->extraCell = 4; o->extraSpan = 4; o->extraTop = 0;   // the lower row, under the four knobs
         o->addAndMakeVisible (osView);
     }
-    add (row2, new ui::Section (s, "GLOBAL", "active", 4, { { K::knob, "in", "ENTRÉE" }, { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
+    add (row3, new ui::Section (s, "GLOBAL", "active", 5, { { K::knob, "in", "ENTRÉE" }, { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
                                                           { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::choice, "autoGain", "GAIN AUTO" }, { K::choice, "meterLook", "AVANCE NAGRA" },
                                                           { K::choice, "listen", "ÉCOUTE" }}),
          [&e, db] { return "GAIN AUTO " + db (e.meterMakeup.load()) + "  DENSITY " + db (e.meterDensity.load()); });
@@ -1488,10 +1488,13 @@ void DeltaCompEditor::resized()
         const int gap = 8, avail = area.getWidth() - gap * (row.size() - 1);
         for (auto* s : row) { const int w = avail * s->cols / cols; s->setBounds (area.removeFromLeft (w)); area.removeFromLeft (gap); }
     };
-    const int rowH = (r.getHeight() - 8) / 2;
-    layRow (row1, r.removeFromTop (rowH));
+    // dynamics alone on the first row (3 rows of controls), the rest on two rows of 2 controls each
+    layRow (row1, r.removeFromTop (300));
     r.removeFromTop (8);
-    layRow (row2, r);
+    const int rowH = (r.getHeight() - 8) / 2;
+    layRow (row2, r.removeFromTop (rowH));
+    r.removeFromTop (8);
+    layRow (row3, r);
 }
 
 void DeltaCompEditor::timerCallback()
@@ -1501,7 +1504,7 @@ void DeltaCompEditor::timerCallback()
     lastMs = now;
     sand.push(); sand.repaint(); osView.poll();
     meter.tick (dt);
-    for (auto* row : { &row1, &row2 })
+    for (auto* row : { &row1, &row2, &row3 })
         for (auto* s : *row)
         {
             if (s->readout) { auto t = s->readout(); if (t != s->shown) { s->shown = t; if (! s->gain) s->repaint(); } }

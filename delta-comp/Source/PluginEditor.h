@@ -184,11 +184,11 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
     void timerCallback() override;
-    static constexpr int kW = 1440, kH = 1000;
+    static constexpr int kW = 1600, kH = 1200;
     juce::Component content;
     ui::Sand sand;
     ui::Meter meter;
-    juce::OwnedArray<ui::Section> row1, row2;
+    juce::OwnedArray<ui::Section> row1, row2, row3;
     ui::InsertSlot insertSlot;
     ui::OsView osView;
 private:
