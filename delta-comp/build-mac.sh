@@ -20,6 +20,8 @@ export PATH="$HOME/dc-tools/bin:$PATH"
 
 echo "== Compilation (la premiere fois environ 10 minutes, ensuite beaucoup moins)"
 rm -f "$BUILD/CMakeCache.txt"
+# Les fichiers du zip GitHub portent la date du commit : on les rafraichit pour que tout soit recompile.
+find "$SRC/Source" "$SRC/CMakeLists.txt" -type f -exec touch {} +
 cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD" --target DeltaComp_VST3 DeltaComp_AU
 
