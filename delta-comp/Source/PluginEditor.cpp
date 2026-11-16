@@ -1389,6 +1389,17 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
     content.addAndMakeVisible (sand);
     content.addAndMakeVisible (meter);
     meter.sand = &sand;
+    content.addAndMakeVisible (openAnalyser);
+    openAnalyser.onClick = [this] {
+        if (analyser == nullptr) analyser = std::make_unique<AnalyserWindow> (proc);
+        if (! analyser->isVisible())
+        {
+            const auto b = getScreenBounds();
+            analyser->setBounds (b.getRight() + 8, b.getY(), jmax (900, b.getWidth()), jmax (560, b.getHeight() * 6 / 10));
+            analyser->setVisible (true);
+        }
+        analyser->toFront (true);
+    };
     auto& s = p.apvts;
     auto add = [&] (OwnedArray<ui::Section>& row, ui::Section* sec, std::function<String()> ro) { sec->readout = std::move (ro); content.addAndMakeVisible (row.add (sec)); };
     auto db = [] (float v) { return (v > 0.05f ? "+" : "") + String (v, 1) + " dB"; };
@@ -1469,7 +1480,18 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
     startTimerHz (30);
 }
 
-DeltaCompEditor::~DeltaCompEditor() { setLookAndFeel (nullptr); }
+DeltaCompEditor::AnalyserWindow::AnalyserWindow (DeltaCompProcessor& p)
+    : DocumentWindow ("Delta Comp - Analyseur", juce::Colours::black, DocumentWindow::allButtons, true), view (p)
+{
+    setUsingNativeTitleBar (true);
+    view.setSize (1400, 800);
+    setContentNonOwned (&view, true);
+    setResizable (true, false);
+    setResizeLimits (600, 360, 8000, 5000);
+    startTimerHz (30);
+}
+
+DeltaCompEditor::~DeltaCompEditor() { analyser.reset(); setLookAndFeel (nullptr); }
 
 void DeltaCompEditor::paint (Graphics& g) { g.fillAll (Colours::black); }
 
@@ -1480,6 +1502,7 @@ void DeltaCompEditor::resized()
     content.setTransform (AffineTransform::scale (k));
     auto r = Rectangle<int> (0, 0, kW, kH).reduced (14);
     sand.setBounds (r.removeFromTop (440));
+    openAnalyser.setBounds (sand.getRight() - 150 - 8 - 120, sand.getY() + 6, 112, 20);
     r.removeFromTop (8);
     meter.setBounds (r.removeFromRight (390));
     r.removeFromRight (8);

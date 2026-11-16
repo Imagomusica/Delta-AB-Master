@@ -179,6 +179,14 @@ struct Meter : juce::Component
 class DeltaCompEditor : public juce::AudioProcessorEditor, private juce::Timer
 {
 public:
+    // the analyser (per-band sand) in its own big, resizable window, to put beside the plugin
+    struct AnalyserWindow : juce::DocumentWindow, juce::Timer
+    {
+        explicit AnalyserWindow (DeltaCompProcessor& p);
+        void closeButtonPressed() override { setVisible (false); }
+        void timerCallback() override { if (isShowing()) { view.push(); view.repaint(); } }
+        ui::Sand view;
+    };
     explicit DeltaCompEditor (DeltaCompProcessor&);
     ~DeltaCompEditor() override;
     void paint (juce::Graphics&) override;
@@ -191,6 +199,8 @@ public:
     juce::OwnedArray<ui::Section> row1, row2, row3;
     ui::InsertSlot insertSlot;
     ui::OsView osView;
+    juce::TextButton openAnalyser { juce::String::fromUTF8 ("ANALYSEUR \xe2\x86\x97") };
+    std::unique_ptr<AnalyserWindow> analyser;
 private:
     DeltaCompProcessor& proc;
     ui::Look look;
