@@ -1406,12 +1406,13 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
                                 { { K::knob, "thr1", "SEUIL mp" }, { K::knob, "ratio1", "RATIO 1" }, { K::knob, "att1", "ATTAQUE 1" }, { K::knob, "rel1", "RELEASE 1" },
                                   { K::knob, "thr2", "SEUIL mf" }, { K::knob, "ratio2", "RATIO 2" }, { K::knob, "att2", "ATTAQUE 2" }, { K::knob, "rel2", "RELEASE 2" },
                                   { K::knob, "hyst", "HYSTÉRÉSIS" }, { K::knob, "knee", "GENOU" }, { K::knob, "window", "FENÊTRE" }, { K::choice, "opto", "DÉTECTION" },
-                                  { K::knob, "character", "COMP / LIM" } }),
+                                  { K::knob, "character", "COMP / LIM" }, { K::choice, "topo", "TOPOLOGIE" }, { K::choice, "relCurve", "RELEASE" } }),
          [&e, db] { return db (e.meterC.load()); });
     row1.getLast()->gain = [&e] { return e.meterC.load(); }; row1.getLast()->range = 20;
     add (row1, new ui::Section (s, "PEAK", "pkOn", 2, { { K::knob, "pkThr", "SEUIL" }, { K::knob, "pkRatio", "RATIO" },
                                                        { K::knob, "pkAtt", "ATTAQUE" }, { K::knob, "pkRel", "RELEASE" },
-                                                       { K::choice, "pkMode", "MODE" }, { K::knob, "crest", "CREST" } }),
+                                                       { K::choice, "pkMode", "MODE" }, { K::knob, "crest", "CREST" },
+                                                       { K::choice, "pkTopo", "TOPOLOGIE" }, { K::choice, "pkRelCurve", "RELEASE" } }),
          [&e, &p, db] { return db (e.meterD.load()) + "  @ " + String (p.engine.peakThr(), 1); });
     row1.getLast()->gain = [&e] { return e.meterD.load(); }; row1.getLast()->range = 12;
 
@@ -1457,7 +1458,7 @@ DeltaCompEditor::DeltaCompEditor (DeltaCompProcessor& p) : AudioProcessorEditor 
     }
     add (row2, new ui::Section (s, "GLOBAL", "active", 4, { { K::knob, "in", "ENTRÉE" }, { K::knob, "target", "CIBLE" }, { K::knob, "density", "DENSITY" }, { K::knob, "link", "LIEN STÉRÉO" },
                                                           { K::knob, "mix", "MIX" }, { K::knob, "out", "SORTIE" }, { K::choice, "autoGain", "GAIN AUTO" }, { K::choice, "meterLook", "AVANCE NAGRA" },
-                                                          { K::choice, "listen", "ÉCOUTE" }, { K::choice, "topo", "TOPOLOGIE" }, { K::choice, "relCurve", "RELEASE" } }),
+                                                          { K::choice, "listen", "ÉCOUTE" }}),
          [&e, db] { return "GAIN AUTO " + db (e.meterMakeup.load()) + "  DENSITY " + db (e.meterDensity.load()); });
 
     row1[0]->marking = "pp"; row1[1]->marking = "p"; row1[2]->marking = "mp mf"; row1[3]->marking = "f ff";

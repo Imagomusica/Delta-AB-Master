@@ -79,6 +79,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeltaCompProcessor::createLa
     fl ("rel2",    "Release 2",         10.f, 5000.f, 800.f, 1.f, 300.f, "ms", 0);
     ch ("topo",    "Topologie",        { "FF", "FB" }, 0);
     ch ("relCurve","Courbe release",   { "LOG", "LIN", "LOG INV" }, 0);
+    ch ("pkTopo",  "Peak topologie",   { "FF", "FB" }, 0);
+    ch ("pkRelCurve","Peak courbe release", { "LOG", "LIN", "LOG INV" }, 0);
     fl ("character", "Comp / Lim",       0.f, 100.f,   0.f, 1.f, 0,      "%", 0);
     bo ("scOn",    "Sidechain filtres", false);
     fl ("scHp",    "Sidechain passe-haut", 0.f, 1000.f, 80.f, 1.f, 150.f, "Hz", 0);   // 0 = OFF
@@ -162,7 +164,7 @@ dcomp::Params DeltaCompProcessor::currentParams() const
     p.ambAtt = pv ("ambAtt"); p.ambRel = pv ("ambRel"); p.ambAuto = pb ("ambAuto"); p.ambPreMs = pv ("ambPre"); p.ambTr = pv ("ambTr") * 0.01; p.ambStage = pi ("ambStage") + 1;
     p.widthDb = pv ("width"); p.centreDb = pv ("centre"); p.centreFilter = pi ("centreFilter"); p.centreFreq = pv ("centreFreq");
     p.sideLowCut = pv ("sideLowCut"); { static const int sl[] = { 6, 12, 18, 24, 36, 48 }; p.sideSlope = sl[juce::jlimit (0, 5, pi ("sideSlope"))]; }
-    p.feedback = pi ("topo") == 1; p.relCurve = pi ("relCurve");
+    p.feedback = pi ("topo") == 1; p.relCurve = pi ("relCurve"); p.pkFeedback = pi ("pkTopo") == 1; p.pkRelCurve = pi ("pkRelCurve");
     p.character = pv ("character") * 0.01; p.scOn = pb ("scOn"); p.scHp = pv ("scHp"); p.scLp = pv ("scLp");
     { static const int sl[] = { 6, 12, 18, 24, 36, 48 }; p.scSlope = sl[juce::jlimit (0, 5, pi ("scSlope"))]; }
     p.centreQ = pv ("centreQ"); p.msMin = pi ("msPhase") == 1;

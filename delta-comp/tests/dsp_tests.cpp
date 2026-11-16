@@ -591,6 +591,14 @@ int main()
         std::printf ("       gain reduction 150 ms after the loud part: log %.1f, lin %.1f, log inv %.1f dB\n", r0, r1, r2);
         check (std::abs (r0 - r1) > 0.3 && std::abs (r0 - r2) > 0.3, "release curves LOG / LIN / LOG INV give different recoveries", std::min (std::abs (r0 - r1), std::abs (r0 - r2)));
     }
+    {   // the peak stage has its own topology and release curve
+        Engine e; e.prepare (fs, 2); Params p = neutral(); p.pkOn = true; p.pkThr = -12; p.pkCrest = false; e.setParams (p);
+        const double a = runSine (e, fs, -3, 3);
+        Engine e2; e2.prepare (fs, 2); p.pkFeedback = true; p.pkRelCurve = 2; e2.setParams (p);
+        const double b = runSine (e2, fs, -3, 3);
+        std::printf ("       peak FF %.2f dB, FB + LOG INV %.2f dB\n", a, b);
+        check (std::abs (a - b) < 1.0, "peak feedback: static level within 1 dB of feedforward", a - b);
+    }
     std::printf (fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails ? 1 : 0;
 }

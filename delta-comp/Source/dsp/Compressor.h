@@ -560,8 +560,10 @@ struct Params
     bool dnOn = true;  bool opto = false, variMu = false;
     double thr1 = 0, ratio1 = 1.5, att1 = 30, rel1 = 300;
     double thr2 = 4, ratio2 = 4,   att2 = 10, rel2 = 150;
-    bool feedback = false;     // detectors of p, mp mf, f ff read the stage OUTPUT (feedback) instead of its input
-    int relCurve = 0;          // release shape: 0 = log (exponential, fast then slow), 1 = linear (constant dB/s), 2 = inverse log (slow then fast)
+    bool feedback = false;     // mp mf detector reads the stage OUTPUT (feedback) instead of its input
+    int relCurve = 0;          // mp mf release shape: 0 = log (exponential, fast then slow), 1 = linear (constant dB/s), 2 = inverse log (slow then fast)
+    bool pkFeedback = false;   // same two choices for the f ff (peak) stage
+    int pkRelCurve = 0;
     double character = 0;      // COMP/LIM on the double threshold: 0 = compressor .. 1 = limiter (ratio to infinity, hard knee, faster attack)
     bool scOn = false; double scHp = 80, scLp = 20000; int scSlope = 12;   // sidechain filters on every detector (zero latency, matched)
     double hyst = 0;           // dB: release only starts when the gain has more than this to recover (C and D)
@@ -1289,7 +1291,7 @@ public:
             for (int c = 0; c < C; ++c) { auto& g = gA[(size_t) c]; smooth0 (g, curveA (L[c]), cAa, cAr); s[c] *= dbToLin (g); mulGain (c, dbToLin (g)); mA = std::max (mA, g); }
             if (p.ambStage == 1) { ambiance (s, C, mAmb); afterAmb = ambUsed; }
             rmsLevels (1, s, L);
-            for (int c = 0; c < C; ++c) { auto& g = gB[(size_t) c]; smooth (g, p.feedback ? fbMul (1.0 / std::max (1.0, p.llRatio)) * curveB (L[c] + g) : curveB (L[c]), cBa, cBr); s[c] *= dbToLin (g); mulGain (c, dbToLin (g)); mB = std::min (mB, g); }
+            for (int c = 0; c < C; ++c) { auto& g = gB[(size_t) c]; smooth (g, curveB (L[c]), cBa, cBr, 0); s[c] *= dbToLin (g); mulGain (c, dbToLin (g)); mB = std::min (mB, g); }
             if (p.ambStage == 2) { ambiance (s, C, mAmb); afterAmb = ambUsed; }
             lvlC = rmsLevels (2, s, L);
             for (int c = 0; c < C; ++c)
@@ -1306,13 +1308,13 @@ public:
                 if (p.feedback)
                 {
                     const double Lo = L[c] + gC1[u] + gC2[u];
-                    smoothHyst (gC1[u], fbMul (invRatio (p.ratio1)) * curveC1 (Lo), cC1a, r1, relC1[u]);
-                    smoothHyst (gC2[u], fbMul (invRatio (p.ratio2)) * curveC2 (Lo), cC2a, r2, relC2[u]);
+                    smoothHyst (gC1[u], fbMul (invRatio (p.ratio1)) * curveC1 (Lo), cC1a, r1, relC1[u], p.relCurve);
+                    smoothHyst (gC2[u], fbMul (invRatio (p.ratio2)) * curveC2 (Lo), cC2a, r2, relC2[u], p.relCurve);
                 }
                 else
                 {
-                    smoothHyst (gC1[u], curveC1 (L[c]), cC1a, r1, relC1[u]);
-                    smoothHyst (gC2[u], curveC2 (L[c]), cC2a, r2, relC2[u]);
+                    smoothHyst (gC1[u], curveC1 (L[c]), cC1a, r1, relC1[u], p.relCurve);
+                    smoothHyst (gC2[u], curveC2 (L[c]), cC2a, r2, relC2[u], p.relCurve);
                 }
                 s[c] *= dbToLin (gC1[u] + gC2[u]); mulGain (c, dbToLin (gC1[u] + gC2[u])); mC = std::min (mC, gC1[u] + gC2[u]);
             }
@@ -1336,7 +1338,7 @@ public:
             {
                 const double lv = linToDb (p.link * pk + (1.0 - p.link) * pkc[c]);
                 auto& g = gD[(size_t) c];
-                smoothHyst (g, p.feedback ? fbMul (1.0 / std::max (1.0, p.pkRatio)) * curveD (lv + g) : curveD (lv), cDa, cDr, relD[(size_t) c]);
+                smoothHyst (g, p.pkFeedback ? fbMul (1.0 / std::max (1.0, p.pkRatio)) * curveD (lv + g) : curveD (lv), cDa, cDr, relD[(size_t) c], p.pkRelCurve);
                 s[c] *= dbToLin (g); mulGain (c, dbToLin (g)); mD = std::min (mD, g);
             }
             if (p.ambStage == 4) { ambiance (s, C, mAmb); afterAmb = ambUsed; }
@@ -1639,20 +1641,20 @@ public:
 
 private:
     // release step with the chosen curve; all three have the same speed at 6 dB from the target
-    void relStep (double& g, double gt, double cr) const
+    static void relStep (double& g, double gt, double cr, int curve)
     {
-        if (p.relCurve == 0) { g = gt + cr * (g - gt); return; }
+        if (curve == 0) { g = gt + cr * (g - gt); return; }
         const double d = gt - g, a = std::abs (d), k = 1.0 - cr;
-        const double step = p.relCurve == 1 ? 6.0 * k : k * 72.0 / (a + 6.0);
+        const double step = curve == 1 ? 6.0 * k : k * 72.0 / (a + 6.0);
         g += std::copysign (std::min (a, step), d);
     }
     static void smooth0 (double& g, double gt, double ca, double cr) { g = gt + (gt < g ? ca : cr) * (g - gt); }
-    void smooth (double& g, double gt, double ca, double cr) const { if (gt < g) g = gt + ca * (g - gt); else relStep (g, gt, cr); }
-    void smoothHyst (double& g, double gt, double ca, double cr, bool& releasing) const
+    static void smooth (double& g, double gt, double ca, double cr, int curve) { if (gt < g) g = gt + ca * (g - gt); else relStep (g, gt, cr, curve); }
+    void smoothHyst (double& g, double gt, double ca, double cr, bool& releasing, int curve) const
     {
         if (gt < g) { g = gt + ca * (g - gt); releasing = false; return; }
         if (! releasing && gt - g > p.hyst) releasing = true;
-        if (releasing) relStep (g, gt, cr);
+        if (releasing) relStep (g, gt, cr, curve);
     }
     // feedback: the detector reads the stage output (level + its own gain), and the curve is steepened by the ratio so
     // the static ratio stays the one set (output above threshold rises 1/ratio as fast as the input); capped for stability
